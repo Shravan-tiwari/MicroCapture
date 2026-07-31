@@ -1,0 +1,23 @@
+# Visual Studio / .NET
+[Oo]bj/
+[Bb]in/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Canon SDK (Do not commit binary SDK packages without permission)
+EDSDK.dll
+EdsImage.dll
+*.lib
+
+# Logs and DB
+*.log
+*.sqlite
+*.db
+
+# Temporary Image Dumps
+/Temp/
+/Thumbnails/
+/Captures/

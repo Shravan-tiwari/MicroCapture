@@ -1,0 +1,15 @@
+# Project Status
+
+| Feature | Status | Tests | Notes |
+|---------|--------|-------|-------|
+| Project Initialization | DONE | - | Basic repo and docs |
+| Desktop UI shell | PLANNED | - | |
+| Camera abstraction | PLANNED | - | |
+| MockCameraService | PLANNED | - | |
+| SQLite Schema | PLANNED | - | |
+| Canon EOS R8 integration | PLANNED | - | |
+| Live View | PLANNED | - | |
+| Capture mechanism | PLANNED | - | |
+| Image Processing | PLANNED | - | |
+| OCR | PLANNED | - | |
+| Export / DMS | PLANNED | - | |
