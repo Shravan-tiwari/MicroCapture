@@ -9,8 +9,8 @@
 | SQLite Schema | DONE | PASS | Entity Framework Core |
 | Durable Capture Queue | DONE | PASS | CaptureQueueService |
 | Canon EOS R8 integration | PLANNED | - | |
-| Live View | PLANNED | - | |
-| Capture mechanism | PLANNED | - | |
-| Image Processing | PLANNED | - | |
+| Live View | DONE | PASS | UI implementation |
+| Capture mechanism | DONE | PASS | UI implementation |
+| Image Processing | DONE | PASS | OpenCV pipeline |
 | OCR | PLANNED | - | |
 | Export / DMS | PLANNED | - | |
