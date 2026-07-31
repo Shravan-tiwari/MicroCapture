@@ -26,5 +26,6 @@
   <ItemGroup>
     <ProjectReference Include="..\MicroCapture.Core\MicroCapture.Core.csproj" />
     <ProjectReference Include="..\MicroCapture.Camera\MicroCapture.Camera.csproj" />
+    <ProjectReference Include="..\MicroCapture.Processing\MicroCapture.Processing.csproj" />
   </ItemGroup>
 </Project>

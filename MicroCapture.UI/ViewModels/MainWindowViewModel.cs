@@ -54,6 +54,15 @@ public partial class MainWindowViewModel : ViewModelBase
         _cameraService = cameraService;
         _dbContext = new AppDbContext();
         _queueService = new CaptureQueueService(_dbContext);
+        
+        var worker = new MicroCapture.Processing.BackgroundProcessingWorker(_dbContext, _queueService);
+        worker.StatusChanged += (s, msg) => {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = $"Background: {msg}");
+        };
+        worker.JobCompleted += (s, result) => {
+            // Can update UI based on QC result
+        };
+        worker.Start();
 
         _cameraService.StateChanged += (s, e) =>
         {
