@@ -3,9 +3,9 @@
 | Feature | Status | Tests | Notes |
 |---------|--------|-------|-------|
 | Project Initialization | DONE | - | Basic repo and docs |
-| Desktop UI shell | PLANNED | - | |
-| Camera abstraction | PLANNED | - | |
-| MockCameraService | PLANNED | - | |
+| Desktop UI shell | DONE | PASS | Avalonia UI |
+| Camera abstraction | DONE | PASS | Core interface |
+| MockCameraService | DONE | PASS | SkiaSharp based |
 | SQLite Schema | PLANNED | - | |
 | Canon EOS R8 integration | PLANNED | - | |
 | Live View | PLANNED | - | |

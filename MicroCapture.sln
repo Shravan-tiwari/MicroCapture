@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MicroCapture.Core", "MicroCapture.Core\MicroCapture.Core.csproj", "{736D33FC-6FE7-4765-86F7-3D41930ED0A7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MicroCapture.Camera", "MicroCapture.Camera\MicroCapture.Camera.csproj", "{7F88EC36-9220-450B-9E00-D3C289FCF069}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MicroCapture.UI", "MicroCapture.UI\MicroCapture.UI.csproj", "{24D536C0-7EF5-4AA0-B256-7998D670307F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{736D33FC-6FE7-4765-86F7-3D41930ED0A7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{736D33FC-6FE7-4765-86F7-3D41930ED0A7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{736D33FC-6FE7-4765-86F7-3D41930ED0A7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{736D33FC-6FE7-4765-86F7-3D41930ED0A7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7F88EC36-9220-450B-9E00-D3C289FCF069}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7F88EC36-9220-450B-9E00-D3C289FCF069}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7F88EC36-9220-450B-9E00-D3C289FCF069}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7F88EC36-9220-450B-9E00-D3C289FCF069}.Release|Any CPU.Build.0 = Release|Any CPU
+		{24D536C0-7EF5-4AA0-B256-7998D670307F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{24D536C0-7EF5-4AA0-B256-7998D670307F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{24D536C0-7EF5-4AA0-B256-7998D670307F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{24D536C0-7EF5-4AA0-B256-7998D670307F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
