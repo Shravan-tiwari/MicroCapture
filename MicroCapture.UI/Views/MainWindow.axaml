@@ -3,47 +3,168 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
+        mc:Ignorable="d" d:DesignWidth="1400" d:DesignHeight="800"
         x:Class="MicroCapture.UI.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Icon="/Assets/avalonia-logo.ico"
-        Title="Micrographics Capture Software">
+        Title="Micrographics Capture Software"
+        Width="1400" Height="800"
+        Background="#1a1a2e">
 
     <Design.DataContext>
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <Grid RowDefinitions="Auto, *, Auto" ColumnDefinitions="*, 300">
-        
-        <!-- Top Toolbar -->
-        <Border Grid.Row="0" Grid.ColumnSpan="2" Background="#2d2d30" Padding="10">
-            <StackPanel Orientation="Horizontal" Spacing="10">
-                <Button Command="{Binding ConnectCommand}" Content="Connect Camera" />
-                <Button Command="{Binding CaptureCommand}" Content="Capture (SPACE)" Background="#007acc" Foreground="White" />
-            </StackPanel>
+    <Grid RowDefinitions="Auto, *, 100, Auto">
+
+        <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
+        <Border Grid.Row="0" Background="#16213e" Padding="12,8" BorderBrush="#0f3460" BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="Auto, *, Auto">
+                <!-- Left: Connection & batch -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <Button Command="{Binding ConnectCommand}"
+                            Content="{Binding ConnectionStatus}"
+                            Background="#0f3460" Foreground="White"
+                            Padding="16,8" CornerRadius="4" />
+                    <TextBox Text="{Binding ProjectCode}" Watermark="Project Code"
+                             Width="120" Background="#1a1a2e" Foreground="White" />
+                    <TextBox Text="{Binding BatchCode}" Watermark="Batch Code"
+                             Width="120" Background="#1a1a2e" Foreground="White" />
+                    <Button Command="{Binding StartBatchCommand}"
+                            Content="Start Batch"
+                            Background="#533483" Foreground="White"
+                            Padding="16,8" CornerRadius="4" />
+                </StackPanel>
+
+                <!-- Center: Page Count -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="5">
+                    <TextBlock Text="PAGE:" Foreground="#a0a0a0" VerticalAlignment="Center" FontSize="13" />
+                    <TextBlock Text="{Binding PageCount}" Foreground="#e94560" VerticalAlignment="Center"
+                               FontSize="28" FontWeight="Bold" />
+                </StackPanel>
+
+                <!-- Right: Auto Capture & Camera Model -->
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
+                    <Button Command="{Binding ToggleAutoCaptureCommand}"
+                            Background="#533483"
+                            Foreground="White" Padding="14,8" CornerRadius="4">
+                        <StackPanel Orientation="Horizontal" Spacing="5">
+                            <TextBlock Text="AUTO" FontWeight="Bold" />
+                            <TextBlock Text="{Binding IsAutoCapture}" FontSize="10" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <TextBlock Text="{Binding CameraModel}" Foreground="#a0a0a0" VerticalAlignment="Center" FontSize="12" />
+                </StackPanel>
+            </Grid>
         </Border>
 
-        <!-- Live View Area -->
-        <Border Grid.Row="1" Grid.Column="0" Background="#1e1e1e" Margin="10">
-            <Image Source="{Binding LiveViewImage}" Stretch="Uniform" />
+        <!-- ═══════════════ MAIN CONTENT ═══════════════ -->
+        <Grid Grid.Row="1" ColumnDefinitions="*, 280">
+
+            <!-- Live View Area -->
+            <Border Grid.Column="0" Background="#0a0a15" Margin="10,10,5,5" CornerRadius="6"
+                    BorderBrush="#0f3460" BorderThickness="2">
+                <Grid>
+                    <Image Source="{Binding LiveViewImage}" Stretch="Uniform" />
+                    <!-- Overlay: readiness badge -->
+                    <Border Background="#80000000" HorizontalAlignment="Left" VerticalAlignment="Top"
+                            Padding="12,6" Margin="15" CornerRadius="4">
+                        <TextBlock Text="{Binding CaptureReadiness}" Foreground="#e94560"
+                                   FontWeight="Bold" FontSize="14" />
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Right Panel: Status & Settings -->
+            <Border Grid.Column="1" Background="#16213e" Margin="5,10,10,5" Padding="14" CornerRadius="6">
+                <ScrollViewer>
+                    <StackPanel Spacing="14">
+                        <!-- Status Indicators -->
+                        <TextBlock Text="STATUS" Foreground="#e94560" FontWeight="Bold" FontSize="13" />
+                        <Border Background="#1a1a2e" CornerRadius="4" Padding="10">
+                            <StackPanel Spacing="6">
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Focus:" Foreground="#a0a0a0" Width="80" />
+                                    <TextBlock Text="{Binding FocusStatus}" Foreground="LightGreen" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Exposure:" Foreground="#a0a0a0" Width="80" />
+                                    <TextBlock Text="{Binding ExposureStatus}" Foreground="LightGreen" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Document:" Foreground="#a0a0a0" Width="80" />
+                                    <TextBlock Text="{Binding DocumentStatus}" Foreground="LightGreen" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Capture Button -->
+                        <Button Command="{Binding CaptureCommand}"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
+                                Background="#e94560" Foreground="White"
+                                Padding="0,14" CornerRadius="6" FontSize="16" FontWeight="Bold">
+                            CAPTURE (SPACE)
+                        </Button>
+                        <Button Command="{Binding RecaptureCommand}"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
+                                Background="#533483" Foreground="White"
+                                Padding="0,10" CornerRadius="6">
+                            RECAPTURE (R)
+                        </Button>
+
+                        <!-- Keyboard Shortcuts -->
+                        <TextBlock Text="SHORTCUTS" Foreground="#e94560" FontWeight="Bold" FontSize="13"
+                                   Margin="0,10,0,0" />
+                        <Border Background="#1a1a2e" CornerRadius="4" Padding="10">
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="SPACE — Capture" Foreground="#a0a0a0" FontSize="12" />
+                                <TextBlock Text="R — Recapture" Foreground="#a0a0a0" FontSize="12" />
+                                <TextBlock Text="A — Toggle Auto-Capture" Foreground="#a0a0a0" FontSize="12" />
+                                <TextBlock Text="← → — Browse Pages" Foreground="#a0a0a0" FontSize="12" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- ═══════════════ THUMBNAIL STRIP ═══════════════ -->
+        <Border Grid.Row="2" Background="#16213e" Margin="10,5,10,5" CornerRadius="6" Padding="8">
+            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding RecentCaptures}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" Spacing="6" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ThumbnailItem">
+                            <Border Background="#1a1a2e" CornerRadius="4" Padding="4" Width="90">
+                                <StackPanel Spacing="2">
+                                    <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform" />
+                                    <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
+                                               Foreground="White" FontSize="10"
+                                               HorizontalAlignment="Center" />
+                                    <TextBlock Text="{Binding Status}"
+                                               Foreground="#a0a0a0" FontSize="9"
+                                               HorizontalAlignment="Center" />
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
         </Border>
 
-        <!-- Right Sidebar (Settings/Metadata) -->
-        <Border Grid.Row="1" Grid.Column="1" Background="#252526" Padding="10" Margin="0,10,10,10">
-            <StackPanel Spacing="10">
-                <TextBlock Text="Project Details" FontWeight="Bold" Foreground="White" />
-                <TextBox Watermark="Project Code (e.g. DU)" />
-                <TextBox Watermark="Batch Code (e.g. B047)" />
-                
-                <TextBlock Text="Camera Status" FontWeight="Bold" Foreground="White" Margin="0,20,0,0" />
-                <TextBlock Text="{Binding StatusText}" Foreground="LightGreen" TextWrapping="Wrap" />
-            </StackPanel>
+        <!-- ═══════════════ STATUS BAR ═══════════════ -->
+        <Border Grid.Row="3" Background="#0f3460" Padding="10,6">
+            <Grid ColumnDefinitions="*, Auto">
+                <TextBlock Grid.Column="0" Text="{Binding StatusText}" Foreground="White" FontSize="12"
+                           VerticalAlignment="Center" />
+                <TextBlock Grid.Column="1" Text="Micrographics v0.4.0" Foreground="#606090"
+                           FontSize="11" VerticalAlignment="Center" />
+            </Grid>
         </Border>
-
-        <!-- Bottom Status Bar -->
-        <Border Grid.Row="2" Grid.ColumnSpan="2" Background="#007acc" Padding="5">
-            <TextBlock Text="{Binding StatusText}" Foreground="White" />
-        </Border>
-
     </Grid>
 </Window>
