@@ -3,20 +3,47 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
         x:Class="MicroCapture.UI.Views.MainWindow"
-        x:DataType="vm:MainViewModel"
+        x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
-        Title="MicroCapture.UI">
+        Title="Micrographics Capture Software">
 
     <Design.DataContext>
-        <!-- This only sets the DataContext for the previewer in an IDE,
-             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
-        <vm:MainViewModel />
+        <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <TextBox Text="{Binding Greeting}"
-             HorizontalAlignment="Center"
-             VerticalAlignment="Center" />
+    <Grid RowDefinitions="Auto, *, Auto" ColumnDefinitions="*, 300">
+        
+        <!-- Top Toolbar -->
+        <Border Grid.Row="0" Grid.ColumnSpan="2" Background="#2d2d30" Padding="10">
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button Command="{Binding ConnectCommand}" Content="Connect Camera" />
+                <Button Command="{Binding CaptureCommand}" Content="Capture (SPACE)" Background="#007acc" Foreground="White" />
+            </StackPanel>
+        </Border>
 
+        <!-- Live View Area -->
+        <Border Grid.Row="1" Grid.Column="0" Background="#1e1e1e" Margin="10">
+            <Image Source="{Binding LiveViewImage}" Stretch="Uniform" />
+        </Border>
+
+        <!-- Right Sidebar (Settings/Metadata) -->
+        <Border Grid.Row="1" Grid.Column="1" Background="#252526" Padding="10" Margin="0,10,10,10">
+            <StackPanel Spacing="10">
+                <TextBlock Text="Project Details" FontWeight="Bold" Foreground="White" />
+                <TextBox Watermark="Project Code (e.g. DU)" />
+                <TextBox Watermark="Batch Code (e.g. B047)" />
+                
+                <TextBlock Text="Camera Status" FontWeight="Bold" Foreground="White" Margin="0,20,0,0" />
+                <TextBlock Text="{Binding StatusText}" Foreground="LightGreen" TextWrapping="Wrap" />
+            </StackPanel>
+        </Border>
+
+        <!-- Bottom Status Bar -->
+        <Border Grid.Row="2" Grid.ColumnSpan="2" Background="#007acc" Padding="5">
+            <TextBlock Text="{Binding StatusText}" Foreground="White" />
+        </Border>
+
+    </Grid>
 </Window>
