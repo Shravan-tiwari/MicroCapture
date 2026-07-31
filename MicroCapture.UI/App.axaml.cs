@@ -17,7 +17,16 @@ public partial class App : Application
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            var cameraService = new MicroCapture.Camera.MockCameraService();
+            MicroCapture.Core.Interfaces.ICameraService cameraService;
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            {
+                cameraService = new MicroCapture.Camera.Canon.CanonCameraService();
+            }
+            else
+            {
+                cameraService = new MicroCapture.Camera.MockCameraService();
+            }
+
             desktop.MainWindow = new MainWindow
             {
                 DataContext = new MainWindowViewModel(cameraService),
