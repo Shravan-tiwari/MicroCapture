@@ -19,6 +19,7 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private bool _isConnected;
     private bool _sdkInitialized;
     private bool _disposed;
+    private bool _isDownloading;
     private CancellationTokenSource? _liveViewCts;
     private Task? _liveViewTask;
     private TaskCompletionSource<string>? _captureTcs;
@@ -251,8 +252,12 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             IntPtr stream = IntPtr.Zero, image = IntPtr.Zero;
             try
             {
-                IntPtr camera; lock (_sync) { camera = _camera; }
+                IntPtr camera;
+                bool isDownloading;
+                lock (_sync) { camera = _camera; isDownloading = _isDownloading; }
                 if (camera == IntPtr.Zero) return;
+                // Canon transfer and EVF download must not compete for the camera stream.
+                if (isDownloading) { await Task.Delay(50, token).ConfigureAwait(false); continue; }
                 if (!Succeeded(Call("EdsCreateMemoryStream", () => EDSDK.EdsCreateMemoryStream(0, out stream))) ||
                     !Succeeded(Call("EdsCreateEvfImageRef", () => EDSDK.EdsCreateEvfImageRef(stream, out image))))
                 { await Task.Delay(250, token).ConfigureAwait(false); continue; }
@@ -285,8 +290,10 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     {
         Log("ObjectEvent", $"event=0x{inEvent:X8}, ref=0x{inRef.ToInt64():X}");
         if (inEvent != EDSDK.ObjectEvent_DirItemRequestTransfer || inRef == IntPtr.Zero) return EDSDK.EDS_ERR_OK;
-        var retain = Call("EdsRetain(DirItemRequestTransfer)", () => EDSDK.EdsRetain(inRef));
-        if (retain != EDSDK.EDS_ERR_OK) { FailCapture(CreateSdkException("EdsRetain(DirItemRequestTransfer)", retain)); return retain; }
+        // EDSDK transfers ownership of this directory-item reference to the object
+        // event handler. Canon's sample queues it directly and releases it after
+        // EdsDownloadComplete; attempting EdsRetain here fails on the EOS R8.
+        lock (_sync) _isDownloading = true;
         _ = Task.Run(() => DownloadImageAsync(inRef));
         return EDSDK.EDS_ERR_OK;
     }
@@ -297,7 +304,12 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         {
             TaskCompletionSource<string>? tcs; string directory, prefix;
             lock (_sync) { tcs = _captureTcs; directory = _currentSaveDirectory; prefix = _currentFilePrefix; }
-            if (tcs == null) { Log("DownloadImage", "Transfer received with no pending capture; releasing item."); return; }
+            if (tcs == null)
+            {
+                Log("DownloadImage", "Transfer received with no pending capture; cancelling transfer.");
+                Call("EdsDownloadCancel", () => EDSDK.EdsDownloadCancel(dirItem));
+                return;
+            }
             var info = default(EDSDK.EdsDirectoryItemInfo);
             EnsureSuccess("EdsGetDirectoryItemInfo", Call("EdsGetDirectoryItemInfo", () => EDSDK.EdsGetDirectoryItemInfo(dirItem, out info)));
             var extension = Path.GetExtension(info.szFileName);
@@ -314,7 +326,11 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             tcs.TrySetResult(path);
         }
         catch (Exception ex) { Log("DownloadImageAsync", ex.ToString()); FailCapture(ex); }
-        finally { Release(dirItem, "retained directory item"); }
+        finally
+        {
+            Release(dirItem, "directory item transferred by event");
+            lock (_sync) _isDownloading = false;
+        }
         await Task.CompletedTask;
     }
 
