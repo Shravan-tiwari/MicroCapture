@@ -1,0 +1,44 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.CropReviewWindow"
+        x:DataType="vm:CropReviewViewModel"
+        Title="Manual Crop Review"
+        Width="1000" Height="700"
+        Background="#1a1a2e">
+    <Grid RowDefinitions="*, Auto">
+        <!-- Image Area -->
+        <Border Grid.Row="0" Background="#0a0a15" Margin="10">
+            <Grid>
+                <Image Source="{Binding Image}" Stretch="Uniform" />
+                <TextBlock Text="Set split percentage (left/right widths) below."
+                           Foreground="White" Background="#80000000" Padding="8"
+                           HorizontalAlignment="Center" VerticalAlignment="Top" Margin="10"/>
+            </Grid>
+        </Border>
+
+        <!-- Controls -->
+        <Border Grid.Row="1" Margin="10" Background="#16213e" Padding="10" CornerRadius="6">
+            <StackPanel Spacing="10">
+                <Grid ColumnDefinitions="*, *">
+                    <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                    <TextBlock Text="Left Page Split (%)" Foreground="Cyan" />
+                    <Slider Minimum="0" Maximum="100" Value="{Binding LeftSplitPercent}" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                    <TextBlock Text="Right Page Split (%)" Foreground="Magenta" />
+                    <Slider Minimum="0" Maximum="100" Value="{Binding RightSplitPercent}" />
+                </StackPanel>
+            </Grid>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
+                <Button Content="Cancel" Command="{Binding CancelCommand}" 
+                        CommandParameter="{Binding $parent[Window]}"
+                        Background="#333" Foreground="White" Padding="10,5" />
+                <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}"
+                        CommandParameter="{Binding $parent[Window]}"
+                        Background="#e94560" Foreground="White" Padding="10,5" FontWeight="Bold" />
+            </StackPanel>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

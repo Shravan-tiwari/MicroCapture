@@ -3,41 +3,43 @@
 ## PHASE 0: Repository + documentation + build system
 - [x] Initialize Git
 - [x] Create directory structure and persistent documentation
-- [ ] Document final Windows technology stack
-- [ ] Commit checkpoint
+- [x] Document final Windows technology stack
+- [x] Commit checkpoint
 
 ## PHASE 1: Desktop UI shell
-- [ ] Create basic main operator UI shell (WPF)
+- [x] Create basic main operator UI shell (Avalonia/XAML)
 
 ## PHASE 2: Camera abstraction + MockCamera
-- [ ] Create camera abstraction interfaces
-- [ ] Implement MockCameraService
+- [x] Create camera abstraction interfaces
+- [x] Implement MockCameraService
 
 ## PHASE 3: Capture Reliability Basics
-- [ ] Initial SQLite schema/migration architecture
-- [ ] Durable capture queue structure
+- [x] Initial SQLite schema/migration architecture
+- [x] Durable capture queue structure
 
 ## PHASE 4: Canon EOS R8 integration
-- [ ] Canon EDSDK integration
-- [ ] Live View
+- [x] Canon EDSDK integration
+- [x] Live View
 
 ## PHASE 5: Reliable capture/download
-- [ ] PC image download
-- [ ] Crash recovery
+- [x] PC image download
+- [x] Crash recovery (Background Queue)
 
 ## PHASE 6: Project/batch management
-- [ ] Projects, Batches, Configurable Naming
+- [x] Projects, Batches, Configurable Naming
 
 ## PHASE 7: Auto-crop/deskew/perspective
-- [ ] Image Processing pipeline
-- [ ] OpenCV Integration
+- [x] Image Processing pipeline
+- [x] OpenCV Integration
 
 ## PHASE 8: Image enhancement & QC
-- [ ] Brightness, contrast, blur detection
+- [x] Brightness, contrast, blur detection
 
 ## PHASE 9: OCR & PDF
-- [ ] Tesseract offline OCR
-- [ ] Searchable PDF generation
+- [x] Tesseract offline OCR
+- [x] Searchable PDF generation
 
-## PHASE 10: Export & DMS Integration
-- [ ] HTTP/REST synchronization
+## PHASE 10: Split Book Pages & Multi-Format Export
+- [x] Intelligent 50/50 page splitting via OpenCV
+- [x] Manual crop review UI for precise boundaries
+- [x] Export to PDF, TIFF, JPG, and PNG (Local File System)

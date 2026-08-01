@@ -29,9 +29,20 @@
                              Width="120" Background="#1a1a2e" Foreground="White" />
                     <TextBox Text="{Binding BatchCode}" Watermark="Batch Code"
                              Width="120" Background="#1a1a2e" Foreground="White" />
+                    <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages" Foreground="White" VerticalAlignment="Center"/>
                     <Button Command="{Binding StartBatchCommand}"
                             Content="Start Batch"
                             Background="#533483" Foreground="White"
+                            Padding="16,8" CornerRadius="4" />
+                    <ComboBox SelectedItem="{Binding ExportFormat}" Width="90" Background="#1a1a2e" Foreground="White" Margin="10,0,0,0">
+                        <x:String>PDF</x:String>
+                        <x:String>TIFF</x:String>
+                        <x:String>JPG</x:String>
+                        <x:String>PNG</x:String>
+                    </ComboBox>
+                    <Button Command="{Binding ExportBatchCommand}"
+                            Content="Export Batch"
+                            Background="#0f3460" Foreground="White"
                             Padding="16,8" CornerRadius="4" />
                 </StackPanel>
 
@@ -149,6 +160,11 @@
                                     <TextBlock Text="{Binding Status}"
                                                Foreground="#a0a0a0" FontSize="9"
                                                HorizontalAlignment="Center" />
+                                    <Button Content="CROP" 
+                                            x:CompileBindings="False"
+                                            Command="{Binding $parent[Window].DataContext.ReviewCropCommand}" 
+                                            CommandParameter="{Binding JobId}" 
+                                            FontSize="9" Padding="4,2" HorizontalAlignment="Center" Background="#533483" Foreground="White"/>
                                 </StackPanel>
                             </Border>
                         </DataTemplate>

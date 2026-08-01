@@ -69,12 +69,29 @@ public class BackgroundProcessingWorker
                         Path.GetDirectoryName(job.OriginalFilePath) ?? ".",
                         "Processed");
 
-                    var result = _processor.Process(job.OriginalFilePath, outputDir);
+                    bool splitPages = job.Batch?.SplitBookPages ?? false;
+                    var result = _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox);
 
-                    if (result.Success)
+                    if (result.Success && result.OutputFilePaths.Count > 0)
                     {
                         await _queueService.UpdateJobStatusAsync(job.Id, "processing", "Completed");
                         await _queueService.UpdateJobStatusAsync(job.Id, "qc", result.QcVerdict);
+
+                        // Perform OCR on all output files
+                        try
+                        {
+                            var ocrProcessor = new OcrProcessor();
+                            foreach (var outputPath in result.OutputFilePaths)
+                            {
+                                string txtPath = ocrProcessor.ProcessImage(outputPath);
+                            }
+                            await _queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
+                        }
+                        catch (Exception ex)
+                        {
+                            StatusChanged?.Invoke(this, $"OCR error: {ex.Message}");
+                            await _queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
+                        }
                     }
                     else
                     {

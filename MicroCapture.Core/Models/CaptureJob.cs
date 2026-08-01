@@ -16,5 +16,10 @@ public class CaptureJob
     public string OcrStatus { get; set; } = "Pending";
     public string ExportStatus { get; set; } = "Pending";
     
+    // Manual Crop Override
+    public bool ManualOverrideApplied { get; set; } = false;
+    public string? LeftCropBox { get; set; } // Format: "X,Y,Width,Height"
+    public string? RightCropBox { get; set; }
+    
     public Batch? Batch { get; set; }
 }

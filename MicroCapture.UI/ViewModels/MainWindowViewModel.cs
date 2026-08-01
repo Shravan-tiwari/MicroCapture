@@ -10,6 +10,7 @@ using MicroCapture.Core.Data;
 using MicroCapture.Core.Interfaces;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
+using MicroCapture.UI.Views;
 
 namespace MicroCapture.UI.ViewModels;
 
@@ -33,6 +34,8 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _exposureStatus = "—";
     [ObservableProperty] private string _documentStatus = "—";
     [ObservableProperty] private string _captureReadiness = "NOT READY";
+    [ObservableProperty] private bool _splitBookPages = false;
+    [ObservableProperty] private string _exportFormat = "PDF";
 
     private string? _currentProjectId;
     private string? _currentBatchId;
@@ -170,7 +173,8 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             ProjectId = project.Id,
             Name = BatchCode,
-            Operator = Environment.UserName
+            Operator = Environment.UserName,
+            SplitBookPages = SplitBookPages
         };
         _dbContext.Batches.Add(batch);
         await _dbContext.SaveChangesAsync();
@@ -199,10 +203,10 @@ public partial class MainWindowViewModel : ViewModelBase
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
 
             // Record in durable queue
-            await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
 
             // Add thumbnail
-            AddThumbnail(filePath, PageCount);
+            AddThumbnail(job.Id, filePath, PageCount);
 
             StatusText = $"Page {pageStr} captured — {Path.GetFileName(filePath)}";
         }
@@ -225,15 +229,16 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
-            await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
 
             // Update thumbnail for the recaptured page
             var existing = RecentCaptures.FirstOrDefault(t => t.PageNumber == PageCount);
             if (existing != null)
             {
                 existing.Status = "Recaptured";
+                existing.JobId = job.Id;
             }
-            AddThumbnail(filePath, PageCount, isRecapture: true);
+            AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
 
             StatusText = $"Page {pageStr} recaptured";
         }
@@ -250,9 +255,50 @@ public partial class MainWindowViewModel : ViewModelBase
         StatusText = IsAutoCapture ? "AUTO CAPTURE: ON" : "AUTO CAPTURE: OFF";
     }
 
+    [RelayCommand]
+    private async Task ExportBatchAsync()
+    {
+        if (_currentBatchId == null)
+        {
+            StatusText = "Start a batch first before exporting.";
+            return;
+        }
+
+        StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
+        try
+        {
+            var exportService = new MicroCapture.Processing.BatchExportService(_dbContext);
+            var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
+            StatusText = $"Exported successfully: {Path.GetFileName(exportPath)}";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Export failed: {ex.Message}";
+        }
+    }
+
     // ---------- Helpers ----------
 
-    private void AddThumbnail(string filePath, int pageNumber, bool isRecapture = false)
+    [RelayCommand]
+    private void ReviewCrop(string jobId)
+    {
+        if (string.IsNullOrEmpty(jobId)) return;
+        var cropWindow = new CropReviewWindow();
+        cropWindow.DataContext = new CropReviewViewModel(jobId, _dbContext, _queueService);
+        
+        // Show as a top-level window (since we don't have a direct reference to MainWindow here easily without injection, 
+        // we'll just show it non-modal, or we can use Avalonia's Application.Current)
+        if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            cropWindow.ShowDialog(desktop.MainWindow);
+        }
+        else
+        {
+            cropWindow.Show();
+        }
+    }
+
+    private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false)
     {
         Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
@@ -262,6 +308,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 var thumb = Bitmap.DecodeToWidth(stream, 120);
                 RecentCaptures.Insert(0, new ThumbnailItem
                 {
+                    JobId = jobId,
                     PageNumber = pageNumber,
                     Thumbnail = thumb,
                     Status = isRecapture ? "Recaptured" : "Captured",
@@ -309,6 +356,7 @@ public partial class MainWindowViewModel : ViewModelBase
 public partial class ThumbnailItem : ObservableObject
 {
     [ObservableProperty] private int _pageNumber;
+    [ObservableProperty] private string _jobId = "";
     [ObservableProperty] private Bitmap? _thumbnail;
     [ObservableProperty] private string _status = "Captured";
     [ObservableProperty] private string _filePath = "";

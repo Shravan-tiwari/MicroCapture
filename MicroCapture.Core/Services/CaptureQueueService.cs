@@ -39,6 +39,7 @@ public class CaptureQueueService
     public async Task<List<CaptureJob>> GetPendingJobsAsync()
     {
         return await _dbContext.CaptureJobs
+            .Include(j => j.Batch)
             .Where(j => j.ProcessingStatus == "Pending")
             .OrderBy(j => j.Timestamp)
             .ToListAsync();

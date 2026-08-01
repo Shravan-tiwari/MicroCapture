@@ -9,7 +9,7 @@ namespace MicroCapture.Processing;
 public class ProcessingResult
 {
     public bool Success { get; set; }
-    public string OutputFilePath { get; set; } = string.Empty;
+    public List<string> OutputFilePaths { get; set; } = new();
     public string OriginalFilePath { get; set; } = string.Empty;
 
     // Auto-crop

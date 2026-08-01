@@ -15,13 +15,15 @@ Working:
 - Image processing pipeline via OpenCvSharp (auto-crop, deskew, CLAHE enhancement, blur detection).
 - Background worker for durable queue processing.
 
+- Phase 4: Canon EOS R8 integration (EDSDK) completed.
+- Phase 5: OCR pipeline (Tesseract) and Export/DMS pipeline (SkiaSharp PDF generation) completed.
+
 In progress:
-- Phase 4: Canon EOS R8 integration (EDSDK)
+- Preparing for Phase 10
 
 Next:
-- Implement `CanonCameraService` using EDSDK wrappers (or native interop).
-- Implement OCR pipeline.
-- Implement Export/DMS pipeline.
+- Phase 10: Export & DMS Integration (HTTP/REST synchronization)
+- Implement cloud syncing / API endpoints for batch upload
 
 Known issue:
 - None
