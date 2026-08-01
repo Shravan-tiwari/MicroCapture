@@ -13,6 +13,8 @@ namespace MicroCapture.Camera.Canon;
 /// <summary>EDSDK-backed camera service. All native calls are traced and native references are released deterministically.</summary>
 public sealed class CanonCameraService : ICameraService, IDisposable
 {
+    private static readonly object LogSync = new();
+    private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
     private readonly object _sync = new();
     private readonly SemaphoreSlim _captureLock = new(1, 1);
     private IntPtr _camera;
@@ -247,10 +249,20 @@ public sealed class CanonCameraService : ICameraService, IDisposable
 
     private async Task LiveViewLoopAsync(CancellationToken token)
     {
-        while (!token.IsCancellationRequested)
+        IntPtr stream = IntPtr.Zero, image = IntPtr.Zero;
+        try
         {
-            IntPtr stream = IntPtr.Zero, image = IntPtr.Zero;
-            try
+            IntPtr initialCamera;
+            lock (_sync) initialCamera = _camera;
+            if (initialCamera == IntPtr.Zero) return;
+            if (!Succeeded(Call("EdsCreateMemoryStream", () => EDSDK.EdsCreateMemoryStream(0, out stream))) ||
+                !Succeeded(Call("EdsCreateEvfImageRef", () => EDSDK.EdsCreateEvfImageRef(stream, out image))))
+            {
+                PublishState(true, "Live View initialization failed — see EDSDK log.");
+                return;
+            }
+
+            while (!token.IsCancellationRequested)
             {
                 IntPtr camera;
                 bool isDownloading;
@@ -258,15 +270,13 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 if (camera == IntPtr.Zero) return;
                 // Canon transfer and EVF download must not compete for the camera stream.
                 if (isDownloading) { await Task.Delay(50, token).ConfigureAwait(false); continue; }
-                if (!Succeeded(Call("EdsCreateMemoryStream", () => EDSDK.EdsCreateMemoryStream(0, out stream))) ||
-                    !Succeeded(Call("EdsCreateEvfImageRef", () => EDSDK.EdsCreateEvfImageRef(stream, out image))))
-                { await Task.Delay(250, token).ConfigureAwait(false); continue; }
-                var result = Call("EdsDownloadEvfImage", () => EDSDK.EdsDownloadEvfImage(camera, image));
+
+                var result = CallLive("EdsDownloadEvfImage", () => EDSDK.EdsDownloadEvfImage(camera, image));
                 if (result == EDSDK.EDS_ERR_OK)
                 {
                     ulong length = 0; IntPtr pointer = IntPtr.Zero;
-                    if (Succeeded(Call("EdsGetLength(EVF stream)", () => EDSDK.EdsGetLength(stream, out length))) && length is > 0 and <= int.MaxValue &&
-                        Succeeded(Call("EdsGetPointer(EVF stream)", () => EDSDK.EdsGetPointer(stream, out pointer))) && pointer != IntPtr.Zero)
+                    if (Succeeded(CallLive("EdsGetLength(EVF stream)", () => EDSDK.EdsGetLength(stream, out length))) && length is > 0 and <= int.MaxValue &&
+                        Succeeded(CallLive("EdsGetPointer(EVF stream)", () => EDSDK.EdsGetPointer(stream, out pointer))) && pointer != IntPtr.Zero)
                     {
                         var bytes = new byte[(int)length];
                         Marshal.Copy(pointer, bytes, 0, bytes.Length);
@@ -278,12 +288,12 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                     PublishState(true, $"Live View error: {ErrorName(result)} (0x{result:X8})");
                     await Task.Delay(250, token).ConfigureAwait(false);
                 }
+                await Task.Delay(33, token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
-            catch (Exception ex) { Log("LiveViewLoopAsync", ex.ToString()); await Task.Delay(250, token).ConfigureAwait(false); }
-            finally { Release(image, "EVF image"); Release(stream, "EVF stream"); }
-            await Task.Delay(33, token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) { Log("LiveViewLoopAsync", ex.ToString()); PublishState(true, "Live View stopped unexpectedly — see EDSDK log."); }
+        finally { Release(image, "EVF image"); Release(stream, "EVF stream"); }
     }
 
     private uint ObjectEventHandler(uint inEvent, IntPtr inRef, IntPtr inContext)
@@ -367,7 +377,44 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         try { var result = call(); Log(operation, $"{parameters ?? ""} result=0x{result:X8} ({ErrorName(result)}), {sw.ElapsedMilliseconds}ms"); return result; }
         catch (Exception ex) { Log(operation, $"{parameters ?? ""} threw after {sw.ElapsedMilliseconds}ms: {ex}"); throw; }
     }
-    private static void Log(string operation, string message) => Console.WriteLine($"[{DateTimeOffset.Now:O}] Canon EDSDK {operation}: {message}");
+    private static uint CallLive(string operation, Func<uint> call, string? parameters = null)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var result = call();
+            // A full log entry for every 30fps frame causes console I/O and UI stalls.
+            // Keep a one-second success heartbeat while preserving every failure.
+            var shouldLogSuccess = false;
+            lock (LogSync)
+            {
+                if (DateTime.UtcNow - _lastLiveSuccessLogUtc >= TimeSpan.FromSeconds(1))
+                {
+                    _lastLiveSuccessLogUtc = DateTime.UtcNow;
+                    shouldLogSuccess = true;
+                }
+            }
+            if (result != EDSDK.EDS_ERR_OK || shouldLogSuccess)
+                Log(operation, $"{parameters ?? ""} result=0x{result:X8} ({ErrorName(result)}), {sw.ElapsedMilliseconds}ms");
+            return result;
+        }
+        catch (Exception ex) { Log(operation, $"{parameters ?? ""} threw after {sw.ElapsedMilliseconds}ms: {ex}"); throw; }
+    }
+    private static void Log(string operation, string message)
+    {
+        var line = $"[{DateTimeOffset.Now:O}] Canon EDSDK {operation}: {message}";
+        Console.WriteLine(line);
+        try
+        {
+            lock (LogSync)
+            {
+                var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MicroCapture", "Logs");
+                Directory.CreateDirectory(directory);
+                File.AppendAllText(Path.Combine(directory, "edsdk.log"), line + Environment.NewLine);
+            }
+        }
+        catch { /* Logging must never interrupt camera control. */ }
+    }
     private static string ErrorName(uint code) => code switch
     {
         EDSDK.EDS_ERR_OK => "OK", EDSDK.EDS_ERR_DEVICE_BUSY => "DEVICE_BUSY", EDSDK.EDS_ERR_DEVICE_NOT_FOUND => "DEVICE_NOT_FOUND",

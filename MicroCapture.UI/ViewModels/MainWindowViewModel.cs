@@ -2,6 +2,7 @@ using System;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -41,6 +42,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private string? _currentProjectId;
     private string? _currentBatchId;
     private string _outputDirectory = string.Empty;
+    private int _liveViewFramePending;
 
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
@@ -87,12 +89,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _cameraService.LiveViewFrameReceived += (s, frameBytes) =>
         {
-            try
+            // Drop stale frames while the UI is rendering. This keeps Live View from
+            // building an unbounded dispatcher queue when camera or processing work is busy.
+            if (Interlocked.Exchange(ref _liveViewFramePending, 1) != 0) return;
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
-                using var ms = new MemoryStream(frameBytes);
-                var bitmap = new Bitmap(ms);
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                try
                 {
+                    using var ms = new MemoryStream(frameBytes);
+                    var bitmap = new Bitmap(ms);
                     var old = LiveViewImage;
                     LiveViewImage = bitmap;
                     old?.Dispose();
@@ -101,12 +106,10 @@ public partial class MainWindowViewModel : ViewModelBase
                     ExposureStatus = "✓ OK";
                     DocumentStatus = "✓ Detected";
                     UpdateCaptureReadiness();
-                });
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"Live View frame decode failed: {ex}");
-            }
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"Live View frame decode failed: {ex}"); }
+                finally { Volatile.Write(ref _liveViewFramePending, 0); }
+            });
         };
     }
 
