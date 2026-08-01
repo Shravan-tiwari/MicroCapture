@@ -34,8 +34,10 @@ public class BatchExportService
         if (batch.Captures == null || batch.Captures.Count == 0)
             throw new Exception("Batch contains no capture jobs.");
 
+        // QC is advisory until a dedicated QC-review screen exists. Do not silently
+        // discard a successfully produced image solely due to an automatic heuristic.
         var jobsToExport = batch.Captures
-            .Where(j => j.ProcessingStatus == "Completed" && j.QcStatus != "FAIL")
+            .Where(j => j.ProcessingStatus == "Completed")
             .OrderBy(j => j.PageNumber)
             .ToList();
 

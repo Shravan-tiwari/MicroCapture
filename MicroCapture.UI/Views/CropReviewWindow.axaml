@@ -11,7 +11,7 @@
         <Border Grid.Row="0" Background="#0a0a15" Margin="10">
             <Grid>
                 <Image Source="{Binding Image}" Stretch="Uniform" />
-                <TextBlock Text="Set split percentage (left/right widths) below."
+                <TextBlock Text="Set a crop rectangle, or a split point for book pages, then save to reprocess."
                            Foreground="White" Background="#80000000" Padding="8"
                            HorizontalAlignment="Center" VerticalAlignment="Top" Margin="10"/>
             </Grid>
@@ -20,16 +20,20 @@
         <!-- Controls -->
         <Border Grid.Row="1" Margin="10" Background="#16213e" Padding="10" CornerRadius="6">
             <StackPanel Spacing="10">
-                <Grid ColumnDefinitions="*, *">
-                    <StackPanel Grid.Column="0" Margin="0,0,10,0">
-                    <TextBlock Text="Left Page Split (%)" Foreground="Cyan" />
-                    <Slider Minimum="0" Maximum="100" Value="{Binding LeftSplitPercent}" />
+                <StackPanel IsVisible="{Binding IsSplitBookPages}" Spacing="4">
+                    <TextBlock Text="Book-page split (%)" Foreground="Cyan" />
+                    <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" />
                 </StackPanel>
-                <StackPanel Grid.Column="1" Margin="10,0,0,0">
-                    <TextBlock Text="Right Page Split (%)" Foreground="Magenta" />
-                    <Slider Minimum="0" Maximum="100" Value="{Binding RightSplitPercent}" />
-                </StackPanel>
-            </Grid>
+                <Grid IsVisible="{Binding IsSinglePage}" ColumnDefinitions="*,*,*,*" RowDefinitions="Auto,Auto">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="X" Foreground="Cyan" />
+                    <TextBlock Grid.Row="0" Grid.Column="1" Text="Y" Foreground="Cyan" />
+                    <TextBlock Grid.Row="0" Grid.Column="2" Text="Width" Foreground="Cyan" />
+                    <TextBlock Grid.Row="0" Grid.Column="3" Text="Height" Foreground="Cyan" />
+                    <TextBox Grid.Row="1" Grid.Column="0" Text="{Binding CropX}" Margin="0,4,4,0" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding CropY}" Margin="4,4,4,0" />
+                    <TextBox Grid.Row="1" Grid.Column="2" Text="{Binding CropWidth}" Margin="4,4,4,0" />
+                    <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding CropHeight}" Margin="4,4,0,0" />
+                </Grid>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
                 <Button Content="Cancel" Command="{Binding CancelCommand}" 
                         CommandParameter="{Binding $parent[Window]}"

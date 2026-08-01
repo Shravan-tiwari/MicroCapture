@@ -70,7 +70,10 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 var thumbnail = RecentCaptures.FirstOrDefault(t => t.FilePath == result.OriginalFilePath);
                 if (thumbnail != null)
-                    thumbnail.Status = result.Success ? "Processed" : "Processing failed";
+                    thumbnail.Status = !result.Success ? "Processing failed"
+                        : result.OcrStatus == "Failed" ? "Processed — OCR failed"
+                        : result.QcVerdict == "FAIL" ? "Processed — QC warning"
+                        : "Processed";
             });
         };
         _worker.Start();

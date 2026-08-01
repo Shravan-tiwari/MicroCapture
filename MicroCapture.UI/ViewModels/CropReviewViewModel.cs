@@ -6,6 +6,7 @@ using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MicroCapture.Core.Data;
+using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
 
 namespace MicroCapture.UI.ViewModels;
@@ -18,8 +19,13 @@ public partial class CropReviewViewModel : ViewModelBase
     private readonly string _imagePath;
     
     [ObservableProperty] private Bitmap? _image;
-    [ObservableProperty] private double _leftSplitPercent = 50.0;
-    [ObservableProperty] private double _rightSplitPercent = 50.0;
+    [ObservableProperty] private double _splitPercent = 50.0;
+    [ObservableProperty] private bool _isSplitBookPages;
+    [ObservableProperty] private bool _isSinglePage;
+    [ObservableProperty] private int _cropX;
+    [ObservableProperty] private int _cropY;
+    [ObservableProperty] private int _cropWidth;
+    [ObservableProperty] private int _cropHeight;
 
     public CropReviewViewModel() { _jobId = ""; _dbContext = null!; _queueService = null!; _imagePath = ""; }
 
@@ -37,17 +43,15 @@ public partial class CropReviewViewModel : ViewModelBase
             {
                 using var stream = File.OpenRead(job.OriginalFilePath);
                 Image = new Bitmap(stream);
-                
-                // If there were existing boundaries, parse them. Otherwise default 50/50.
-                if (job.ManualOverrideApplied)
-                {
-                    // Basic parsing just to show they can be loaded.
-                    // For a robust system, we would map the rect back to percentages.
-                    LeftSplitPercent = 50.0;
-                    RightSplitPercent = 50.0;
-                }
+                CropWidth = (int)Image.Size.Width;
+                CropHeight = (int)Image.Size.Height;
+                var batch = _dbContext.Batches.Find(job.BatchId);
+                IsSplitBookPages = batch?.SplitBookPages == true;
+                IsSinglePage = !IsSplitBookPages;
+                if (job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox))
+                    LoadCrop(job.LeftCropBox);
             }
-            catch { }
+            catch (Exception ex) { Console.Error.WriteLine($"Crop review image load failed: {ex}"); }
         }
     }
 
@@ -65,18 +69,23 @@ public partial class CropReviewViewModel : ViewModelBase
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)
         {
-            // Convert percentages to OpenCV rect strings "X,Y,W,H"
-            // Wait, we need the original image dimensions.
-            int w = (int)Image.Size.Width;
-            int h = (int)Image.Size.Height;
-            
-            int leftW = (int)(w * (LeftSplitPercent / 100.0));
-            int rightW = (int)(w * (RightSplitPercent / 100.0));
-            
-            job.LeftCropBox = $"0,0,{leftW},{h}";
-            // Right box starts from the right edge inward, or from the end of the left box
-            int rightX = w - rightW;
-            job.RightCropBox = $"{rightX},0,{rightW},{h}";
+            var imageWidth = (int)Image.Size.Width;
+            var imageHeight = (int)Image.Size.Height;
+            if (IsSplitBookPages)
+            {
+                var leftWidth = Math.Clamp((int)(imageWidth * (SplitPercent / 100.0)), 1, imageWidth - 1);
+                job.LeftCropBox = $"0,0,{leftWidth},{imageHeight}";
+                job.RightCropBox = $"{leftWidth},0,{imageWidth - leftWidth},{imageHeight}";
+            }
+            else
+            {
+                var x = Math.Clamp(CropX, 0, imageWidth - 1);
+                var y = Math.Clamp(CropY, 0, imageHeight - 1);
+                var width = Math.Clamp(CropWidth, 1, imageWidth - x);
+                var height = Math.Clamp(CropHeight, 1, imageHeight - y);
+                job.LeftCropBox = $"{x},{y},{width},{height}";
+                job.RightCropBox = null;
+            }
             
             job.ManualOverrideApplied = true;
             job.ProcessingStatus = "Pending"; // Re-queue it
@@ -85,5 +94,13 @@ public partial class CropReviewViewModel : ViewModelBase
         }
 
         window?.Close();
+    }
+
+    private void LoadCrop(string crop)
+    {
+        var values = crop.Split(',');
+        if (values.Length != 4 || !int.TryParse(values[0], out var x) || !int.TryParse(values[1], out var y) ||
+            !int.TryParse(values[2], out var width) || !int.TryParse(values[3], out var height)) return;
+        CropX = x; CropY = y; CropWidth = width; CropHeight = height;
     }
 }

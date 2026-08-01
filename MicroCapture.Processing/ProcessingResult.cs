@@ -25,6 +25,7 @@ public class ProcessingResult
     public double BlurScore { get; set; }
     public double ExposureScore { get; set; }
     public string QcVerdict { get; set; } = "Pending"; // PASS, WARNING, FAIL
+    public string OcrStatus { get; set; } = "Pending";
 
     public List<string> Warnings { get; } = new();
     public List<string> Errors { get; } = new();

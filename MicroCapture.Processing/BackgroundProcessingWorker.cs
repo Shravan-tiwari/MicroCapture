@@ -87,11 +87,13 @@ public class BackgroundProcessingWorker
                                 string txtPath = ocrProcessor.ProcessImage(outputPath);
                             }
                             await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
+                            result.OcrStatus = "Completed";
                         }
                         catch (Exception ex)
                         {
                             StatusChanged?.Invoke(this, $"OCR error: {ex.Message}");
                             await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
+                            result.OcrStatus = "Failed";
                         }
                     }
                     else
