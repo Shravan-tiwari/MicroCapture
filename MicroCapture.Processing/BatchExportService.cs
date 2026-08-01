@@ -21,7 +21,10 @@ public class BatchExportService
 
     public async Task<string> ExportBatchAsync(string batchId, string outputDirectory, string format)
     {
+        // The capture worker updates a separate DbContext; use a no-tracking query so
+        // export sees its latest statuses rather than stale navigation properties.
         var batch = await _dbContext.Batches
+            .AsNoTracking()
             .Include(b => b.Captures)
             .FirstOrDefaultAsync(b => b.Id == batchId);
 
@@ -35,6 +38,9 @@ public class BatchExportService
             .Where(j => j.ProcessingStatus == "Completed" && j.QcStatus != "FAIL")
             .OrderBy(j => j.PageNumber)
             .ToList();
+
+        if (jobsToExport.Count == 0 && batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
+            throw new InvalidOperationException("Images are still being processed.");
 
         if (jobsToExport.Count == 0)
             throw new Exception("No successfully processed images found to export in this batch.");
@@ -67,6 +73,8 @@ public class BatchExportService
                 document.Close();
             }
             batch.Status = "Exported";
+            _dbContext.Batches.Update(batch);
+            _dbContext.CaptureJobs.UpdateRange(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return pdfFilePath;
         }
@@ -117,6 +125,8 @@ public class BatchExportService
                 job.ExportStatus = "Completed";
             }
             batch.Status = "Exported";
+            _dbContext.Batches.Update(batch);
+            _dbContext.CaptureJobs.UpdateRange(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return exportDir;
         }

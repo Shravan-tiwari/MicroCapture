@@ -64,7 +64,12 @@ public partial class MainWindowViewModel : ViewModelBase
             Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = $"Background: {msg}");
         };
         _worker.JobCompleted += (s, result) => {
-            // Can update UI based on QC result
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                var thumbnail = RecentCaptures.FirstOrDefault(t => t.FilePath == result.OriginalFilePath);
+                if (thumbnail != null)
+                    thumbnail.Status = result.Success ? "Processed" : "Processing failed";
+            });
         };
         _worker.Start();
 
@@ -288,6 +293,10 @@ public partial class MainWindowViewModel : ViewModelBase
             var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
             StatusText = $"Exported successfully: {Path.GetFileName(exportPath)}";
         }
+        catch (InvalidOperationException ex) when (ex.Message == "Images are still being processed.")
+        {
+            StatusText = "Images are still processing — wait for thumbnails to show Processed, then export.";
+        }
         catch (Exception ex)
         {
             StatusText = $"Export failed: {ex.Message}";
@@ -328,7 +337,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     JobId = jobId,
                     PageNumber = pageNumber,
                     Thumbnail = thumb,
-                    Status = isRecapture ? "Recaptured" : "Captured",
+                    Status = isRecapture ? "Recapturing" : "Processing",
                     FilePath = filePath
                 });
 

@@ -151,7 +151,11 @@
                     </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
-                            <Border Background="#1a1a2e" CornerRadius="4" Padding="4" Width="90">
+                            <Button Background="#1a1a2e" CornerRadius="4" Padding="4" Width="90"
+                                    ToolTip.Tip="Open crop review"
+                                    x:CompileBindings="False"
+                                    Command="{Binding $parent[Window].DataContext.ReviewCropCommand}"
+                                    CommandParameter="{Binding JobId}">
                                 <StackPanel Spacing="2">
                                     <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform" />
                                     <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
@@ -160,13 +164,10 @@
                                     <TextBlock Text="{Binding Status}"
                                                Foreground="#a0a0a0" FontSize="9"
                                                HorizontalAlignment="Center" />
-                                    <Button Content="CROP" 
-                                            x:CompileBindings="False"
-                                            Command="{Binding $parent[Window].DataContext.ReviewCropCommand}" 
-                                            CommandParameter="{Binding JobId}" 
-                                            FontSize="9" Padding="4,2" HorizontalAlignment="Center" Background="#533483" Foreground="White"/>
+                                    <TextBlock Text="Click to review" Foreground="#8e8ea8" FontSize="8"
+                                               HorizontalAlignment="Center" />
                                 </StackPanel>
-                            </Border>
+                            </Button>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
