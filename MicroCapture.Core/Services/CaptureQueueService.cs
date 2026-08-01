@@ -15,8 +15,48 @@ public class CaptureQueueService
     public CaptureQueueService(AppDbContext dbContext)
     {
         _dbContext = dbContext;
-        // Ensure database is created (for Phase 3)
+        // Older installations were created with EnsureCreated, so EF migrations were
+        // never recorded. Upgrade those databases in place before any query includes
+        // the newer crop/book-splitting columns.
         _dbContext.Database.EnsureCreated();
+        EnsureCompatibleSchema();
+    }
+
+    private void EnsureCompatibleSchema()
+    {
+        EnsureColumn("Batches", "BatchCode", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumn("Batches", "SplitBookPages", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "ManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "LeftCropBox", "TEXT NULL");
+        EnsureColumn("CaptureJobs", "RightCropBox", "TEXT NULL");
+    }
+
+    private void EnsureColumn(string table, string column, string definition)
+    {
+        var connection = _dbContext.Database.GetDbConnection();
+        var wasClosed = connection.State != System.Data.ConnectionState.Open;
+        if (wasClosed) connection.Open();
+        try
+        {
+            {
+                using var check = connection.CreateCommand();
+                check.CommandText = $"PRAGMA table_info(\"{table}\")";
+                using var reader = check.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                        return;
+                }
+            }
+
+            using var alter = connection.CreateCommand();
+            alter.CommandText = $"ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {definition}";
+            alter.ExecuteNonQuery();
+        }
+        finally
+        {
+            if (wasClosed) connection.Close();
+        }
     }
 
     public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber)

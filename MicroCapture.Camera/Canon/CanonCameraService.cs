@@ -24,6 +24,8 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private TaskCompletionSource<string>? _captureTcs;
     private string _currentSaveDirectory = string.Empty;
     private string _currentFilePrefix = string.Empty;
+    private uint _previousEvfOutputDevice;
+    private bool _hasPreviousEvfOutputDevice;
 
     // Delegates must remain rooted for as long as the EDSDK session is open.
     private EDSDK.EdsObjectEventHandler? _objectEventHandler;
@@ -178,8 +180,16 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             ThrowIfDisconnected();
             if (_liveViewCts != null) return Task.CompletedTask;
             var camera = _camera;
-            uint device = EDSDK.EvfOutputDevice_PC;
-            EnsureSuccess("EdsSetPropertyData(Evf_OutputDevice=PC)", Call("EdsSetPropertyData(Evf_OutputDevice=PC)", () => EDSDK.EdsSetPropertyData(camera, EDSDK.PropID_Evf_OutputDevice, 0, sizeof(uint), device)));
+            uint currentDevice = 0;
+            var getResult = Call("EdsGetPropertyData(Evf_OutputDevice)", () => EDSDK.EdsGetPropertyData(camera, EDSDK.PropID_Evf_OutputDevice, 0, out currentDevice));
+            _hasPreviousEvfOutputDevice = getResult == EDSDK.EDS_ERR_OK;
+            _previousEvfOutputDevice = currentDevice;
+            // Output-device flags are a bitmask. Retaining TFT keeps the camera LCD
+            // active while adding the PC stream used by the application.
+            uint device = _hasPreviousEvfOutputDevice
+                ? currentDevice | EDSDK.EvfOutputDevice_PC
+                : EDSDK.EvfOutputDevice_TFT | EDSDK.EvfOutputDevice_PC;
+            EnsureSuccess("EdsSetPropertyData(Evf_OutputDevice=TFT|PC)", Call("EdsSetPropertyData(Evf_OutputDevice=TFT|PC)", () => EDSDK.EdsSetPropertyData(camera, EDSDK.PropID_Evf_OutputDevice, 0, sizeof(uint), device)));
             _liveViewCts = new CancellationTokenSource();
             token = _liveViewCts.Token;
             _liveViewTask = Task.Run(() => LiveViewLoopAsync(token), CancellationToken.None);
@@ -199,8 +209,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         {
             if (_camera != IntPtr.Zero)
             {
-                uint device = EDSDK.EvfOutputDevice_TFT;
-                Call("EdsSetPropertyData(Evf_OutputDevice=TFT)", () => EDSDK.EdsSetPropertyData(_camera, EDSDK.PropID_Evf_OutputDevice, 0, sizeof(uint), device));
+                uint device = _hasPreviousEvfOutputDevice ? _previousEvfOutputDevice : EDSDK.EvfOutputDevice_TFT;
+                Call("EdsSetPropertyData(Evf_OutputDevice=restore)", () => EDSDK.EdsSetPropertyData(_camera, EDSDK.PropID_Evf_OutputDevice, 0, sizeof(uint), device));
+                _hasPreviousEvfOutputDevice = false;
             }
         }
     }
