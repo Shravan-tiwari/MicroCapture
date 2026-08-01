@@ -19,6 +19,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ICameraService _cameraService;
     private readonly AppDbContext _dbContext;
     private readonly CaptureQueueService _queueService;
+    private readonly MicroCapture.Processing.BackgroundProcessingWorker? _worker;
 
     // --- State ---
     [ObservableProperty] private string _statusText = "Ready — Connect camera to begin";
@@ -58,14 +59,14 @@ public partial class MainWindowViewModel : ViewModelBase
         _dbContext = new AppDbContext();
         _queueService = new CaptureQueueService(_dbContext);
         
-        var worker = new MicroCapture.Processing.BackgroundProcessingWorker(_dbContext, _queueService);
-        worker.StatusChanged += (s, msg) => {
+        _worker = new MicroCapture.Processing.BackgroundProcessingWorker(_dbContext, _queueService);
+        _worker.StatusChanged += (s, msg) => {
             Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = $"Background: {msg}");
         };
-        worker.JobCompleted += (s, result) => {
+        _worker.JobCompleted += (s, result) => {
             // Can update UI based on QC result
         };
-        worker.Start();
+        _worker.Start();
 
         _cameraService.StateChanged += (s, e) =>
         {
@@ -97,9 +98,9 @@ public partial class MainWindowViewModel : ViewModelBase
                     UpdateCaptureReadiness();
                 });
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Silently skip corrupt frames
+                Console.Error.WriteLine($"Live View frame decode failed: {ex}");
             }
         };
     }
@@ -119,23 +120,32 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task ConnectAsync()
     {
-        if (IsConnected)
+        try
         {
-            await _cameraService.StopLiveViewAsync();
-            await _cameraService.DisconnectAsync();
-            return;
-        }
-        StatusText = "Connecting to camera...";
-        var cameras = await _cameraService.GetConnectedCamerasAsync();
-        var first = cameras.FirstOrDefault();
-        if (first != null)
-        {
-            await _cameraService.ConnectAsync(first.Id);
+            if (IsConnected)
+            {
+                await _cameraService.StopLiveViewAsync();
+                await _cameraService.DisconnectAsync();
+                return;
+            }
+            StatusText = "Connecting to camera...";
+            var cameras = await _cameraService.GetConnectedCamerasAsync();
+            var first = cameras.FirstOrDefault();
+            if (first == null)
+            {
+                StatusText = "No cameras found";
+                return;
+            }
+            if (!await _cameraService.ConnectAsync(first.Id))
+            {
+                StatusText = "Camera connection failed — see diagnostic log";
+                return;
+            }
             await _cameraService.StartLiveViewAsync();
         }
-        else
+        catch (Exception ex)
         {
-            StatusText = "No cameras found";
+            StatusText = $"Camera error: {ex.Message}";
         }
     }
 
@@ -148,42 +158,49 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        // Ensure project exists
-        var project = _dbContext.Projects.FirstOrDefault(p => p.Name == ProjectCode);
-        if (project == null)
+        try
         {
-            project = new Project
+            // Ensure project exists
+            var project = _dbContext.Projects.FirstOrDefault(p => p.Name == ProjectCode);
+            if (project == null)
             {
-                Name = ProjectCode,
-                Customer = "",
-                Description = "Auto-created from scanning session",
-                CreatedBy = Environment.UserName,
-                OutputDirectory = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
-                    "MicroCapture", ProjectCode)
+                project = new Project
+                {
+                    Name = ProjectCode,
+                    Customer = "",
+                    Description = "Auto-created from scanning session",
+                    CreatedBy = Environment.UserName,
+                    OutputDirectory = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                        "MicroCapture", ProjectCode)
+                };
+                _dbContext.Projects.Add(project);
+                await _dbContext.SaveChangesAsync();
+            }
+            _currentProjectId = project.Id;
+            _outputDirectory = project.OutputDirectory;
+
+            // Create batch
+            var batch = new Batch
+            {
+                ProjectId = project.Id,
+                Name = BatchCode,
+                Operator = Environment.UserName,
+                SplitBookPages = SplitBookPages
             };
-            _dbContext.Projects.Add(project);
+            _dbContext.Batches.Add(batch);
             await _dbContext.SaveChangesAsync();
+
+            _currentBatchId = batch.Id;
+            PageCount = 0;
+            RecentCaptures.Clear();
+            StatusText = $"Batch '{BatchCode}' started for project '{ProjectCode}'";
+            UpdateCaptureReadiness();
         }
-        _currentProjectId = project.Id;
-        _outputDirectory = project.OutputDirectory;
-
-        // Create batch
-        var batch = new Batch
+        catch (Exception ex)
         {
-            ProjectId = project.Id,
-            Name = BatchCode,
-            Operator = Environment.UserName,
-            SplitBookPages = SplitBookPages
-        };
-        _dbContext.Batches.Add(batch);
-        await _dbContext.SaveChangesAsync();
-        _currentBatchId = batch.Id;
-
-        PageCount = 0;
-        RecentCaptures.Clear();
-        StatusText = $"Batch '{BatchCode}' started for project '{ProjectCode}'";
-        UpdateCaptureReadiness();
+            StatusText = $"Could not start batch: {ex.Message}";
+        }
     }
 
     [RelayCommand]
@@ -323,9 +340,9 @@ public partial class MainWindowViewModel : ViewModelBase
                     RecentCaptures.RemoveAt(RecentCaptures.Count - 1);
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Non-critical: skip thumbnail if file can't be read
+                Console.Error.WriteLine($"Thumbnail generation failed for '{filePath}': {ex}");
             }
         });
     }
@@ -346,6 +363,25 @@ public partial class MainWindowViewModel : ViewModelBase
             case "A":
                 ToggleAutoCapture();
                 break;
+        }
+    }
+
+    public async Task ShutdownAsync()
+    {
+        _worker?.Stop();
+        try
+        {
+            await _cameraService.StopLiveViewAsync();
+            await _cameraService.DisconnectAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Shutdown warning: {ex.Message}";
+        }
+        finally
+        {
+            _cameraService.Dispose();
+            _dbContext.Dispose();
         }
     }
 }

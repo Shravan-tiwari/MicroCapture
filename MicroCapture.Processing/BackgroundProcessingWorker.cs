@@ -14,8 +14,6 @@ namespace MicroCapture.Processing;
 /// </summary>
 public class BackgroundProcessingWorker
 {
-    private readonly AppDbContext _dbContext;
-    private readonly CaptureQueueService _queueService;
     private readonly ImageProcessor _processor;
     private CancellationTokenSource? _cts;
 
@@ -24,8 +22,9 @@ public class BackgroundProcessingWorker
 
     public BackgroundProcessingWorker(AppDbContext dbContext, CaptureQueueService queueService)
     {
-        _dbContext = dbContext;
-        _queueService = queueService;
+        // DbContext is not thread-safe. The UI owns the context passed here; this worker
+        // creates an independent context for each poll so batch creation and capture do
+        // not race the processing loop.
         _processor = new ImageProcessor();
     }
 
@@ -48,7 +47,9 @@ public class BackgroundProcessingWorker
         {
             try
             {
-                var pendingJobs = await _queueService.GetPendingJobsAsync();
+                using var dbContext = new AppDbContext();
+                var queueService = new CaptureQueueService(dbContext);
+                var pendingJobs = await queueService.GetPendingJobsAsync();
 
                 if (pendingJobs.Count == 0)
                 {
@@ -62,7 +63,7 @@ public class BackgroundProcessingWorker
                     if (token.IsCancellationRequested) break;
 
                     // Mark as InProgress
-                    await _queueService.UpdateJobStatusAsync(job.Id, "processing", "InProgress");
+                    await queueService.UpdateJobStatusAsync(job.Id, "processing", "InProgress");
 
                     // Determine output directory
                     var outputDir = Path.Combine(
@@ -74,8 +75,8 @@ public class BackgroundProcessingWorker
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {
-                        await _queueService.UpdateJobStatusAsync(job.Id, "processing", "Completed");
-                        await _queueService.UpdateJobStatusAsync(job.Id, "qc", result.QcVerdict);
+                        await queueService.UpdateJobStatusAsync(job.Id, "processing", "Completed");
+                        await queueService.UpdateJobStatusAsync(job.Id, "qc", result.QcVerdict);
 
                         // Perform OCR on all output files
                         try
@@ -85,17 +86,17 @@ public class BackgroundProcessingWorker
                             {
                                 string txtPath = ocrProcessor.ProcessImage(outputPath);
                             }
-                            await _queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
+                            await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
                         }
                         catch (Exception ex)
                         {
                             StatusChanged?.Invoke(this, $"OCR error: {ex.Message}");
-                            await _queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
+                            await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
                         }
                     }
                     else
                     {
-                        await _queueService.UpdateJobStatusAsync(job.Id, "processing", "Failed");
+                        await queueService.UpdateJobStatusAsync(job.Id, "processing", "Failed");
                     }
 
                     JobCompleted?.Invoke(this, result);

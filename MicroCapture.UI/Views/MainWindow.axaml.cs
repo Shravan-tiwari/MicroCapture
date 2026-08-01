@@ -1,3 +1,4 @@
+using System;
 using Avalonia.Controls;
 using Avalonia.Input;
 using MicroCapture.UI.ViewModels;
@@ -9,6 +10,13 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+    }
+
+    protected override async void OnClosed(EventArgs e)
+    {
+        if (DataContext is MainWindowViewModel vm)
+            await vm.ShutdownAsync();
+        base.OnClosed(e);
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
