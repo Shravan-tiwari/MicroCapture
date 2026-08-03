@@ -72,17 +72,69 @@ public class OcrProcessor
         {
             if (IsTesseractCliAvailable(out var tesseractPath))
             {
+                // Preflight: ensure the 'eng' language data is available via --list-langs
+                try
+                {
+                    var listInfo = new ProcessStartInfo
+                    {
+                        FileName = tesseractPath,
+                        Arguments = "--list-langs",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true,
+                    };
+
+                    if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
+                    {
+                        var parent = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
+                        listInfo.Environment["TESSDATA_PREFIX"] = parent;
+                    }
+
+                    using var listProc = Process.Start(listInfo)!;
+                    var listOut = listProc.StandardOutput.ReadToEnd();
+                    var listErr = listProc.StandardError.ReadToEnd();
+                    if (!listProc.WaitForExit(5_000))
+                    {
+                        try { listProc.Kill(); } catch { }
+                    }
+
+                    if (listProc.ExitCode != 0)
+                    {
+                        Console.Error.WriteLine($"Tesseract --list-langs failed: exit {listProc.ExitCode}, out={listOut}, err={listErr}");
+                        if (!allowManaged)
+                            throw new InvalidOperationException($"Tesseract --list-langs failed: {listErr}");
+                        // else we'll fall back to managed wrapper later
+                    }
+                    else
+                    {
+                        var combined = string.Join("\n", new[] { listOut, listErr });
+                        if (!combined.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Any(s => s.Trim() == "eng"))
+                        {
+                            Console.Error.WriteLine($"Tesseract --list-langs output did not include 'eng': out={listOut}, err={listErr}");
+                            // Do not fail here: the CLI may still work. Only warn and continue.
+                        }
+                    }
+                }
+                catch (Exception preEx)
+                {
+                    Console.Error.WriteLine($"Tesseract preflight check failed: {preEx}");
+                    if (!allowManaged)
+                        throw;
+                }
+
+                // Run tesseract writing output to a temp base name to avoid write-permission issues
+                var tempBase = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = tesseractPath,
-                    Arguments = $"\"{imagePath}\" \"{Path.ChangeExtension(imagePath, null)}\" -l eng",
+                    Arguments = $"\"{imagePath}\" \"{tempBase}\" -l eng",
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     CreateNoWindow = true,
                 };
 
-                // Ensure TESSDATA_PREFIX is set if we discovered a path earlier
                 if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
                 {
                     var parent = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
@@ -106,23 +158,26 @@ public class OcrProcessor
                 {
                     var err = stderr.ToString();
                     Console.Error.WriteLine($"Tesseract CLI failed (exit {proc.ExitCode}): {err}");
-                    // If managed wrapper is not explicitly allowed, do not fallback — surface the CLI failure so worker can skip OCR.
                     if (!allowManaged)
                         throw new InvalidOperationException($"Tesseract CLI failed (exit {proc.ExitCode}): {err}");
-                    // otherwise fall through to managed wrapper attempt
                 }
 
-                // tesseract writes to <base>.txt
-                if (File.Exists(txtFileName))
+                var tempTxt = tempBase + ".txt";
+                if (File.Exists(tempTxt))
+                {
+                    // Move/copy to the expected txtFileName
+                    File.Copy(tempTxt, txtFileName, true);
+                    try { File.Delete(tempTxt); } catch { }
                     return txtFileName;
+                }
 
-                // Fallback: if the default txt isn't present, try a base-name path
+                // Fallback: if the default txt isn't present, try a base-name path near the image
                 var alt = Path.ChangeExtension(imagePath, ".txt");
                 if (File.Exists(alt)) return alt;
 
                 if (!allowManaged)
                     throw new InvalidOperationException("Tesseract CLI succeeded but output file not found and managed wrapper disabled");
-                // otherwise fall through
+                // otherwise fall through to managed wrapper
             }
         }
         catch (Exception ex)
