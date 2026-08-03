@@ -365,20 +365,32 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private void ReviewCrop(string jobId)
     {
-        if (string.IsNullOrEmpty(jobId)) return;
+        if (string.IsNullOrEmpty(jobId)) { Console.WriteLine($"[ReviewCrop] JobId is empty"); return; }
+        Console.WriteLine($"[ReviewCrop] Opening crop review for {jobId}");
         var cropWindow = new CropReviewWindow();
+        Console.WriteLine($"[ReviewCrop] CropReviewWindow created");
         cropWindow.DataContext = new CropReviewViewModel(jobId, _dbContext, _queueService);
+        Console.WriteLine($"[ReviewCrop] CropReviewViewModel set as DataContext");
         
         // Show as a top-level window (since we don't have a direct reference to MainWindow here easily without injection, 
         // we'll just show it non-modal, or we can use Avalonia's Application.Current)
         if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop &&
             desktop.MainWindow != null)
         {
+            Console.WriteLine($"[ReviewCrop] Calling ShowDialog");
+            // Ensure dialog appears above the main window and is centered
+            cropWindow.WindowStartupLocation = Avalonia.Controls.WindowStartupLocation.CenterOwner;
+            cropWindow.Topmost = true; // bring to front
             cropWindow.ShowDialog(desktop.MainWindow);
+            Console.WriteLine($"[ReviewCrop] ShowDialog returned");
         }
         else
         {
+            Console.WriteLine($"[ReviewCrop] Calling Show (desktop context not available)");
+            cropWindow.WindowStartupLocation = Avalonia.Controls.WindowStartupLocation.CenterScreen;
+            cropWindow.Topmost = true;
             cropWindow.Show();
+            Console.WriteLine($"[ReviewCrop] Show called");
         }
     }
 
