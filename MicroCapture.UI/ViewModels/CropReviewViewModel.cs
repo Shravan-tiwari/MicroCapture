@@ -36,24 +36,59 @@ public partial class CropReviewViewModel : ViewModelBase
         _queueService = queueService;
         _imagePath = string.Empty;
 
+        Console.WriteLine($"[CropReviewViewModel] Initializing for job {jobId}");
         var job = _dbContext.CaptureJobs.Find(jobId);
-        if (job != null && File.Exists(job.OriginalFilePath))
+        if (job == null)
         {
-            _imagePath = job.OriginalFilePath;
+            Console.WriteLine($"[CropReviewViewModel] Job {jobId} not found in database");
+            return;
+        }
+
+        Console.WriteLine($"[CropReviewViewModel] Job found. OriginalFilePath: {job.OriginalFilePath}");
+        if (!File.Exists(job.OriginalFilePath))
+        {
+            Console.WriteLine($"[CropReviewViewModel] Image file does not exist at: {job.OriginalFilePath}");
+            return;
+        }
+
+        _imagePath = job.OriginalFilePath;
+
+        // Load the image on a background thread to avoid blocking the UI when opening the dialog.
+        Task.Run(() =>
+        {
             try
             {
+                Console.WriteLine($"[CropReviewViewModel] Background opening image file: {_imagePath}");
                 using var stream = File.OpenRead(job.OriginalFilePath);
-                Image = new Bitmap(stream);
-                CropWidth = (int)Image.Size.Width;
-                CropHeight = (int)Image.Size.Height;
+                var bmp = new Bitmap(stream);
                 var batch = _dbContext.Batches.Find(job.BatchId);
-                IsSplitBookPages = batch?.SplitBookPages == true;
-                IsSinglePage = !IsSplitBookPages;
-                if (job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox))
-                    LoadCrop(job.LeftCropBox);
+                var isSplit = batch?.SplitBookPages == true;
+                // Marshal results back to UI thread
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    try
+                    {
+                        Image = bmp;
+                        Console.WriteLine($"[CropReviewViewModel] Image loaded successfully. Size: {Image.Size}");
+                        CropWidth = (int)Image.Size.Width;
+                        CropHeight = (int)Image.Size.Height;
+                        IsSplitBookPages = isSplit;
+                        IsSinglePage = !IsSplitBookPages;
+                        Console.WriteLine($"[CropReviewViewModel] IsSplitBookPages: {IsSplitBookPages}, IsSinglePage: {IsSinglePage}");
+                        if (job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox))
+                            LoadCrop(job.LeftCropBox);
+                    }
+                    catch (Exception uiEx)
+                    {
+                        Console.WriteLine($"[CropReviewViewModel] Setting image on UI thread failed: {uiEx}");
+                    }
+                });
             }
-            catch (Exception ex) { Console.Error.WriteLine($"Crop review image load failed: {ex}"); }
-        }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[CropReviewViewModel] Background crop review image load failed: {ex}");
+            }
+        });
     }
 
     [RelayCommand]
