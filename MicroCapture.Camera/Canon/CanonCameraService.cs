@@ -216,7 +216,11 @@ public sealed class CanonCameraService : ICameraService, IDisposable
 
     public async Task DisconnectAsync()
     {
+        Console.WriteLine("[Disconnect] Started");
+
         await StopLiveViewAsync().ConfigureAwait(false);
+        Console.WriteLine("[Disconnect] LiveView stopped");
+
         IntPtr camera;
         lock (_sync)
         {
@@ -226,12 +230,22 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             _captureTcs?.TrySetException(new OperationCanceledException("Camera disconnected before capture completed."));
             _captureTcs = null;
         }
+
+        Console.WriteLine($"[Disconnect] Camera ptr = 0x{camera.ToInt64():X}");
+
         if (camera != IntPtr.Zero)
         {
+            Console.WriteLine("[Disconnect] Closing session");
             Call("EdsCloseSession", () => EDSDK.EdsCloseSession(camera));
+
+            Console.WriteLine("[Disconnect] Releasing camera");
             Release(camera, "camera session");
         }
+
+        Console.WriteLine("[Disconnect] Publishing state");
         PublishState(false, "Disconnected");
+
+        Console.WriteLine("[Disconnect] Finished");
     }
 
     public Task StartLiveViewAsync()
@@ -248,10 +262,17 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             _previousEvfOutputDevice = currentDevice;
             // Output-device flags are a bitmask. Retaining TFT keeps the camera LCD
             // active while adding the PC stream used by the application.
-            uint device = _hasPreviousEvfOutputDevice
-                ? currentDevice | EDSDK.EvfOutputDevice_PC
-                : EDSDK.EvfOutputDevice_TFT | EDSDK.EvfOutputDevice_PC;
-            EnsureSuccess("EdsSetPropertyData(Evf_OutputDevice=TFT|PC)", Call("EdsSetPropertyData(Evf_OutputDevice=TFT|PC)", () => EDSDK.EdsSetPropertyData(camera, EDSDK.PropID_Evf_OutputDevice, 0, sizeof(uint), device)));
+            uint device = EDSDK.EvfOutputDevice_PC;
+
+            EnsureSuccess(
+                "EdsSetPropertyData(Evf_OutputDevice=PC)",
+                Call("EdsSetPropertyData(Evf_OutputDevice=PC)",
+                    () => EDSDK.EdsSetPropertyData(
+                        camera,
+                        EDSDK.PropID_Evf_OutputDevice,
+                        0,
+                        sizeof(uint),
+                        device)));
             _liveViewCts = new CancellationTokenSource();
             token = _liveViewCts.Token;
             _liveViewTask = Task.Run(() => LiveViewLoopAsync(token), CancellationToken.None);
