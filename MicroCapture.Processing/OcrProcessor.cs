@@ -87,8 +87,26 @@ public class OcrProcessor
 
                     if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
                     {
-                        var parent = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
-                        listInfo.Environment["TESSDATA_PREFIX"] = parent;
+                        // Prefer pointing TESSDATA_PREFIX at the actual tessdata directory itself.
+                        string prefix;
+                        if (_tessDataPath.EndsWith("tessdata", StringComparison.OrdinalIgnoreCase))
+                        {
+                            prefix = _tessDataPath;
+                        }
+                        else if (Directory.Exists(Path.Combine(_tessDataPath, "tessdata")))
+                        {
+                            prefix = Path.Combine(_tessDataPath, "tessdata");
+                        }
+                        else if (Directory.Exists(Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata")))
+                        {
+                            prefix = Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata");
+                        }
+                        else
+                        {
+                            prefix = _tessDataPath;
+                        }
+
+                        listInfo.Environment["TESSDATA_PREFIX"] = prefix;
                     }
 
                     using var listProc = Process.Start(listInfo)!;
@@ -137,14 +155,19 @@ public class OcrProcessor
 
                 if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
                 {
+                    // Prefer pointing TESSDATA_PREFIX at the actual tessdata directory itself.
                     string prefix;
                     if (_tessDataPath.EndsWith("tessdata", StringComparison.OrdinalIgnoreCase))
                     {
-                        prefix = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
+                        prefix = _tessDataPath;
                     }
                     else if (Directory.Exists(Path.Combine(_tessDataPath, "tessdata")))
                     {
-                        prefix = _tessDataPath;
+                        prefix = Path.Combine(_tessDataPath, "tessdata");
+                    }
+                    else if (Directory.Exists(Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata")))
+                    {
+                        prefix = Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata");
                     }
                     else
                     {
