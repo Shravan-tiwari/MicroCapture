@@ -142,11 +142,9 @@ public class OcrProcessor
                 }
 
                 using var proc = Process.Start(startInfo)!;
-                var stderr = new StringBuilder();
-                proc.OutputDataReceived += (_, e) => { /* ignore stdout */ };
-                proc.BeginOutputReadLine();
-                proc.ErrorDataReceived += (_, e) => { if (e.Data != null) stderr.AppendLine(e.Data); };
-                proc.BeginErrorReadLine();
+                // Capture both stdout and stderr synchronously to avoid missing messages when exit != 0.
+                var stdout = proc.StandardOutput.ReadToEnd();
+                var stderr = proc.StandardError.ReadToEnd();
 
                 if (!proc.WaitForExit(30_000))
                 {
@@ -154,9 +152,28 @@ public class OcrProcessor
                     throw new InvalidOperationException("Tesseract CLI timed out");
                 }
 
+                // Write a debug trace so you can inspect what the CLI actually returned when run by the app.
+                try
+                {
+                    var dbg = new StringBuilder();
+                    dbg.AppendLine($"--- TESSERACT DEBUG {DateTime.UtcNow:O} ---");
+                    dbg.AppendLine($"Command: {startInfo.FileName} {startInfo.Arguments}");
+                    if (startInfo.Environment != null && startInfo.Environment.ContainsKey("TESSDATA_PREFIX"))
+                        dbg.AppendLine($"TESSDATA_PREFIX={startInfo.Environment["TESSDATA_PREFIX"]}");
+                    dbg.AppendLine($"ExitCode: {proc.ExitCode}");
+                    dbg.AppendLine("--- STDOUT ---");
+                    dbg.AppendLine(stdout);
+                    dbg.AppendLine("--- STDERR ---");
+                    dbg.AppendLine(stderr);
+                    dbg.AppendLine($"TempTxt: {tempBase}.txt");
+                    dbg.AppendLine("--- END DEBUG ---\n");
+                    File.AppendAllText("/tmp/microcapture_tess_debug.log", dbg.ToString());
+                }
+                catch { /* non-fatal logging failure */ }
+
                 if (proc.ExitCode != 0)
                 {
-                    var err = stderr.ToString();
+                    var err = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
                     Console.Error.WriteLine($"Tesseract CLI failed (exit {proc.ExitCode}): {err}");
                     if (!allowManaged)
                         throw new InvalidOperationException($"Tesseract CLI failed (exit {proc.ExitCode}): {err}");
