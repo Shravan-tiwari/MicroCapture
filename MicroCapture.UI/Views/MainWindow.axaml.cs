@@ -98,6 +98,28 @@ public partial class MainWindow : Window
                     vm.HandleKeyShortcut("A");
                     e.Handled = true;
                     break;
+                case Key.F2:
+                    // Debug: cycle every camera control to the next option (fallback when mouse is blocked)
+                    try
+                    {
+                        foreach (var ctrl in vm.CameraControls)
+                        {
+                            var opts = ctrl.Options;
+                            if (opts == null || opts.Count == 0) continue;
+                            var current = ctrl.SelectedOption;
+                            int idx = -1;
+                            if (current != null)
+                            {
+                                for (int i = 0; i < opts.Count; i++) if (opts[i].Value == current.Value) { idx = i; break; }
+                            }
+                            var next = opts[(idx + 1) % opts.Count];
+                            ctrl.SelectedOption = next;
+                            Console.WriteLine($"[F2] Cycled {ctrl.DisplayName} -> {next.DisplayName}");
+                        }
+                    }
+                    catch (Exception ex) { Console.WriteLine($"[F2] cycle failed: {ex}"); }
+                    e.Handled = true;
+                    break;
             }
         }
     }
