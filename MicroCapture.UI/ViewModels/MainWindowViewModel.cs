@@ -377,12 +377,16 @@ public partial class MainWindowViewModel : ViewModelBase
         if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop &&
             desktop.MainWindow != null)
         {
-            Console.WriteLine($"[ReviewCrop] Calling ShowDialog");
-            // Ensure dialog appears above the main window and is centered
-            cropWindow.WindowStartupLocation = Avalonia.Controls.WindowStartupLocation.CenterOwner;
-            cropWindow.Topmost = true; // bring to front
-            cropWindow.ShowDialog(desktop.MainWindow);
-            Console.WriteLine($"[ReviewCrop] ShowDialog returned");
+            Console.WriteLine("[ReviewCrop] Calling Show");
+
+            // Don't use modal dialog for this test
+            cropWindow.WindowStartupLocation =
+                Avalonia.Controls.WindowStartupLocation.CenterScreen;
+
+            // Remove Topmost for now
+            cropWindow.Show();
+
+            Console.WriteLine("[ReviewCrop] Show returned");
         }
         else
         {

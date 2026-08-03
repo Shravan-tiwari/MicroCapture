@@ -81,19 +81,52 @@ public class BackgroundProcessingWorker
                         await queueService.UpdateJobStatusAsync(job.Id, "processing", "Completed");
                         await queueService.UpdateJobStatusAsync(job.Id, "qc", result.QcVerdict);
 
-                        // Perform OCR on all output files
+                        // Perform OCR on all output files. If Tesseract/tessdata is not available, skip OCR gracefully.
                         try
                         {
-                            var ocrProcessor = new OcrProcessor();
-                            foreach (var outputPath in result.OutputFilePaths)
+                            // Attempt to construct the OCR processor. This may throw if tessdata or native libs are missing.
+                            OcrProcessor? ocrProcessor = null;
+                            try
                             {
-                                string txtPath = ocrProcessor.ProcessImage(outputPath);
+                                ocrProcessor = new OcrProcessor();
                             }
-                            await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
-                            result.OcrStatus = "Completed";
+                            catch (Exception initEx)
+                            {
+                                // If initialization fails, log and skip OCR for this job (and future jobs).
+                                Console.Error.WriteLine($"OCR initialization failed: {initEx}");
+                                StatusChanged?.Invoke(this, $"OCR unavailable: {initEx.Message}");
+                                await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Skipped");
+                                result.OcrStatus = "Skipped";
+                                ocrProcessor = null;
+                            }
+
+                            if (ocrProcessor != null)
+                            {
+                                // If tesseract CLI is not available and managed wrapper is not explicitly allowed,
+                                // skip OCR to avoid native interop crashes.
+                                var allowManaged = string.Equals(Environment.GetEnvironmentVariable("MICROCAPTURE_ALLOW_MANAGED_TESS"), "1");
+                                if (!ocrProcessor.CliAvailable && !allowManaged)
+                                {
+                                    Console.Error.WriteLine($"OCR skipped for job {job.Id}: tesseract CLI not available and managed wrapper disabled");
+                                    StatusChanged?.Invoke(this, "OCR unavailable: tesseract CLI not found");
+                                    await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Skipped");
+                                    result.OcrStatus = "Skipped";
+                                }
+                                else
+                                {
+                                    foreach (var outputPath in result.OutputFilePaths)
+                                    {
+                                        string txtPath = ocrProcessor.ProcessImage(outputPath);
+                                    }
+                                    await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
+                                    result.OcrStatus = "Completed";
+                                }
+                            }
                         }
                         catch (Exception ex)
                         {
+                            // Log full exception for diagnostics (stack trace and inner exceptions)
+                            Console.Error.WriteLine($"OCR exception for job {job.Id}: {ex}");
                             StatusChanged?.Invoke(this, $"OCR error: {ex.Message}");
                             await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
                             result.OcrStatus = "Failed";

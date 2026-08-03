@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using System.Windows.Input;
 using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
@@ -66,6 +67,77 @@ public partial class MainWindow : Window
             Console.WriteLine($"PointerReleased at {p.X:F1},{p.Y:F1} source={e.Source?.GetType().Name}");
         }
         catch { }
+    }
+
+    private void OnExportFormatButtonClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
+            {
+                var formats = new[] { "PDF", "TIFF", "JPG", "PNG" };
+                var current = vm.ExportFormat ?? "PDF";
+                var idx = Array.IndexOf(formats, current);
+                var next = formats[(idx + 1) % formats.Length];
+                vm.ExportFormat = next;
+                Console.WriteLine($"Cycled export format -> {next}");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"ExportFormat click failed: {ex}"); }
+    }
+
+    private void OnThumbnailClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (sender is Button btn)
+            {
+                var jobId = btn.Tag as string ?? (btn.DataContext as global::MicroCapture.UI.ViewModels.ThumbnailItem)?.JobId;
+                if (!string.IsNullOrEmpty(jobId) && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
+                {
+                    Console.WriteLine($"[Thumbnail] Opening review for {jobId}");
+                    
+                    // Invoke the generated ReviewCropCommand if available to keep ViewModel encapsulation
+                    try
+                    {
+                        var cmdProp = vm.GetType().GetProperty("ReviewCropCommand");
+                        if (cmdProp != null)
+                        {
+                            var cmd = cmdProp.GetValue(vm) as System.Windows.Input.ICommand;
+                            if (cmd != null)
+                            {
+                                Console.WriteLine($"[Thumbnail] ReviewCropCommand found, CanExecute={cmd.CanExecute(jobId)}");
+                                if (cmd.CanExecute(jobId))
+                                {
+                                    cmd.Execute(jobId);
+                                    Console.WriteLine($"[Thumbnail] Command executed");
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"[Thumbnail] Command CanExecute returned false");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[Thumbnail] ReviewCropCommand property is null");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[Thumbnail] ReviewCropCommand property not found");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Thumbnail] Command invoke failed: {ex}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Thumbnail] OnThumbnailClick failed: {ex}");
+        }
     }
 
     protected override async void OnClosed(EventArgs e)

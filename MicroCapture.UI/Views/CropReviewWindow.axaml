@@ -10,7 +10,13 @@
         <!-- Image Area -->
         <Border Grid.Row="0" Background="#0a0a15" Margin="10">
             <Grid>
-                <Image Source="{Binding Image}" Stretch="Uniform" />
+                <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                            VerticalScrollBarVisibility="Auto">
+                    <Image Source="{Binding Image}"
+                        Stretch="None"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Top"/>
+                </ScrollViewer>
                 <TextBlock Text="Set a crop rectangle, or a split point for book pages, then save to reprocess."
                            Foreground="White" Background="#80000000" Padding="8"
                            HorizontalAlignment="Center" VerticalAlignment="Top" Margin="10"/>

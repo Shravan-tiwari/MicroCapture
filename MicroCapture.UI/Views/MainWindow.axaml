@@ -34,12 +34,12 @@
                             Content="Start Batch"
                             Background="#533483" Foreground="White"
                             Padding="16,8" CornerRadius="4" />
-                    <ComboBox SelectedItem="{Binding ExportFormat}" Width="90" Background="#1a1a2e" Foreground="White" Margin="10,0,0,0">
-                        <x:String>PDF</x:String>
-                        <x:String>TIFF</x:String>
-                        <x:String>JPG</x:String>
-                        <x:String>PNG</x:String>
-                    </ComboBox>
+                    <Button Width="90" Background="#1a1a2e" Foreground="White" Margin="10,0,0,0" Click="OnExportFormatButtonClick">
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
+                            <TextBlock Text="{Binding ExportFormat}" />
+                            <TextBlock Text="▾" FontSize="12" Opacity="0.85" Margin="6,0,0,0" />
+                        </StackPanel>
+                    </Button>
                     <Button Command="{Binding ExportBatchCommand}"
                             Content="Export Batch"
                             Background="#0f3460" Foreground="White"
@@ -171,9 +171,8 @@
                         <DataTemplate x:DataType="vm:ThumbnailItem">
                             <Button Background="#1a1a2e" CornerRadius="4" Padding="4" Width="90"
                                     ToolTip.Tip="Open crop review"
-                                    x:CompileBindings="False"
-                                    Command="{Binding $parent[Window].DataContext.ReviewCropCommand}"
-                                    CommandParameter="{Binding JobId}">
+                                    Click="OnThumbnailClick"
+                                    Tag="{Binding JobId}">
                                 <StackPanel Spacing="2">
                                     <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform" />
                                     <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
