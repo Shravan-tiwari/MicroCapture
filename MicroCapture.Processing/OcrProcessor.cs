@@ -137,8 +137,21 @@ public class OcrProcessor
 
                 if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
                 {
-                    var parent = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
-                    startInfo.Environment["TESSDATA_PREFIX"] = parent;
+                    string prefix;
+                    if (_tessDataPath.EndsWith("tessdata", StringComparison.OrdinalIgnoreCase))
+                    {
+                        prefix = Path.GetDirectoryName(_tessDataPath) ?? _tessDataPath;
+                    }
+                    else if (Directory.Exists(Path.Combine(_tessDataPath, "tessdata")))
+                    {
+                        prefix = _tessDataPath;
+                    }
+                    else
+                    {
+                        prefix = _tessDataPath;
+                    }
+
+                    startInfo.Environment["TESSDATA_PREFIX"] = prefix;
                 }
 
                 using var proc = Process.Start(startInfo)!;
