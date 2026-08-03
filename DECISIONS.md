@@ -1,9 +1,9 @@
 # Architecture Decision Records
 
 ## ADR-001: Technology Stack
-- **Decision:** Use C# with WPF (.NET 8) for UI, SQLite for database, OpenCvSharp for CV, and Tesseract for OCR.
-- **Reason:** C# and WPF provide a mature, highly responsive native Windows desktop experience required for smooth Live View and multithreaded hardware interactions. SQLite is perfect for local transactional reliability.
-- **Status:** Proposed (Pending developer approval)
+- **Decision:** Use C# with Avalonia (.NET 8) for UI, SQLite for database, OpenCvSharp for CV, and Tesseract for OCR.
+- **Reason:** C# and Avalonia provide a responsive desktop UI while retaining a mock-camera workflow on non-Windows systems. SQLite provides local transactional reliability.
+- **Status:** Accepted
 
 ## ADR-002: Camera Abstraction
 - **Decision:** Wrap Canon EDSDK calls in a generic `ICameraService`.

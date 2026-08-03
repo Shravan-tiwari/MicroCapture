@@ -108,6 +108,25 @@
                             </StackPanel>
                         </Border>
 
+                        <TextBlock Text="CAMERA CONTROLS" Foreground="#e94560" FontWeight="Bold" FontSize="13" />
+                        <ItemsControl ItemsSource="{Binding CameraControls}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:CameraControlItem">
+                                    <Grid ColumnDefinitions="*, 120" Margin="0,2">
+                                        <TextBlock Text="{Binding DisplayName}" Foreground="#a0a0a0" VerticalAlignment="Center" />
+                                        <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
+                                                  Background="#1a1a2e" Foreground="White">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding DisplayName}" />
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
                         <!-- Capture Button -->
                         <Button Command="{Binding CaptureCommand}"
                                 HorizontalAlignment="Stretch"

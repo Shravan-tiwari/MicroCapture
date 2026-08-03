@@ -10,6 +10,12 @@ namespace MicroCapture.Camera;
 
 public class MockCameraService : ICameraService
 {
+    private readonly Dictionary<string, uint> _settings = new()
+    {
+        ["AEMode"] = 3, ["Tv"] = 0x60, ["Av"] = 0x38, ["ISO"] = 0x48,
+        ["ExposureCompensation"] = 0x00, ["WhiteBalance"] = 0, ["ImageQuality"] = 0x13ff,
+        ["DriveMode"] = 0, ["AFMode"] = 0
+    };
     private bool _isConnected;
     private bool _isLiveViewRunning;
     private CancellationTokenSource? _liveViewCts;
@@ -19,6 +25,17 @@ public class MockCameraService : ICameraService
 
     public event EventHandler<CameraStateEventArgs>? StateChanged;
     public event EventHandler<byte[]>? LiveViewFrameReceived;
+
+    public Task<IReadOnlyList<CameraSetting>> GetCameraSettingsAsync() =>
+        Task.FromResult<IReadOnlyList<CameraSetting>>(CreateSettings());
+
+    public Task SetCameraSettingAsync(string settingKey, uint value)
+    {
+        if (!_isConnected) throw new InvalidOperationException("Camera not connected.");
+        if (!_settings.ContainsKey(settingKey)) throw new ArgumentException($"Unsupported camera setting: {settingKey}");
+        _settings[settingKey] = value;
+        return Task.CompletedTask;
+    }
 
     public Task<IEnumerable<CameraDeviceInfo>> GetConnectedCamerasAsync()
     {
@@ -121,8 +138,7 @@ public class MockCameraService : ICameraService
         float y = height / 2f - (lines.Length * font.Size) / 2f;
         foreach (var line in lines)
         {
-            float textWidth = font.MeasureText(line);
-            canvas.DrawText(line, (width / 2f) - (textWidth / 2f), y, font, paint);
+            canvas.DrawText(line, width / 2f, y, SKTextAlign.Center, font, paint);
             y += font.Size + 10;
         }
 
@@ -147,4 +163,23 @@ public class MockCameraService : ICameraService
         _liveViewCts?.Cancel();
         _liveViewCts?.Dispose();
     }
+
+    private IReadOnlyList<CameraSetting> CreateSettings() => new[]
+    {
+        Setting("AEMode", "Exposure mode", (3, "Manual"), (0, "Program"), (1, "Tv"), (2, "Av")),
+        Setting("Tv", "Shutter speed", (0x60, "1/125"), (0x58, "1/60"), (0x68, "1/250")),
+        Setting("Av", "Aperture", (0x38, "f/5.6"), (0x30, "f/4"), (0x40, "f/8")),
+        Setting("ISO", "ISO", (0, "Auto"), (0x48, "100"), (0x50, "200"), (0x58, "400"), (0x60, "800")),
+        Setting("ExposureCompensation", "Exposure compensation", (0, "0"), (0x08, "+1"), (unchecked((uint)-8), "-1")),
+        Setting("WhiteBalance", "White balance", (0, "Auto"), (1, "Daylight"), (3, "Cloudy"), (6, "Tungsten")),
+        Setting("ImageQuality", "Image quality", (0x13ff, "JPEG Large")),
+        Setting("DriveMode", "Drive mode", (0, "Single"), (1, "Continuous")),
+        Setting("AFMode", "Focus mode", (0, "One-shot"), (1, "AI Servo"))
+    };
+
+    private CameraSetting Setting(string key, string name, params (uint Value, string Name)[] options) => new()
+    {
+        Key = key, DisplayName = name, Value = _settings[key],
+        Options = options.Select(option => new CameraSettingOption { Value = option.Value, DisplayName = option.Name }).ToArray()
+    };
 }

@@ -43,3 +43,13 @@
 - [x] Intelligent 50/50 page splitting via OpenCV
 - [x] Manual crop review UI for precise boundaries
 - [x] Export to PDF, TIFF, JPG, and PNG (Local File System)
+
+## PHASE 11: Operator Reliability and Camera Controls
+- [x] Recover jobs interrupted while processing
+- [x] Prevent superseded recaptures from exporting
+- [x] Discover and apply supported Canon camera settings from the dashboard
+- [x] Verify local export files are written before reporting success
+- [ ] Hardware verification on EOS R8 and representative document fixtures
+
+## PHASE 12: DMS Integration
+- [ ] Implement authenticated HTTP/REST batch synchronization

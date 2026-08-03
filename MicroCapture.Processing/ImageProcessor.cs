@@ -16,6 +16,32 @@ public class ImageProcessor
     public int CropPadding { get; set; } = 10;
     public double BlurThreshold { get; set; } = 100.0;
 
+    /// <summary>Fast, non-mutating boundary check for live-view auto-capture gating.</summary>
+    public static bool IsDocumentDetected(byte[] encodedImage)
+    {
+        try
+        {
+            using var image = Cv2.ImDecode(encodedImage, ImreadModes.Grayscale);
+            if (image.Empty()) return false;
+            using var blurred = new Mat();
+            using var edges = new Mat();
+            using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
+            using var joined = new Mat();
+            Cv2.GaussianBlur(image, blurred, new Size(5, 5), 0);
+            Cv2.Canny(blurred, edges, 50, 200);
+            Cv2.Dilate(edges, joined, kernel, iterations: 2);
+            Cv2.FindContours(joined, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+            var imageArea = image.Width * image.Height;
+            return contours.Any(contour => Cv2.ContourArea(contour) / imageArea >= 0.2);
+        }
+        catch
+        {
+            // Live-view analysis is advisory. A decoding/native failure must never
+            // interrupt the stream or turn an operator capture into a crash.
+            return false;
+        }
+    }
+
     /// <summary>
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
@@ -196,21 +222,38 @@ public class ImageProcessor
 
             result.CropConfidence = ratio;
 
-            var rect = Cv2.BoundingRect(contours[maxIdx]);
-
-            // Apply padding
-            int x = Math.Max(0, rect.X - CropPadding);
-            int y = Math.Max(0, rect.Y - CropPadding);
-            int w = Math.Min(src.Cols - x, rect.Width + 2 * CropPadding);
-            int h = Math.Min(src.Rows - y, rect.Height + 2 * CropPadding);
-
             if (ratio < CropConfidenceThreshold)
             {
                 result.Warnings.Add($"Crop confidence low ({ratio:P1}). Keeping full image.");
                 return src;
             }
 
-            var cropped = src[new Rect(x, y, w, h)].Clone();
+            // A four-corner contour represents a photographed page. Rectifying it
+            // here avoids the trapezoidal crop produced by a bounding rectangle.
+            var perimeter = Cv2.ArcLength(contours[maxIdx], true);
+            var polygon = Cv2.ApproxPolyDP(contours[maxIdx], perimeter * 0.02, true);
+            Mat cropped;
+            if (polygon.Length == 4)
+            {
+                var source = OrderCorners(polygon.Select(point => new Point2f(point.X, point.Y)).ToArray());
+                var width = Math.Max(1, (int)Math.Round(Math.Max(Distance(source[0], source[1]), Distance(source[2], source[3]))));
+                var height = Math.Max(1, (int)Math.Round(Math.Max(Distance(source[0], source[3]), Distance(source[1], source[2]))));
+                var destination = new[] { new Point2f(0, 0), new Point2f(width - 1, 0), new Point2f(width - 1, height - 1), new Point2f(0, height - 1) };
+                using var transform = Cv2.GetPerspectiveTransform(source, destination);
+                cropped = new Mat();
+                Cv2.WarpPerspective(src, cropped, transform, new Size(width, height), InterpolationFlags.Linear, BorderTypes.Replicate);
+                result.Warnings.Add("Document boundary detected and perspective-corrected.");
+            }
+            else
+            {
+                var rect = Cv2.BoundingRect(contours[maxIdx]);
+                int x = Math.Max(0, rect.X - CropPadding);
+                int y = Math.Max(0, rect.Y - CropPadding);
+                int w = Math.Min(src.Cols - x, rect.Width + 2 * CropPadding);
+                int h = Math.Min(src.Rows - y, rect.Height + 2 * CropPadding);
+                cropped = src[new Rect(x, y, w, h)].Clone();
+                result.Warnings.Add("Document boundary was not quadrilateral; applied rectangular auto-crop.");
+            }
             result.WasCropped = true;
             return cropped;
         }
@@ -219,6 +262,23 @@ public class ImageProcessor
             result.Warnings.Add($"Auto-crop failed: {ex.Message}");
             return src;
         }
+    }
+
+    private static Point2f[] OrderCorners(Point2f[] corners)
+    {
+        var ordered = new Point2f[4];
+        ordered[0] = corners.OrderBy(point => point.X + point.Y).First(); // top-left
+        ordered[2] = corners.OrderByDescending(point => point.X + point.Y).First(); // bottom-right
+        ordered[1] = corners.OrderByDescending(point => point.X - point.Y).First(); // top-right
+        ordered[3] = corners.OrderBy(point => point.X - point.Y).First(); // bottom-left
+        return ordered;
+    }
+
+    private static double Distance(Point2f first, Point2f second)
+    {
+        var dx = first.X - second.X;
+        var dy = first.Y - second.Y;
+        return Math.Sqrt(dx * dx + dy * dy);
     }
 
     // ───────────── DESKEW ─────────────

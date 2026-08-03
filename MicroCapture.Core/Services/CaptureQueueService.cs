@@ -85,6 +85,34 @@ public class CaptureQueueService
             .ToListAsync();
     }
 
+    /// <summary>Recovers work interrupted by an application or power failure.</summary>
+    public async Task<int> RecoverInterruptedJobsAsync()
+    {
+        var interrupted = await _dbContext.CaptureJobs
+            .Where(job => job.ProcessingStatus == "InProgress")
+            .ToListAsync();
+        foreach (var job in interrupted)
+            job.ProcessingStatus = "Pending";
+        if (interrupted.Count > 0)
+            await _dbContext.SaveChangesAsync();
+        return interrupted.Count;
+    }
+
+    /// <summary>Supersedes previous attempts for a page before recording a recapture.</summary>
+    public async Task SupersedePageAsync(string batchId, int pageNumber)
+    {
+        var priorAttempts = await _dbContext.CaptureJobs
+            .Where(job => job.BatchId == batchId && job.PageNumber == pageNumber && job.ProcessingStatus != "Superseded")
+            .ToListAsync();
+        foreach (var job in priorAttempts)
+        {
+            job.ProcessingStatus = "Superseded";
+            job.ExportStatus = "Superseded";
+        }
+        if (priorAttempts.Count > 0)
+            await _dbContext.SaveChangesAsync();
+    }
+
     public async Task UpdateJobStatusAsync(string jobId, string statusType, string newStatus)
     {
         var job = await _dbContext.CaptureJobs.FindAsync(jobId);

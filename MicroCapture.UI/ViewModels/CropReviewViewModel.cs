@@ -34,6 +34,7 @@ public partial class CropReviewViewModel : ViewModelBase
         _jobId = jobId;
         _dbContext = dbContext;
         _queueService = queueService;
+        _imagePath = string.Empty;
 
         var job = _dbContext.CaptureJobs.Find(jobId);
         if (job != null && File.Exists(job.OriginalFilePath))
@@ -89,6 +90,22 @@ public partial class CropReviewViewModel : ViewModelBase
             
             job.ManualOverrideApplied = true;
             job.ProcessingStatus = "Pending"; // Re-queue it
+            job.QcStatus = "Pending";
+            job.OcrStatus = "Pending";
+            job.ExportStatus = "Pending";
+
+            // A reprocess must not leave stale derivatives eligible for export.
+            var processedDirectory = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
+            var baseName = Path.GetFileNameWithoutExtension(job.OriginalFilePath);
+            if (Directory.Exists(processedDirectory))
+            {
+                foreach (var derivative in Directory.EnumerateFiles(processedDirectory, $"{baseName}*"))
+                {
+                    try { File.Delete(derivative); }
+                    catch (IOException) { /* The worker will overwrite its own output on retry. */ }
+                    catch (UnauthorizedAccessException) { /* Preserve the source job; report remains available. */ }
+                }
+            }
             
             await _dbContext.SaveChangesAsync();
         }

@@ -5,7 +5,7 @@ Welcome to the Micrographics Capture Software. This tool is designed to provide 
 ## 1. Getting Started
 
 ### Prerequisites
-- Windows 10/11 or macOS.
+- Windows 10/11 for Canon EOS R8 control through Canon EDSDK. macOS runs the mock camera for workflow development.
 - Canon EOS R8 Camera connected via USB.
 - `.NET 8` Runtime installed (if not running the self-contained executable).
 
@@ -24,25 +24,28 @@ The application interface consists of the following sections:
 
 1. **Connect Camera**
    Ensure your Canon camera is powered on and connected via USB. Click the **CONNECT** button in the top left. The status should turn to `CONNECTED` and you will see the Live View feed.
-2. **Setup Project & Batch**
+2. **Set camera controls**
+   The right panel shows the settings supported by the connected camera and lens: exposure mode, shutter, aperture, ISO, exposure compensation, white balance, image quality, drive mode, and focus mode. Changes apply immediately; unsupported properties are omitted.
+3. **Setup Project & Batch**
    - Enter a **Project Code** (e.g., `Archive_2026`).
    - Enter a **Batch Code** (e.g., `Box_01`).
    - Click **Start Batch**. This initializes the database and creates the output directory.
-3. **Capture Images**
+4. **Capture Images**
    Place your document beneath the camera.
-   - Wait for the Live View overlay to display **READY TO CAPTURE** (which means Focus, Exposure, and Document detection have passed).
+   - Wait for the Live View overlay to display **READY TO CAPTURE** (a document boundary has been detected and the project/batch are set). Camera focus and exposure remain operator-controlled through the dashboard.
    - Press **SPACEBAR** or click the **CAPTURE** button to take a photo.
-4. **Review Thumbnails**
+5. **Review Thumbnails and Crop**
    As you capture, thumbnails appear in the bottom strip. The background worker automatically processes the images (cropping, deskewing, OCR).
-   - If a page needs to be retaken, select it and press **R** (Recapture).
-5. **Export to PDF**
-   Once your batch is complete, click **Export Batch**. The software will compile all successfully processed images and OCR text into a single, searchable PDF located in your `Pictures/MicroCapture` directory.
+   - If a page needs to be retaken, press **R**. The replacement supersedes the earlier image and only the replacement is exported.
+   - Click a thumbnail for crop review. For a single page, enter the crop rectangle in source-image pixels. For a book, set the split percentage. Saving reprocesses the preserved original.
+6. **Export**
+   Once thumbnails show Processed, select PDF, TIFF, JPG, or PNG and click **Export Batch**. PDF includes a basic OCR search/copy layer. All output files are checked before export reports success.
 
 ## 4. Keyboard Shortcuts
 
 - **SPACE**: Capture a new frame.
 - **R**: Recapture the last frame.
-- **A**: Toggle Auto-Capture (automatically triggers capture when a document is placed and focused).
+- **A**: Toggle Auto-Capture. It captures when the live-view readiness condition is met, with a 1.5-second minimum interval.
 
 ## 5. Troubleshooting
 

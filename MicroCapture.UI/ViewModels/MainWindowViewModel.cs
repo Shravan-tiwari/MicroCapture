@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
@@ -42,10 +43,15 @@ public partial class MainWindowViewModel : ViewModelBase
     private string? _currentProjectId;
     private string? _currentBatchId;
     private string _outputDirectory = string.Empty;
+    private string _connectedCameraModel = "Not connected";
     private int _liveViewFramePending;
+    private int _captureInProgress;
+    private DateTime _lastAutoCaptureUtc = DateTime.MinValue;
+    private DateTime _lastDocumentCheckUtc = DateTime.MinValue;
 
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
+    public ObservableCollection<CameraControlItem> CameraControls { get; } = new();
 
     public MainWindowViewModel()
     {
@@ -61,7 +67,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _dbContext = new AppDbContext();
         _queueService = new CaptureQueueService(_dbContext);
         
-        _worker = new MicroCapture.Processing.BackgroundProcessingWorker(_dbContext, _queueService);
+        _worker = new MicroCapture.Processing.BackgroundProcessingWorker();
         _worker.StatusChanged += (s, msg) => {
             Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = $"Background: {msg}");
         };
@@ -84,7 +90,7 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 IsConnected = e.IsConnected;
                 ConnectionStatus = e.IsConnected ? "CONNECTED" : "DISCONNECTED";
-                CameraModel = e.IsConnected ? "Canon EOS R8 (Mock)" : "Not connected";
+                CameraModel = e.IsConnected ? _connectedCameraModel : "Not connected";
                 StatusText = e.StatusMessage;
                 UpdateCaptureReadiness();
             });
@@ -104,11 +110,22 @@ public partial class MainWindowViewModel : ViewModelBase
                     var old = LiveViewImage;
                     LiveViewImage = bitmap;
                     old?.Dispose();
-                    // Simulate document detection for mock
-                    FocusStatus = "✓ OK";
-                    ExposureStatus = "✓ OK";
-                    DocumentStatus = "✓ Detected";
+                    // Boundary detection is throttled to keep the live-view path
+                    // responsive while still providing a meaningful auto-capture gate.
+                    if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
+                    {
+                        _lastDocumentCheckUtc = DateTime.UtcNow;
+                        var detected = MicroCapture.Processing.ImageProcessor.IsDocumentDetected(frameBytes);
+                        DocumentStatus = detected ? "✓ Boundary detected" : "Waiting for boundary";
+                    }
+                    FocusStatus = "Camera-controlled";
+                    ExposureStatus = "Camera-controlled";
                     UpdateCaptureReadiness();
+                    if (IsAutoCapture && DocumentStatus.StartsWith("✓") && _currentBatchId != null && DateTime.UtcNow - _lastAutoCaptureUtc >= TimeSpan.FromSeconds(1.5))
+                    {
+                        _lastAutoCaptureUtc = DateTime.UtcNow;
+                        _ = CaptureAsync();
+                    }
                 }
                 catch (Exception ex) { Console.Error.WriteLine($"Live View frame decode failed: {ex}"); }
                 finally { Volatile.Write(ref _liveViewFramePending, 0); }
@@ -122,6 +139,8 @@ public partial class MainWindowViewModel : ViewModelBase
             CaptureReadiness = "NOT READY";
         else if (string.IsNullOrWhiteSpace(ProjectCode) || string.IsNullOrWhiteSpace(BatchCode))
             CaptureReadiness = "SET PROJECT & BATCH";
+        else if (!DocumentStatus.StartsWith("✓"))
+            CaptureReadiness = "WAITING FOR DOCUMENT";
         else
             CaptureReadiness = "READY TO CAPTURE";
     }
@@ -152,7 +171,10 @@ public partial class MainWindowViewModel : ViewModelBase
                 StatusText = "Camera connection failed — see diagnostic log";
                 return;
             }
+            _connectedCameraModel = first.Model;
+            CameraModel = first.Model;
             await _cameraService.StartLiveViewAsync();
+            await LoadCameraSettingsAsync();
         }
         catch (Exception ex)
         {
@@ -196,6 +218,7 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 ProjectId = project.Id,
                 Name = BatchCode,
+                BatchCode = BatchCode,
                 Operator = Environment.UserName,
                 SplitBookPages = SplitBookPages
             };
@@ -217,6 +240,9 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task CaptureAsync()
     {
+        if (Interlocked.Exchange(ref _captureInProgress, 1) != 0) return;
+        try
+        {
         if (!IsConnected) { StatusText = "Camera not connected"; return; }
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
@@ -243,11 +269,16 @@ public partial class MainWindowViewModel : ViewModelBase
             StatusText = $"Capture failed: {ex.Message}";
             PageCount--; // Revert count
         }
+        }
+        finally { Volatile.Write(ref _captureInProgress, 0); }
     }
 
     [RelayCommand]
     private async Task RecaptureAsync()
     {
+        if (Interlocked.Exchange(ref _captureInProgress, 1) != 0) return;
+        try
+        {
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
         var pageStr = PageCount.ToString("D6");
@@ -256,15 +287,16 @@ public partial class MainWindowViewModel : ViewModelBase
         StatusText = $"Recapturing page {pageStr}...";
         try
         {
+            await _queueService.SupersedePageAsync(_currentBatchId, PageCount);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
             var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
 
             // Update thumbnail for the recaptured page
-            var existing = RecentCaptures.FirstOrDefault(t => t.PageNumber == PageCount);
-            if (existing != null)
+            var existing = RecentCaptures.Where(t => t.PageNumber == PageCount).ToList();
+            foreach (var thumbnail in existing)
             {
-                existing.Status = "Recaptured";
-                existing.JobId = job.Id;
+                thumbnail.Thumbnail?.Dispose();
+                RecentCaptures.Remove(thumbnail);
             }
             AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
 
@@ -274,6 +306,8 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             StatusText = $"Recapture failed: {ex.Message}";
         }
+        }
+        finally { Volatile.Write(ref _captureInProgress, 0); }
     }
 
     [RelayCommand]
@@ -281,6 +315,23 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         IsAutoCapture = !IsAutoCapture;
         StatusText = IsAutoCapture ? "AUTO CAPTURE: ON" : "AUTO CAPTURE: OFF";
+    }
+
+    private async Task LoadCameraSettingsAsync()
+    {
+        CameraControls.Clear();
+        try
+        {
+            var settings = await _cameraService.GetCameraSettingsAsync();
+            foreach (var setting in settings)
+                CameraControls.Add(new CameraControlItem(setting, _cameraService, message => StatusText = message));
+            if (CameraControls.Count == 0)
+                StatusText = "Camera connected. This body did not expose configurable capture properties.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Camera connected, but settings could not be read: {ex.Message}";
+        }
     }
 
     [RelayCommand]
@@ -320,7 +371,8 @@ public partial class MainWindowViewModel : ViewModelBase
         
         // Show as a top-level window (since we don't have a direct reference to MainWindow here easily without injection, 
         // we'll just show it non-modal, or we can use Avalonia's Application.Current)
-        if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop)
+        if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop &&
+            desktop.MainWindow != null)
         {
             cropWindow.ShowDialog(desktop.MainWindow);
         }
@@ -411,4 +463,43 @@ public partial class ThumbnailItem : ObservableObject
     [ObservableProperty] private Bitmap? _thumbnail;
     [ObservableProperty] private string _status = "Captured";
     [ObservableProperty] private string _filePath = "";
+}
+
+public partial class CameraControlItem : ObservableObject
+{
+    private readonly ICameraService _cameraService;
+    private readonly Action<string> _report;
+    public string Key { get; }
+    public string DisplayName { get; }
+    public IReadOnlyList<CameraSettingOption> Options { get; }
+    [ObservableProperty] private CameraSettingOption? _selectedOption;
+
+    public CameraControlItem(CameraSetting setting, ICameraService cameraService, Action<string> report)
+    {
+        Key = setting.Key;
+        DisplayName = setting.DisplayName;
+        Options = setting.Options;
+        _cameraService = cameraService;
+        _report = report;
+        _selectedOption = Options.FirstOrDefault(option => option.Value == setting.Value) ?? Options.FirstOrDefault();
+    }
+
+    partial void OnSelectedOptionChanged(CameraSettingOption? value)
+    {
+        if (value == null) return;
+        _ = ApplyAsync(value);
+    }
+
+    private async Task ApplyAsync(CameraSettingOption option)
+    {
+        try
+        {
+            await _cameraService.SetCameraSettingAsync(Key, option.Value);
+            _report($"Camera setting updated: {DisplayName} = {option.DisplayName}");
+        }
+        catch (Exception ex)
+        {
+            _report($"Could not update {DisplayName}: {ex.Message}");
+        }
+    }
 }

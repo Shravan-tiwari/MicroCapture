@@ -13,6 +13,23 @@ namespace MicroCapture.Camera.Canon;
 /// <summary>EDSDK-backed camera service. All native calls are traced and native references are released deterministically.</summary>
 public sealed class CanonCameraService : ICameraService, IDisposable
 {
+    private sealed record CameraPropertyDefinition(string Key, string DisplayName, uint PropertyId);
+
+    // These are the capture controls supported by Canon EDSDK. The actual values
+    // are discovered from the connected camera, which prevents offering a lens or
+    // body setting that cannot be applied.
+    private static readonly CameraPropertyDefinition[] OperatorProperties =
+    {
+        new("AEMode", "Exposure mode", EDSDK.PropID_AEMode),
+        new("Tv", "Shutter speed", EDSDK.PropID_Tv),
+        new("Av", "Aperture", EDSDK.PropID_Av),
+        new("ISO", "ISO", EDSDK.PropID_ISOSpeed),
+        new("ExposureCompensation", "Exposure compensation", EDSDK.PropID_ExposureCompensation),
+        new("WhiteBalance", "White balance", EDSDK.PropID_WhiteBalance),
+        new("ImageQuality", "Image quality", EDSDK.PropID_ImageQuality),
+        new("DriveMode", "Drive mode", EDSDK.PropID_DriveMode),
+        new("AFMode", "Focus mode", EDSDK.PropID_AFMode)
+    };
     private static readonly object LogSync = new();
     private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
     private readonly object _sync = new();
@@ -38,6 +55,48 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     public bool IsConnected { get { lock (_sync) return _isConnected; } }
     public event EventHandler<CameraStateEventArgs>? StateChanged;
     public event EventHandler<byte[]>? LiveViewFrameReceived;
+
+    public Task<IReadOnlyList<CameraSetting>> GetCameraSettingsAsync()
+    {
+        var settings = new List<CameraSetting>();
+        lock (_sync)
+        {
+            ThrowIfDisconnected();
+            foreach (var definition in OperatorProperties)
+            {
+                uint current = 0;
+                if (!Succeeded(Call("EdsGetPropertyData", () => EDSDK.EdsGetPropertyData(_camera, definition.PropertyId, 0, out current), definition.Key)))
+                    continue;
+                var description = default(EDSDK.EdsPropertyDesc);
+                if (!Succeeded(Call("EdsGetPropertyDesc", () => EDSDK.EdsGetPropertyDesc(_camera, definition.PropertyId, out description), definition.Key)) ||
+                    description.NumElements <= 0 || description.PropDesc == null)
+                    continue;
+
+                var options = description.PropDesc
+                    .Take(Math.Min(description.NumElements, description.PropDesc.Length))
+                    .Select(value => unchecked((uint)value))
+                    .Distinct()
+                    .Select(value => new CameraSettingOption { Value = value, DisplayName = FormatCameraValue(definition.Key, value) })
+                    .ToArray();
+                if (options.Length > 0)
+                    settings.Add(new CameraSetting { Key = definition.Key, DisplayName = definition.DisplayName, Value = current, Options = options });
+            }
+        }
+        return Task.FromResult<IReadOnlyList<CameraSetting>>(settings);
+    }
+
+    public Task SetCameraSettingAsync(string settingKey, uint value)
+    {
+        var definition = OperatorProperties.FirstOrDefault(property => property.Key == settingKey)
+            ?? throw new ArgumentException($"Unsupported camera setting: {settingKey}", nameof(settingKey));
+        lock (_sync)
+        {
+            ThrowIfDisconnected();
+            EnsureSuccess($"EdsSetPropertyData({definition.Key})", Call($"EdsSetPropertyData({definition.Key})", () =>
+                EDSDK.EdsSetPropertyData(_camera, definition.PropertyId, 0, sizeof(uint), value), $"value=0x{value:X8}"));
+        }
+        return Task.CompletedTask;
+    }
 
     public CanonCameraService()
     {
@@ -423,6 +482,23 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         EDSDK.EDS_ERR_INVALID_PARAMETER => "INVALID_PARAMETER", EDSDK.EDS_ERR_NOT_SUPPORTED => "NOT_SUPPORTED",
         EDSDK.EDS_ERR_TAKE_PICTURE_AF_NG => "TAKE_PICTURE_AF_NG", EDSDK.EDS_ERR_LOW_BATTERY => "LOW_BATTERY", _ => "UNKNOWN_EDSDK_ERROR"
     };
+
+    private static string FormatCameraValue(string key, uint value)
+    {
+        // Values differ by body/firmware. Keep the raw SDK code visible so that
+        // every option remains unambiguous even where Canon uses a new value.
+        if (key == "ISO")
+        {
+            var iso = value switch { 0 => "Auto", 0x48 => "100", 0x50 => "200", 0x58 => "400", 0x60 => "800", 0x68 => "1600", 0x70 => "3200", _ => null };
+            if (iso != null) return $"{iso} (0x{value:X})";
+        }
+        if (key == "WhiteBalance")
+        {
+            var wb = value switch { 0 => "Auto", 1 => "Daylight", 2 => "Cloudy", 3 => "Tungsten", 4 => "Fluorescent", 6 => "Flash", _ => null };
+            if (wb != null) return $"{wb} (0x{value:X})";
+        }
+        return $"0x{value:X}";
+    }
 
     public void Dispose()
     {

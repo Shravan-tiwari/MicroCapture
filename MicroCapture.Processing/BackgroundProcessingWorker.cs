@@ -10,7 +10,7 @@ namespace MicroCapture.Processing;
 /// <summary>
 /// Background worker that polls the CaptureQueue for pending jobs 
 /// and runs the image processing pipeline on each one.
-/// Crash-safe: jobs remain "Pending" until processing completes and DB is updated.
+/// Crash-safe: interrupted InProgress jobs are returned to Pending on worker startup.
 /// </summary>
 public class BackgroundProcessingWorker
 {
@@ -20,16 +20,17 @@ public class BackgroundProcessingWorker
     public event EventHandler<ProcessingResult>? JobCompleted;
     public event EventHandler<string>? StatusChanged;
 
-    public BackgroundProcessingWorker(AppDbContext dbContext, CaptureQueueService queueService)
+    public BackgroundProcessingWorker()
     {
-        // DbContext is not thread-safe. The UI owns the context passed here; this worker
-        // creates an independent context for each poll so batch creation and capture do
-        // not race the processing loop.
+        // The background worker creates its own AppDbContext instances for polling.
+        // This avoids DbContext thread-safety issues while still processing the same
+        // persisted local database created by the UI layer.
         _processor = new ImageProcessor();
     }
 
     public void Start()
     {
+        if (_cts != null) return;
         _cts = new CancellationTokenSource();
         Task.Run(() => ProcessLoop(_cts.Token));
         StatusChanged?.Invoke(this, "Background processing started.");
@@ -38,6 +39,7 @@ public class BackgroundProcessingWorker
     public void Stop()
     {
         _cts?.Cancel();
+        _cts = null;
         StatusChanged?.Invoke(this, "Background processing stopped.");
     }
 
@@ -49,6 +51,7 @@ public class BackgroundProcessingWorker
             {
                 using var dbContext = new AppDbContext();
                 var queueService = new CaptureQueueService(dbContext);
+                await queueService.RecoverInterruptedJobsAsync();
                 var pendingJobs = await queueService.GetPendingJobsAsync();
 
                 if (pendingJobs.Count == 0)

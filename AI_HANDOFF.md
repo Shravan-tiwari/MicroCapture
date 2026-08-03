@@ -3,7 +3,7 @@
 CURRENT STATE
 
 Version:
-0.4.0
+0.5.0 (unverified build in this checkout)
 
 Working:
 - Repository initialized
@@ -16,17 +16,18 @@ Working:
 - Background worker for durable queue processing.
 
 - Phase 4: Canon EOS R8 integration (EDSDK) completed.
-- Phase 5: OCR pipeline (Tesseract) and Export/DMS pipeline (SkiaSharp PDF generation) completed.
+- OCR pipeline (Tesseract) and local export pipeline completed.
+- Runtime camera-settings dashboard, crash recovery, recapture superseding, perspective-corrected boundary detection, and TIFF output verification added.
 
 In progress:
-- Preparing for Phase 10
+- Hardware validation of Canon camera controls and capture workflow.
+- Add automated image-fixture and export tests.
 
 Next:
-- Phase 10: Export & DMS Integration (HTTP/REST synchronization)
-- Implement cloud syncing / API endpoints for batch upload
+- Implement DMS / HTTP synchronization.
 
 Known issue:
-- None
+- The local development environment currently has no dotnet CLI; build and hardware verification remain required.
 
 Last verified commit:
 [See latest commit hash in git log]
