@@ -75,10 +75,10 @@
             <Border Grid.Column="0" Background="#0a0a15" Margin="10,10,5,5" CornerRadius="6"
                     BorderBrush="#0f3460" BorderThickness="2">
                 <Grid>
-                    <Image Source="{Binding LiveViewImage}" Stretch="Uniform" />
+                    <Image Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
                     <!-- Overlay: readiness badge -->
                     <Border Background="#80000000" HorizontalAlignment="Left" VerticalAlignment="Top"
-                            Padding="12,6" Margin="15" CornerRadius="4">
+                            Padding="12,6" Margin="15" CornerRadius="4" IsHitTestVisible="False">
                         <TextBlock Text="{Binding CaptureReadiness}" Foreground="#e94560"
                                    FontWeight="Bold" FontSize="14" />
                     </Border>

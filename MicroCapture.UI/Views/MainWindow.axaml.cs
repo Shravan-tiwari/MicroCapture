@@ -20,31 +20,52 @@ public partial class MainWindow : Window
         {
             if (sender is Button btn && btn.DataContext is CameraControlItem item)
             {
-                // Build a simple ContextMenu from the available options.
-                var menu = new ContextMenu();
-                var menuItems = new List<MenuItem>();
-                foreach (var opt in item.Options)
+                // Fast, reliable behavior: cycle to the next option on each click.
+                var opts = item.Options;
+                if (opts == null || opts.Count == 0) return;
+                var current = item.SelectedOption;
+                int idx = -1;
+                if (current != null)
                 {
-                    var mi = new MenuItem { Header = opt.DisplayName };
-                    var captured = opt; // capture loop variable
-                    mi.Click += (_, __) =>
+                    for (int i = 0; i < opts.Count; i++)
                     {
-                        try { item.SelectedOption = captured; }
-                        catch (Exception ex) { Console.Error.WriteLine($"Menu item click failed: {ex}"); }
-                    };
-                    menuItems.Add(mi);
+                        if (opts[i].Value == current.Value)
+                        {
+                            idx = i; break;
+                        }
+                    }
                 }
-                foreach (var mi in menuItems)
-                    menu.Items.Add(mi);
-                btn.ContextMenu = menu;
-                // Open next tick to ensure the menu is attached
-                Avalonia.Threading.Dispatcher.UIThread.Post(() => menu.Open(btn));
+                var next = opts[(idx + 1) % opts.Count];
+                item.SelectedOption = next;
+                Console.WriteLine($"Cycled {item.DisplayName} -> {next.DisplayName}");
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"CameraControl menu creation failed: {ex}");
+            Console.Error.WriteLine($"CameraControl button click failed: {ex}");
         }
+    }
+
+    protected override void OnPointerPressed(Avalonia.Input.PointerPressedEventArgs e)
+    {
+        base.OnPointerPressed(e);
+        try
+        {
+            var p = e.GetPosition(this);
+            Console.WriteLine($"PointerPressed at {p.X:F1},{p.Y:F1} source={e.Source?.GetType().Name}");
+        }
+        catch { }
+    }
+
+    protected override void OnPointerReleased(Avalonia.Input.PointerReleasedEventArgs e)
+    {
+        base.OnPointerReleased(e);
+        try
+        {
+            var p = e.GetPosition(this);
+            Console.WriteLine($"PointerReleased at {p.X:F1},{p.Y:F1} source={e.Source?.GetType().Name}");
+        }
+        catch { }
     }
 
     protected override async void OnClosed(EventArgs e)
