@@ -10,13 +10,38 @@ public class OcrProcessor
 
     public OcrProcessor(string? tessDataPath = null)
     {
-        // The working directory is the project folder under `dotnet run`, not the
-        // executable directory. The trained data is copied beside the executable.
-        _tessDataPath = tessDataPath ?? Path.Combine(AppContext.BaseDirectory, "tessdata");
+        _tessDataPath = tessDataPath ?? ResolveTessDataPath();
         if (!Directory.Exists(_tessDataPath))
         {
-            throw new DirectoryNotFoundException($"Tesseract data directory not found: {_tessDataPath}");
+            throw new DirectoryNotFoundException($"Tesseract data directory not found. Searched: {_tessDataPath}");
         }
+    }
+
+    private static string ResolveTessDataPath()
+    {
+        string[] candidates = new[]
+        {
+            Environment.GetEnvironmentVariable("TESSDATA_PREFIX") ?? string.Empty,
+            Path.Combine(AppContext.BaseDirectory, "tessdata"),
+            Path.Combine(AppContext.BaseDirectory, "..", "tessdata"),
+            "/opt/homebrew/share/tessdata",
+            "/usr/local/share/tessdata"
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+                continue;
+
+            if (Directory.Exists(candidate))
+                return candidate;
+
+            var nested = Path.Combine(candidate, "tessdata");
+            if (Directory.Exists(nested))
+                return nested;
+        }
+
+        return Path.Combine(AppContext.BaseDirectory, "tessdata");
     }
 
     /// <summary>

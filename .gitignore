@@ -17,6 +17,9 @@ EdsImage.dll
 *.sqlite
 *.db
 
+# macOS metadata
+.DS_Store
+
 # Temporary Image Dumps
 /Temp/
 /Thumbnails/

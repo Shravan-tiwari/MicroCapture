@@ -82,8 +82,8 @@ public class BatchExportService
             }
             File.Move(temporaryPath, pdfFilePath, true);
             batch.Status = "Exported";
-            _dbContext.Batches.Update(batch);
-            _dbContext.CaptureJobs.UpdateRange(jobsToExport);
+            AttachOrUpdateBatch(batch);
+            AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return pdfFilePath;
         }
@@ -130,10 +130,42 @@ public class BatchExportService
                 job.ExportStatus = "Completed";
             }
             batch.Status = "Exported";
-            _dbContext.Batches.Update(batch);
-            _dbContext.CaptureJobs.UpdateRange(jobsToExport);
+            AttachOrUpdateBatch(batch);
+            AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return exportDir;
+        }
+    }
+
+    private void AttachOrUpdateBatch(Batch batch)
+    {
+        var tracked = _dbContext.ChangeTracker.Entries<Batch>().FirstOrDefault(entry => entry.Entity.Id == batch.Id)?.Entity;
+        if (tracked != null)
+        {
+            tracked.Status = batch.Status;
+        }
+        else
+        {
+            _dbContext.Batches.Update(batch);
+        }
+    }
+
+    private void AttachOrUpdateJobs(List<CaptureJob> jobs)
+    {
+        foreach (var job in jobs)
+        {
+            var tracked = _dbContext.ChangeTracker.Entries<CaptureJob>().FirstOrDefault(entry => entry.Entity.Id == job.Id)?.Entity;
+            if (tracked != null)
+            {
+                tracked.ExportStatus = job.ExportStatus;
+            }
+            else
+            {
+                // Avoid attaching duplicate Batch navigation references when the job
+                // was loaded with a related Batch entity from another query/context.
+                job.Batch = null;
+                _dbContext.CaptureJobs.Update(job);
+            }
         }
     }
 
