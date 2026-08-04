@@ -22,7 +22,7 @@ public class AppDbContext : DbContext
     }
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseSqlite($"Data Source={DbPath};Journal Mode=Wal;Busy Timeout=5000");
+        => options.UseSqlite($"Data Source={DbPath}");
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

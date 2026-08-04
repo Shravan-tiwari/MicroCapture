@@ -38,6 +38,11 @@ public class CaptureQueueService
         if (wasClosed) connection.Open();
         try
         {
+            using (var pragmaCmd = connection.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+                pragmaCmd.ExecuteNonQuery();
+            }
             {
                 using var check = connection.CreateCommand();
                 check.CommandText = $"PRAGMA table_info(\"{table}\")";
