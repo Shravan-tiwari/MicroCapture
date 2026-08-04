@@ -92,6 +92,19 @@ public partial class CropReviewViewModel : ViewModelBase
     }
 
     [RelayCommand]
+    private void Reset()
+    {
+        if (Image != null)
+        {
+            CropX = 0;
+            CropY = 0;
+            CropWidth = (int)Image.Size.Width;
+            CropHeight = (int)Image.Size.Height;
+            SplitPercent = 50.0;
+        }
+    }
+
+    [RelayCommand]
     private void Cancel(Window window)
     {
         window?.Close();

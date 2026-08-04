@@ -3,52 +3,57 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
-        Title="Manual Crop Review"
-        Width="1000" Height="700"
-        Background="#1a1a2e">
+        Title="Crop Review"
+        Width="1050" Height="720"
+        WindowStartupLocation="CenterScreen"
+        Background="#12121e">
     <Grid RowDefinitions="*, Auto">
-        <!-- Image Area -->
-        <Border Grid.Row="0" Background="#0a0a15" Margin="10">
-            <Grid>
-                <ScrollViewer HorizontalScrollBarVisibility="Auto"
-                            VerticalScrollBarVisibility="Auto">
-                    <Image Source="{Binding Image}"
-                        Stretch="Uniform"
-                        HorizontalAlignment="Center"
-                        VerticalAlignment="Center"/>
-                </ScrollViewer>
-                <TextBlock Text="Set a crop rectangle, or a split point for book pages, then save to reprocess."
-                           Foreground="White" Background="#80000000" Padding="8"
-                           HorizontalAlignment="Center" VerticalAlignment="Top" Margin="10"/>
+        <!-- Main Image & Interactive Crop Canvas Area -->
+        <Border Grid.Row="0" Background="#080811" Margin="12" CornerRadius="8" ClipToBounds="True">
+            <Grid Name="ContainerGrid">
+                <Image Name="TargetImage"
+                       Source="{Binding Image}"
+                       Stretch="Uniform"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"/>
+                <Canvas Name="OverlayCanvas"
+                        Background="Transparent"
+                        HorizontalAlignment="Stretch"
+                        VerticalAlignment="Stretch"/>
             </Grid>
         </Border>
 
-        <!-- Controls -->
-        <Border Grid.Row="1" Margin="10" Background="#16213e" Padding="10" CornerRadius="6">
-            <StackPanel Spacing="10">
-                <StackPanel IsVisible="{Binding IsSplitBookPages}" Spacing="4">
-                    <TextBlock Text="Book-page split (%)" Foreground="Cyan" />
-                    <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" />
+        <!-- Bottom Action Bar -->
+        <Border Grid.Row="1" Margin="12,0,12,12" Background="#1c1c2e" Padding="14,10" CornerRadius="8">
+            <Grid ColumnDefinitions="Auto, *, Auto">
+                <!-- Mode & Instruction Text -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding IsSplitBookPages, Converter={x:Null}, FallbackValue='Single Page Crop'}"
+                               Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
+                    <TextBlock Text="• Drag box or handles to adjust boundary"
+                               Foreground="#a0a0b0" VerticalAlignment="Center" FontSize="13"/>
                 </StackPanel>
-                <Grid IsVisible="{Binding IsSinglePage}" ColumnDefinitions="*,*,*,*" RowDefinitions="Auto,Auto">
-                    <TextBlock Grid.Row="0" Grid.Column="0" Text="X" Foreground="Cyan" />
-                    <TextBlock Grid.Row="0" Grid.Column="1" Text="Y" Foreground="Cyan" />
-                    <TextBlock Grid.Row="0" Grid.Column="2" Text="Width" Foreground="Cyan" />
-                    <TextBlock Grid.Row="0" Grid.Column="3" Text="Height" Foreground="Cyan" />
-                    <TextBox Grid.Row="1" Grid.Column="0" Text="{Binding CropX}" Margin="0,4,4,0" />
-                    <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding CropY}" Margin="4,4,4,0" />
-                    <TextBox Grid.Row="1" Grid.Column="2" Text="{Binding CropWidth}" Margin="4,4,4,0" />
-                    <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding CropHeight}" Margin="4,4,0,0" />
-                </Grid>
-            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
-                <Button Content="Cancel" Command="{Binding CancelCommand}" 
-                        CommandParameter="{Binding $parent[Window]}"
-                        Background="#333" Foreground="White" Padding="10,5" />
-                <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}"
-                        CommandParameter="{Binding $parent[Window]}"
-                        Background="#e94560" Foreground="White" Padding="10,5" FontWeight="Bold" />
-            </StackPanel>
-            </StackPanel>
+
+                <!-- Book Split Slider (Visible only in Split mode) -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center"
+                            IsVisible="{Binding IsSplitBookPages}" Spacing="10" VerticalAlignment="Center">
+                    <TextBlock Text="Split Point:" Foreground="#a0a0b0" VerticalAlignment="Center"/>
+                    <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" Width="200" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding SplitPercent, StringFormat='{}{0:F0}%'}" Foreground="#00d2ff" FontWeight="Bold" Width="40" VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <!-- Action Buttons -->
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
+                    <Button Content="Reset" Command="{Binding ResetCommand}"
+                            Background="#2a2a3c" Foreground="#e0e0e0" Padding="14,6" CornerRadius="4"/>
+                    <Button Content="Cancel" Command="{Binding CancelCommand}" 
+                            CommandParameter="{Binding $parent[Window]}"
+                            Background="#2a2a3c" Foreground="#e0e0e0" Padding="14,6" CornerRadius="4"/>
+                    <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}"
+                            CommandParameter="{Binding $parent[Window]}"
+                            Background="#e94560" Foreground="White" Padding="16,6" FontWeight="Bold" CornerRadius="4"/>
+                </StackPanel>
+            </Grid>
         </Border>
     </Grid>
 </Window>
