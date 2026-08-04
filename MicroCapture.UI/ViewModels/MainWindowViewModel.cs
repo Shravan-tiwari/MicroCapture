@@ -485,6 +485,8 @@ public partial class CameraControlItem : ObservableObject
 {
     private readonly ICameraService _cameraService;
     private readonly Action<string> _report;
+    private readonly SemaphoreSlim _settingLock = new(1, 1);
+    [ObservableProperty] private bool _isBusy;
     public string Key { get; }
     public string DisplayName { get; }
     public IReadOnlyList<CameraSettingOption> Options { get; }
@@ -519,7 +521,7 @@ public partial class CameraControlItem : ObservableObject
 
         await _cameraService.StopLiveViewAsync();
 
-        await _cameraService.SetCameraSettingAsync(...);
+        await _cameraService.SetCameraSettingAsync(Key, option.Value);
 
         await Task.Delay(150);
 
