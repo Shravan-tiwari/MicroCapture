@@ -76,10 +76,25 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 var thumbnail = RecentCaptures.FirstOrDefault(t => t.FilePath == result.OriginalFilePath);
                 if (thumbnail != null)
+                {
                     thumbnail.Status = !result.Success ? "Processing failed"
                         : result.OcrStatus == "Failed" ? "Processed — OCR failed"
                         : result.QcVerdict == "FAIL" ? "Processed — QC warning"
                         : "Processed";
+
+                    if (result.Success && result.OutputFilePaths.Count > 0 && File.Exists(result.OutputFilePaths[0]))
+                    {
+                        try
+                        {
+                            using var stream = File.OpenRead(result.OutputFilePaths[0]);
+                            var newThumb = Bitmap.DecodeToWidth(stream, 120);
+                            var old = thumbnail.Thumbnail;
+                            thumbnail.Thumbnail = newThumb;
+                            old?.Dispose();
+                        }
+                        catch { }
+                    }
+                }
             });
         };
         _worker.Start();

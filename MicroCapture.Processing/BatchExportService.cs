@@ -45,7 +45,7 @@ public class BatchExportService
             .OrderBy(j => j.PageNumber)
             .ToList();
 
-        if (jobsToExport.Count == 0 && batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
+        if (batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
             throw new InvalidOperationException("Images are still being processed.");
 
         if (jobsToExport.Count == 0)
