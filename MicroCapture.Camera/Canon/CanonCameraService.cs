@@ -64,22 +64,29 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             ThrowIfDisconnected();
             foreach (var definition in OperatorProperties)
             {
-                uint current = 0;
-                if (!Succeeded(Call("EdsGetPropertyData", () => EDSDK.EdsGetPropertyData(_camera, definition.PropertyId, 0, out current), definition.Key)))
-                    continue;
-                var description = default(EDSDK.EdsPropertyDesc);
-                if (!Succeeded(Call("EdsGetPropertyDesc", () => EDSDK.EdsGetPropertyDesc(_camera, definition.PropertyId, out description), definition.Key)) ||
-                    description.NumElements <= 0 || description.PropDesc == null)
-                    continue;
+                try
+                {
+                    uint current = 0;
+                    if (!Succeeded(Call("EdsGetPropertyData", () => EDSDK.EdsGetPropertyData(_camera, definition.PropertyId, 0, out current), definition.Key)))
+                        continue;
+                    var description = default(EDSDK.EdsPropertyDesc);
+                    if (!Succeeded(Call("EdsGetPropertyDesc", () => EDSDK.EdsGetPropertyDesc(_camera, definition.PropertyId, out description), definition.Key)) ||
+                        description.NumElements <= 0 || description.PropDesc == null)
+                        continue;
 
-                var options = description.PropDesc
-                    .Take(Math.Min(description.NumElements, description.PropDesc.Length))
-                    .Select(value => unchecked((uint)value))
-                    .Distinct()
-                    .Select(value => new CameraSettingOption { Value = value, DisplayName = FormatCameraValue(definition.Key, value) })
-                    .ToArray();
-                if (options.Length > 0)
-                    settings.Add(new CameraSetting { Key = definition.Key, DisplayName = definition.DisplayName, Value = current, Options = options });
+                    var options = description.PropDesc
+                        .Take(Math.Min(description.NumElements, description.PropDesc.Length))
+                        .Select(value => unchecked((uint)value))
+                        .Distinct()
+                        .Select(value => new CameraSettingOption { Value = value, DisplayName = FormatCameraValue(definition.Key, value) })
+                        .ToArray();
+                    if (options.Length > 0)
+                        settings.Add(new CameraSetting { Key = definition.Key, DisplayName = definition.DisplayName, Value = current, Options = options });
+                }
+                catch (Exception ex)
+                {
+                    Log("GetCameraSettingsAsync", $"Skipped {definition.Key}: {ex.Message}");
+                }
             }
         }
         return Task.FromResult<IReadOnlyList<CameraSetting>>(settings);
