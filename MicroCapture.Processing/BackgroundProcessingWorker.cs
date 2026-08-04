@@ -108,7 +108,6 @@ public class BackgroundProcessingWorker
                                 if (!ocrProcessor.CliAvailable && !allowManaged)
                                 {
                                     Console.Error.WriteLine($"OCR skipped for job {job.Id}: tesseract CLI not available and managed wrapper disabled");
-                                    StatusChanged?.Invoke(this, "OCR unavailable: tesseract CLI not found");
                                     await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Skipped");
                                     result.OcrStatus = "Skipped";
                                 }

@@ -123,21 +123,40 @@ public class ImageProcessor
         }
         catch (Exception ex)
         {
-            result.Warnings.Add($"OpenCV processing failed (often missing dependencies like freetype on Mac): {ex.Message}. Falling back to copy.");
+            result.Warnings.Add($"OpenCV processing failed: {ex.Message}. Using fallback processor.");
             try
             {
-                var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed_mock.jpg";
-                var outPath = Path.Combine(outputDirectory, outName);
-                File.Copy(inputPath, outPath, true);
-                
-                result.OutputFilePaths.Add(outPath);
-                result.Success = true;
-                result.QcVerdict = "PASS";
+                using var inputStream = File.OpenRead(inputPath);
+                using var originalBitmap = SkiaSharp.SKBitmap.Decode(inputStream);
+                if (originalBitmap != null)
+                {
+                    SkiaSharp.SKBitmap outputBitmap = originalBitmap;
+                    if (manualOverride && !string.IsNullOrEmpty(leftCrop))
+                    {
+                        var rect = ParseRect(leftCrop, originalBitmap.Width, originalBitmap.Height);
+                        var skRect = new SkiaSharp.SKRectI(rect.X, rect.Y, rect.X + rect.Width, rect.Y + rect.Height);
+                        var cropped = new SkiaSharp.SKBitmap(rect.Width, rect.Height);
+                        using (var canvas = new SkiaSharp.SKCanvas(cropped))
+                        {
+                            canvas.DrawBitmap(originalBitmap, skRect, new SkiaSharp.SKRect(0, 0, rect.Width, rect.Height));
+                        }
+                        outputBitmap = cropped;
+                    }
+                    var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.jpg";
+                    var outPath = Path.Combine(outputDirectory, outName);
+                    using var image = SkiaSharp.SKImage.FromBitmap(outputBitmap);
+                    using var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Jpeg, 95);
+                    using var outStream = File.Create(outPath);
+                    data.SaveTo(outStream);
+                    result.OutputFilePaths.Add(outPath);
+                    result.Success = true;
+                    result.QcVerdict = "PASS";
+                }
             }
-            catch (Exception copyEx)
+            catch (Exception fallbackEx)
             {
                 result.Success = false;
-                result.Errors.Add($"Fallback copy failed: {copyEx.Message}");
+                result.Errors.Add($"Fallback crop failed: {fallbackEx.Message}");
             }
         }
 
