@@ -13,9 +13,9 @@
                 <ScrollViewer HorizontalScrollBarVisibility="Auto"
                             VerticalScrollBarVisibility="Auto">
                     <Image Source="{Binding Image}"
-                        Stretch="None"
-                        HorizontalAlignment="Left"
-                        VerticalAlignment="Top"/>
+                        Stretch="Uniform"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"/>
                 </ScrollViewer>
                 <TextBlock Text="Set a crop rectangle, or a split point for book pages, then save to reprocess."
                            Foreground="White" Background="#80000000" Padding="8"

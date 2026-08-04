@@ -313,6 +313,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         await _captureLock.WaitAsync().ConfigureAwait(false);
         try
         {
+            await StopLiveViewAsync().ConfigureAwait(false);
+            await Task.Delay(100).ConfigureAwait(false);
+
             TaskCompletionSource<string> tcs;
             lock (_sync)
             {
@@ -326,11 +329,14 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 var result = Call("EdsSendCommand(CameraCommand_TakePicture)", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_TakePicture, 0));
                 if (result != EDSDK.EDS_ERR_OK) { _isDownloading = false; tcs.TrySetException(CreateSdkException("EdsSendCommand(CameraCommand_TakePicture)", result)); }
             }
-            return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            var resultPath = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            await Task.Delay(200).ConfigureAwait(false);
+            return resultPath;
         }
         finally
         {
             lock (_sync) { _captureTcs = null; _isDownloading = false; }
+            _ = StartLiveViewAsync();
             _captureLock.Release();
         }
     }
