@@ -318,18 +318,19 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             {
                 ThrowIfDisconnected();
                 if (_captureTcs != null) throw new InvalidOperationException("A capture is already in progress.");
+                _isDownloading = true;
                 _currentSaveDirectory = outputDirectory;
                 _currentFilePrefix = filePrefix;
                 tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
                 _captureTcs = tcs;
                 var result = Call("EdsSendCommand(CameraCommand_TakePicture)", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_TakePicture, 0));
-                if (result != EDSDK.EDS_ERR_OK) tcs.TrySetException(CreateSdkException("EdsSendCommand(CameraCommand_TakePicture)", result));
+                if (result != EDSDK.EDS_ERR_OK) { _isDownloading = false; tcs.TrySetException(CreateSdkException("EdsSendCommand(CameraCommand_TakePicture)", result)); }
             }
             return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         }
         finally
         {
-            lock (_sync) _captureTcs = null;
+            lock (_sync) { _captureTcs = null; _isDownloading = false; }
             _captureLock.Release();
         }
     }
