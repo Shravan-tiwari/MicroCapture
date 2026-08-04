@@ -508,14 +508,32 @@ public partial class CameraControlItem : ObservableObject
 
     private async Task ApplyAsync(CameraSettingOption option)
     {
+        if (IsBusy)
+            return;
+
+        await _settingLock.WaitAsync();
+
         try
         {
-            await _cameraService.SetCameraSettingAsync(Key, option.Value);
+            IsBusy = true;
+
+        await _cameraService.StopLiveViewAsync();
+
+        await _cameraService.SetCameraSettingAsync(...);
+
+        await Task.Delay(150);
+
+        await _cameraService.StartLiveViewAsync();   
             _report($"Camera setting updated: {DisplayName} = {option.DisplayName}");
         }
         catch (Exception ex)
         {
             _report($"Could not update {DisplayName}: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+            _settingLock.Release();
         }
     }
 }
