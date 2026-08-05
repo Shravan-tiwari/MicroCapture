@@ -1,20 +1,24 @@
 using System;
+using System.Linq;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media;
+using MicroCapture.Processing;
 using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
 
 public partial class CropReviewWindow : Window
 {
-    private enum DragTarget { None, Body, TopLeft, TopRight, BottomLeft, BottomRight, Top, Bottom, Left, Right }
+    private enum DragTarget { None, Corner0, Corner1, Corner2, Corner3, SplitLine }
+
+    private const double HandleHitRadius = 16.0;
+    private const double SplitLineHitMargin = 12.0;
+
     private DragTarget _activeDrag = DragTarget.None;
-    private Point _dragStartPoint;
-    private Rect _initialCropRect;
 
     public CropReviewWindow()
     {
@@ -28,7 +32,8 @@ public partial class CropReviewWindow : Window
         {
             vm.PropertyChanged += (s, ev) =>
             {
-                if (ev.PropertyName is nameof(vm.CropX) or nameof(vm.CropY) or nameof(vm.CropWidth) or nameof(vm.CropHeight) or nameof(vm.Image))
+                if (ev.PropertyName is nameof(vm.TopLeft) or nameof(vm.TopRight) or nameof(vm.BottomRight) or nameof(vm.BottomLeft)
+                    or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages))
                 {
                     RenderOverlay();
                 }
@@ -48,21 +53,27 @@ public partial class CropReviewWindow : Window
         var (imgRect, scale) = GetDisplayedImageRect();
         if (imgRect.Width <= 0 || imgRect.Height <= 0) return;
 
-        // Convert current crop coords to canvas space
-        var cropCanvasX = imgRect.X + (vm.CropX * scale);
-        var cropCanvasY = imgRect.Y + (vm.CropY * scale);
-        var cropCanvasW = vm.CropWidth * scale;
-        var cropCanvasH = vm.CropHeight * scale;
-        var cropCanvasRect = new Rect(cropCanvasX, cropCanvasY, cropCanvasW, cropCanvasH);
-
-        const double handleSize = 16.0;
-        _activeDrag = HitTest(pt, cropCanvasRect, handleSize);
-
-        if (_activeDrag != DragTarget.None)
+        if (vm.IsSplitBookPages)
         {
-            _dragStartPoint = pt;
-            _initialCropRect = new Rect(vm.CropX, vm.CropY, vm.CropWidth, vm.CropHeight);
-            e.Pointer.Capture(canvas);
+            var lineX = imgRect.X + vm.ImageWidth * (vm.SplitPercent / 100.0) * scale;
+            if (Math.Abs(pt.X - lineX) <= SplitLineHitMargin)
+            {
+                _activeDrag = DragTarget.SplitLine;
+                e.Pointer.Capture(canvas);
+            }
+            return;
+        }
+
+        var corners = new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft };
+        for (var i = 0; i < corners.Length; i++)
+        {
+            var canvasPt = new Point(imgRect.X + corners[i].X * scale, imgRect.Y + corners[i].Y * scale);
+            if (Distance(canvasPt, pt) <= HandleHitRadius)
+            {
+                _activeDrag = DragTarget.Corner0 + i;
+                e.Pointer.Capture(canvas);
+                return;
+            }
         }
     }
 
@@ -78,51 +89,25 @@ public partial class CropReviewWindow : Window
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;
 
-        var deltaX = (pt.X - _dragStartPoint.X) / scale;
-        var deltaY = (pt.Y - _dragStartPoint.Y) / scale;
-
-        var imgW = (int)vm.Image.Size.Width;
-        var imgH = (int)vm.Image.Size.Height;
-
-        double x = _initialCropRect.X;
-        double y = _initialCropRect.Y;
-        double w = _initialCropRect.Width;
-        double h = _initialCropRect.Height;
-
-        switch (_activeDrag)
+        if (_activeDrag == DragTarget.SplitLine)
         {
-            case DragTarget.Body:
-                x = Math.Clamp(_initialCropRect.X + deltaX, 0, imgW - w);
-                y = Math.Clamp(_initialCropRect.Y + deltaY, 0, imgH - h);
-                break;
-            case DragTarget.TopLeft:
-                x = Math.Clamp(_initialCropRect.X + deltaX, 0, _initialCropRect.Right - 20);
-                y = Math.Clamp(_initialCropRect.Y + deltaY, 0, _initialCropRect.Bottom - 20);
-                w = _initialCropRect.Right - x;
-                h = _initialCropRect.Bottom - y;
-                break;
-            case DragTarget.TopRight:
-                w = Math.Clamp(_initialCropRect.Width + deltaX, 20, imgW - x);
-                y = Math.Clamp(_initialCropRect.Y + deltaY, 0, _initialCropRect.Bottom - 20);
-                h = _initialCropRect.Bottom - y;
-                break;
-            case DragTarget.BottomLeft:
-                x = Math.Clamp(_initialCropRect.X + deltaX, 0, _initialCropRect.Right - 20);
-                w = _initialCropRect.Right - x;
-                h = Math.Clamp(_initialCropRect.Height + deltaY, 20, imgH - y);
-                break;
-            case DragTarget.BottomRight:
-                w = Math.Clamp(_initialCropRect.Width + deltaX, 20, imgW - x);
-                h = Math.Clamp(_initialCropRect.Height + deltaY, 20, imgH - y);
-                break;
+            var x = Math.Clamp((pt.X - imgRect.X) / scale, 1, Math.Max(1, vm.ImageWidth - 1));
+            vm.SplitPercent = Math.Clamp(x / vm.ImageWidth * 100.0, 1.0, 99.0);
+            return;
         }
 
-        vm.CropX = (int)x;
-        vm.CropY = (int)y;
-        vm.CropWidth = (int)w;
-        vm.CropHeight = (int)h;
+        var cornerIndex = _activeDrag - DragTarget.Corner0;
+        var rawX = Math.Clamp((pt.X - imgRect.X) / scale, 0, vm.ImageWidth);
+        var rawY = Math.Clamp((pt.Y - imgRect.Y) / scale, 0, vm.ImageHeight);
+        var resolved = vm.ResolveCornerDrag(cornerIndex, new CropPoint(rawX, rawY));
 
-        RenderOverlay();
+        switch (cornerIndex)
+        {
+            case 0: vm.TopLeft = resolved; break;
+            case 1: vm.TopRight = resolved; break;
+            case 2: vm.BottomRight = resolved; break;
+            case 3: vm.BottomLeft = resolved; break;
+        }
     }
 
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
@@ -131,26 +116,15 @@ public partial class CropReviewWindow : Window
         if (_activeDrag != DragTarget.None)
         {
             _activeDrag = DragTarget.None;
-            var canvas = this.FindControl<Canvas>("OverlayCanvas");
             e.Pointer.Capture(null);
         }
     }
 
-    private DragTarget HitTest(Point pt, Rect rect, double handleMargin)
+    private static double Distance(Point a, Point b)
     {
-        var tl = new Rect(rect.X - handleMargin, rect.Y - handleMargin, handleMargin * 2, handleMargin * 2);
-        var tr = new Rect(rect.Right - handleMargin, rect.Y - handleMargin, handleMargin * 2, handleMargin * 2);
-        var bl = new Rect(rect.X - handleMargin, rect.Bottom - handleMargin, handleMargin * 2, handleMargin * 2);
-        var br = new Rect(rect.Right - handleMargin, rect.Bottom - handleMargin, handleMargin * 2, handleMargin * 2);
-
-        if (tl.Contains(pt)) return DragTarget.TopLeft;
-        if (tr.Contains(pt)) return DragTarget.TopRight;
-        if (bl.Contains(pt)) return DragTarget.BottomLeft;
-        if (br.Contains(pt)) return DragTarget.BottomRight;
-
-        if (rect.Contains(pt)) return DragTarget.Body;
-
-        return DragTarget.None;
+        var dx = a.X - b.X;
+        var dy = a.Y - b.Y;
+        return Math.Sqrt(dx * dx + dy * dy);
     }
 
     private (Rect displayedRect, double scale) GetDisplayedImageRect()
@@ -184,34 +158,71 @@ public partial class CropReviewWindow : Window
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;
 
-        var cropCanvasX = imgRect.X + (vm.CropX * scale);
-        var cropCanvasY = imgRect.Y + (vm.CropY * scale);
-        var cropCanvasW = vm.CropWidth * scale;
-        var cropCanvasH = vm.CropHeight * scale;
+        if (vm.IsSplitBookPages)
+            RenderSplitLine(canvas, vm, imgRect, scale);
+        else
+            RenderQuad(canvas, vm, imgRect, scale);
+    }
 
-        // Crop Box Border
-        var box = new Rectangle
+    private void RenderQuad(Canvas canvas, CropReviewViewModel vm, Rect imgRect, double scale)
+    {
+        var corners = new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft };
+        var canvasPoints = corners.Select(c => new Point(imgRect.X + c.X * scale, imgRect.Y + c.Y * scale)).ToList();
+
+        var polygon = new Polygon
         {
-            Width = Math.Max(1, cropCanvasW),
-            Height = Math.Max(1, cropCanvasH),
+            Points = canvasPoints,
             Stroke = new SolidColorBrush(Color.Parse("#00d2ff")),
             StrokeThickness = 2,
             Fill = new SolidColorBrush(Color.FromArgb(40, 0, 210, 255))
         };
-        Canvas.SetLeft(box, cropCanvasX);
-        Canvas.SetTop(box, cropCanvasY);
-        canvas.Children.Add(box);
+        canvas.Children.Add(polygon);
 
-        // Corner Handles
-        AddHandle(canvas, cropCanvasX, cropCanvasY);
-        AddHandle(canvas, cropCanvasX + cropCanvasW, cropCanvasY);
-        AddHandle(canvas, cropCanvasX, cropCanvasY + cropCanvasH);
-        AddHandle(canvas, cropCanvasX + cropCanvasW, cropCanvasY + cropCanvasH);
+        foreach (var p in canvasPoints)
+            AddHandle(canvas, p.X, p.Y);
+    }
+
+    private void RenderSplitLine(Canvas canvas, CropReviewViewModel vm, Rect imgRect, double scale)
+    {
+        var lineX = imgRect.X + vm.ImageWidth * (vm.SplitPercent / 100.0) * scale;
+
+        // Shade both halves so it's visually unambiguous which side is which.
+        var leftShade = new Rectangle
+        {
+            Width = Math.Max(0, lineX - imgRect.X),
+            Height = imgRect.Height,
+            Fill = new SolidColorBrush(Color.FromArgb(35, 0, 210, 255))
+        };
+        Canvas.SetLeft(leftShade, imgRect.X);
+        Canvas.SetTop(leftShade, imgRect.Y);
+        canvas.Children.Add(leftShade);
+
+        var rightShade = new Rectangle
+        {
+            Width = Math.Max(0, imgRect.Right - lineX),
+            Height = imgRect.Height,
+            Fill = new SolidColorBrush(Color.FromArgb(20, 255, 255, 255))
+        };
+        Canvas.SetLeft(rightShade, lineX);
+        Canvas.SetTop(rightShade, imgRect.Y);
+        canvas.Children.Add(rightShade);
+
+        var line = new Rectangle
+        {
+            Width = 3,
+            Height = imgRect.Height,
+            Fill = new SolidColorBrush(Color.Parse("#e94560"))
+        };
+        Canvas.SetLeft(line, lineX - 1.5);
+        Canvas.SetTop(line, imgRect.Y);
+        canvas.Children.Add(line);
+
+        AddHandle(canvas, lineX, imgRect.Y + imgRect.Height / 2);
     }
 
     private void AddHandle(Canvas canvas, double cx, double cy)
     {
-        const double radius = 6;
+        const double radius = 7;
         var handle = new Ellipse
         {
             Width = radius * 2,
@@ -223,6 +234,12 @@ public partial class CropReviewWindow : Window
         Canvas.SetLeft(handle, cx - radius);
         Canvas.SetTop(handle, cy - radius);
         canvas.Children.Add(handle);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        (DataContext as CropReviewViewModel)?.Dispose();
+        base.OnClosed(e);
     }
 
     private void InitializeComponent()

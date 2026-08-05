@@ -4,24 +4,45 @@
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
         Title="Crop Review"
-        Width="1050" Height="720"
+        Width="1280" Height="760"
         WindowStartupLocation="CenterScreen"
         Background="#12121e">
     <Grid RowDefinitions="*, Auto">
-        <!-- Main Image & Interactive Crop Canvas Area -->
-        <Border Grid.Row="0" Background="#080811" Margin="12" CornerRadius="8" ClipToBounds="True">
-            <Grid Name="ContainerGrid">
-                <Image Name="TargetImage"
-                       Source="{Binding Image}"
-                       Stretch="Uniform"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Center"/>
-                <Canvas Name="OverlayCanvas"
-                        Background="Transparent"
-                        HorizontalAlignment="Stretch"
-                        VerticalAlignment="Stretch"/>
-            </Grid>
-        </Border>
+        <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
+            <!-- Main Image & Interactive Crop Canvas Area -->
+            <Border Grid.Column="0" Background="#080811" Margin="12" CornerRadius="8" ClipToBounds="True">
+                <Grid Name="ContainerGrid">
+                    <Image Name="TargetImage"
+                           Source="{Binding Image}"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
+                    <Canvas Name="OverlayCanvas"
+                            Background="Transparent"
+                            HorizontalAlignment="Stretch"
+                            VerticalAlignment="Stretch"/>
+                </Grid>
+            </Border>
+
+            <!-- Live Preview -->
+            <Border Grid.Column="1" Background="#080811" Margin="0,12,12,12" CornerRadius="8" Padding="12">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="LIVE PREVIEW" Foreground="#00d2ff" FontWeight="Bold" FontSize="12"/>
+                    <Image Source="{Binding PreviewImage}" Stretch="Uniform"
+                           IsVisible="{Binding IsSinglePage}" MaxHeight="500"/>
+                    <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding IsSplitBookPages}">
+                        <StackPanel Spacing="4" Width="150">
+                            <TextBlock Text="Left" Foreground="#a0a0b0" FontSize="11"/>
+                            <Image Source="{Binding PreviewImage}" Stretch="Uniform"/>
+                        </StackPanel>
+                        <StackPanel Spacing="4" Width="150">
+                            <TextBlock Text="Right" Foreground="#a0a0b0" FontSize="11"/>
+                            <Image Source="{Binding SecondaryPreviewImage}" Stretch="Uniform"/>
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
 
         <!-- Bottom Action Bar -->
         <Border Grid.Row="1" Margin="12,0,12,12" Background="#1c1c2e" Padding="14,10" CornerRadius="8">

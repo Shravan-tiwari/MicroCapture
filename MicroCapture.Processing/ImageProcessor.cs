@@ -1,11 +1,21 @@
 using System;
+using System.Globalization;
 using System.IO;
 using OpenCvSharp;
 
 namespace MicroCapture.Processing;
 
-/// <summary>Axis-aligned document boundary detected in a still image, in that image's own pixel coordinates.</summary>
-public readonly record struct DocumentBoundary(int X, int Y, int Width, int Height, double Confidence);
+/// <summary>A single crop-shape corner, in an image's own pixel coordinates. OpenCvSharp-free
+/// so it can safely cross into the UI project (mirrors the existing DTO pattern used by
+/// <see cref="DocumentBoundary"/> and <see cref="LiveFrameCheck"/>).</summary>
+public readonly record struct CropPoint(double X, double Y);
+
+/// <summary>Document boundary detected in a still image, in that image's own pixel coordinates.
+/// <see cref="Quad"/> is populated when the detected contour approximated a clean
+/// quadrilateral (ordered top-left, top-right, bottom-right, bottom-left) — the UI should
+/// prefer it over the axis-aligned <see cref="X"/>/<see cref="Y"/>/<see cref="Width"/>/
+/// <see cref="Height"/> rect when present, since it captures perspective skew the rect can't.</summary>
+public readonly record struct DocumentBoundary(int X, int Y, int Width, int Height, double Confidence, CropPoint[]? Quad = null);
 
 /// <summary>Result of a single live-view frame check: whether a document-sized boundary is
 /// present, where it is, and how sharp (in-focus) that region is. Used to drive assisted
@@ -100,12 +110,15 @@ public class ImageProcessor
 
             if (splitPages)
             {
-                // Split logic
-                Rect leftRect, rightRect;
+                // Split logic. Each side is parsed to its 4 corners; a plain saved strip
+                // (today's UI) is an axis-aligned quad and takes WarpQuad's cheap-crop path,
+                // while a future per-half quad edit would automatically get a real warp —
+                // one shared implementation, no special-casing here.
+                Point2f[] leftCorners, rightCorners;
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop) && !string.IsNullOrEmpty(rightCrop))
                 {
-                    leftRect = ParseRect(leftCrop, src.Width, src.Height);
-                    rightRect = ParseRect(rightCrop, src.Width, src.Height);
+                    leftCorners = ParseCropCorners(leftCrop, src.Width, src.Height);
+                    rightCorners = ParseCropCorners(rightCrop, src.Width, src.Height);
                 }
                 else
                 {
@@ -116,12 +129,12 @@ public class ImageProcessor
                         ? (int)Math.Round(src.Width * gutter.Fraction)
                         : src.Width / 2;
                     splitX = Math.Clamp(splitX, 1, src.Width - 1);
-                    leftRect = new Rect(0, 0, splitX, src.Height);
-                    rightRect = new Rect(splitX, 0, src.Width - splitX, src.Height);
+                    leftCorners = RectCorners(0, 0, splitX, src.Height);
+                    rightCorners = RectCorners(splitX, 0, src.Width - splitX, src.Height);
                 }
 
                 // Process left
-                using var leftMat = new Mat(src, leftRect);
+                using var leftMat = WarpQuad(src, leftCorners);
                 var leftResult = ProcessSinglePage(leftMat, result, manualOverride);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
                 Cv2.ImWrite(outLeft, leftResult);
@@ -129,7 +142,7 @@ public class ImageProcessor
                 leftResult.Dispose();
 
                 // Process right
-                using var rightMat = new Mat(src, rightRect);
+                using var rightMat = WarpQuad(src, rightCorners);
                 var rightResult = ProcessSinglePage(rightMat, result, manualOverride);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
                 Cv2.ImWrite(outRight, rightResult);
@@ -140,15 +153,17 @@ public class ImageProcessor
             }
             else
             {
-                // Single page logic
-                Rect cropRect;
+                // Single page logic. Only a manual override needs to apply a crop shape here —
+                // the automatic (non-override) case passes the untouched source straight
+                // through, since ProcessSinglePage's own TryAutoCrop will detect and warp it
+                // as needed. Pre-warping the full frame first would be pure wasted work.
+                Mat? manualCrop = null;
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
-                    cropRect = ParseRect(leftCrop, src.Width, src.Height);
-                else
-                    cropRect = new Rect(0, 0, src.Width, src.Height);
+                    manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                using var singleMat = new Mat(src, cropRect);
-                var processed = ProcessSinglePage(singleMat, result, manualOverride);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride);
+                manualCrop?.Dispose();
+
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
                 Cv2.ImWrite(outPath, processed);
@@ -169,7 +184,11 @@ public class ImageProcessor
                     SkiaSharp.SKBitmap outputBitmap = originalBitmap;
                     if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     {
-                        var rect = ParseRect(leftCrop, originalBitmap.Width, originalBitmap.Height);
+                        // OpenCV itself is unavailable on this path, so a true perspective
+                        // warp isn't possible here — degrade to the crop shape's bounding
+                        // rect rather than losing the crop entirely.
+                        var corners = ParseCropCorners(leftCrop, originalBitmap.Width, originalBitmap.Height);
+                        var rect = BoundingRectOfCorners(corners, originalBitmap.Width, originalBitmap.Height);
                         var skRect = new SkiaSharp.SKRectI(rect.X, rect.Y, rect.X + rect.Width, rect.Y + rect.Height);
                         var cropped = new SkiaSharp.SKBitmap(rect.Width, rect.Height);
                         using (var canvas = new SkiaSharp.SKCanvas(cropped))
@@ -199,21 +218,57 @@ public class ImageProcessor
         return result;
     }
 
-    private Rect ParseRect(string cropStr, int maxW, int maxH)
+    /// <summary>UI-facing, OpenCvSharp-free equivalent of <see cref="ParseCropCorners"/> — same
+    /// parsing rules (legacy rect or new quad format, full-frame fallback), used by Crop Review
+    /// to restore a previously saved crop shape so there's exactly one implementation of what a
+    /// saved crop string means.</summary>
+    public static CropPoint[] ParseCropShape(string cropStr, int maxW, int maxH) =>
+        ParseCropCorners(cropStr, maxW, maxH).Select(p => new CropPoint(p.X, p.Y)).ToArray();
+
+    /// <summary>Parses a saved crop shape into its 4 corners (top-left, top-right,
+    /// bottom-right, bottom-left). Accepts either the legacy 4-number "x,y,w,h" rect format
+    /// (corners synthesized from it) or the newer 8-number "x1,y1,x2,y2,x3,y3,x4,y4" quad
+    /// format written directly. Falls back to the full frame on any parse failure — the same
+    /// safe default the old rect-only parser used.</summary>
+    private static Point2f[] ParseCropCorners(string cropStr, int maxW, int maxH)
     {
         try
         {
-            var parts = cropStr.Split(',');
-            int x = Math.Max(0, int.Parse(parts[0]));
-            int y = Math.Max(0, int.Parse(parts[1]));
-            int w = Math.Min(maxW - x, int.Parse(parts[2]));
-            int h = Math.Min(maxH - y, int.Parse(parts[3]));
-            return new Rect(x, y, w, h);
+            var parts = cropStr.Split(',').Select(part => double.Parse(part, CultureInfo.InvariantCulture)).ToArray();
+            if (parts.Length == 8)
+            {
+                var corners = new Point2f[4];
+                for (var i = 0; i < 4; i++)
+                    corners[i] = new Point2f((float)parts[i * 2], (float)parts[i * 2 + 1]);
+                return corners;
+            }
+            if (parts.Length == 4)
+            {
+                int x = Math.Max(0, (int)parts[0]);
+                int y = Math.Max(0, (int)parts[1]);
+                int w = Math.Min(maxW - x, (int)parts[2]);
+                int h = Math.Min(maxH - y, (int)parts[3]);
+                return RectCorners(x, y, w, h);
+            }
         }
-        catch
-        {
-            return new Rect(0, 0, maxW, maxH);
-        }
+        catch { /* fall through to the full-frame default below */ }
+
+        return RectCorners(0, 0, maxW, maxH);
+    }
+
+    private static Point2f[] RectCorners(int x, int y, int w, int h) =>
+        new[] { new Point2f(x, y), new Point2f(x + w, y), new Point2f(x + w, y + h), new Point2f(x, y + h) };
+
+    /// <summary>Axis-aligned bounding rect of arbitrary corners, clamped to the image bounds.
+    /// Used only by the emergency SkiaSharp fallback path (when OpenCV itself is unavailable),
+    /// which can't perform a perspective warp and must degrade to a plain rectangular crop.</summary>
+    private static Rect BoundingRectOfCorners(Point2f[] corners, int maxW, int maxH)
+    {
+        var minX = Math.Max(0, (int)Math.Floor(corners.Min(c => c.X)));
+        var minY = Math.Max(0, (int)Math.Floor(corners.Min(c => c.Y)));
+        var maxX = Math.Min(maxW, (int)Math.Ceiling(corners.Max(c => c.X)));
+        var maxY = Math.Min(maxH, (int)Math.Ceiling(corners.Max(c => c.Y)));
+        return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
     private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop)
@@ -307,13 +362,7 @@ public class ImageProcessor
             Mat cropped;
             if (detection.Quad != null)
             {
-                var source = detection.Quad;
-                var width = Math.Max(1, (int)Math.Round(Math.Max(Distance(source[0], source[1]), Distance(source[2], source[3]))));
-                var height = Math.Max(1, (int)Math.Round(Math.Max(Distance(source[0], source[3]), Distance(source[1], source[2]))));
-                var destination = new[] { new Point2f(0, 0), new Point2f(width - 1, 0), new Point2f(width - 1, height - 1), new Point2f(0, height - 1) };
-                using var transform = Cv2.GetPerspectiveTransform(source, destination);
-                cropped = new Mat();
-                Cv2.WarpPerspective(src, cropped, transform, new Size(width, height), InterpolationFlags.Linear, BorderTypes.Replicate);
+                cropped = WarpQuad(src, detection.Quad);
                 result.Warnings.Add("Document boundary detected and perspective-corrected.");
             }
             else
@@ -332,11 +381,9 @@ public class ImageProcessor
     }
 
     /// <summary>Read-only boundary lookup for the UI's Crop Review screen: detects the
-    /// document in a still image and returns its padded bounding rect (in that image's own
-    /// pixel coordinates) without modifying anything, or null when no confident boundary
-    /// was found. Always axis-aligned — perspective correction is applied only during the
-    /// full automatic <see cref="Process"/> pass, since the manual-override crop model is
-    /// rectangle-only.</summary>
+    /// document in a still image and returns its padded bounding rect — plus a 4-point quad
+    /// when the contour approximated one — in that image's own pixel coordinates, without
+    /// modifying anything. Returns null when no confident boundary was found.</summary>
     public DocumentBoundary? DetectDocumentBoundary(string imagePath)
     {
         if (!File.Exists(imagePath)) return null;
@@ -347,12 +394,98 @@ public class ImageProcessor
             var detection = DetectBoundary(src);
             if (!detection.Found || detection.Confidence < CropConfidenceThreshold) return null;
             var rect = detection.PaddedRect;
-            return new DocumentBoundary(rect.X, rect.Y, rect.Width, rect.Height, detection.Confidence);
+            var quad = detection.Quad?.Select(p => new CropPoint(p.X, p.Y)).ToArray();
+            return new DocumentBoundary(rect.X, rect.Y, rect.Width, rect.Height, detection.Confidence, quad);
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>Extracts a thinned set of strong edge-pixel coordinates from a still image, for
+    /// the UI to snap a dragged crop corner to a nearby real edge instead of leaving it exactly
+    /// where the pointer happens to be. Meant to be computed once when Crop Review opens (not
+    /// re-run per drag frame) — all native resources are disposed before returning, so nothing
+    /// keeps an OpenCV Mat alive for the window's lifetime.</summary>
+    public static IReadOnlyList<CropPoint> DetectEdgePoints(string imagePath, int maxPoints = 5000)
+    {
+        if (!File.Exists(imagePath)) return Array.Empty<CropPoint>();
+        try
+        {
+            using var src = Cv2.ImRead(imagePath, ImreadModes.Grayscale);
+            if (src.Empty()) return Array.Empty<CropPoint>();
+            using var blurred = new Mat();
+            Cv2.GaussianBlur(src, blurred, new Size(5, 5), 0);
+            using var edges = new Mat();
+            Cv2.Canny(blurred, edges, 50, 200);
+
+            using var idx = new Mat();
+            Cv2.FindNonZero(edges, idx);
+            idx.GetArray(out Point[] points);
+            if (points.Length <= maxPoints)
+                return points.Select(p => new CropPoint(p.X, p.Y)).ToArray();
+
+            var stride = (int)Math.Ceiling(points.Length / (double)maxPoints);
+            var sampled = new List<CropPoint>(maxPoints + 1);
+            for (var i = 0; i < points.Length; i += stride)
+                sampled.Add(new CropPoint(points[i].X, points[i].Y));
+            return sampled;
+        }
+        catch
+        {
+            // Snapping is advisory. A failure here should degrade to "no snapping", never crash the editor.
+            return Array.Empty<CropPoint>();
+        }
+    }
+
+    /// <summary>Crops the quadrilateral region <paramref name="corners"/> (ordered top-left,
+    /// top-right, bottom-right, bottom-left) of <paramref name="src"/> into an upright
+    /// rectangle sized to the quad's own longest edges. Shared by the automatic auto-crop
+    /// pass, the manual quad-edit path, and the plain rect/strip paths (default split, legacy
+    /// saved crops) so there's exactly one implementation of "apply this crop shape" — a
+    /// genuinely skewed quad gets a full perspective warp, while a shape that's already an
+    /// axis-aligned rectangle (the common case: no perspective to correct) takes a cheap
+    /// direct crop instead of paying full-image `WarpPerspective` cost for nothing.</summary>
+    internal static Mat WarpQuad(Mat src, Point2f[] corners)
+    {
+        if (IsAxisAlignedRect(corners, out var rect))
+            return src[ClampRectToBounds(rect, src.Cols, src.Rows)].Clone();
+
+        var width = Math.Max(1, (int)Math.Round(Math.Max(Distance(corners[0], corners[1]), Distance(corners[2], corners[3]))));
+        var height = Math.Max(1, (int)Math.Round(Math.Max(Distance(corners[0], corners[3]), Distance(corners[1], corners[2]))));
+        var destination = new[] { new Point2f(0, 0), new Point2f(width - 1, 0), new Point2f(width - 1, height - 1), new Point2f(0, height - 1) };
+        using var transform = Cv2.GetPerspectiveTransform(corners, destination);
+        var warped = new Mat();
+        Cv2.WarpPerspective(src, warped, transform, new Size(width, height), InterpolationFlags.Linear, BorderTypes.Replicate);
+        return warped;
+    }
+
+    private static bool IsAxisAlignedRect(Point2f[] corners, out Rect rect)
+    {
+        rect = default;
+        if (corners.Length != 4) return false;
+        var (tl, tr, br, bl) = (corners[0], corners[1], corners[2], corners[3]);
+        const float epsilon = 0.01f;
+        if (Math.Abs(tl.Y - tr.Y) > epsilon || Math.Abs(bl.Y - br.Y) > epsilon ||
+            Math.Abs(tl.X - bl.X) > epsilon || Math.Abs(tr.X - br.X) > epsilon)
+            return false;
+
+        var x = (int)Math.Round(Math.Min(tl.X, bl.X));
+        var y = (int)Math.Round(Math.Min(tl.Y, tr.Y));
+        var w = (int)Math.Round(Math.Max(tr.X, br.X) - x);
+        var h = (int)Math.Round(Math.Max(bl.Y, br.Y) - y);
+        rect = new Rect(x, y, Math.Max(1, w), Math.Max(1, h));
+        return true;
+    }
+
+    private static Rect ClampRectToBounds(Rect rect, int maxW, int maxH)
+    {
+        var x = Math.Clamp(rect.X, 0, Math.Max(0, maxW - 1));
+        var y = Math.Clamp(rect.Y, 0, Math.Max(0, maxH - 1));
+        var w = Math.Clamp(rect.Width, 1, maxW - x);
+        var h = Math.Clamp(rect.Height, 1, maxH - y);
+        return new Rect(x, y, w, h);
     }
 
     private static Point2f[] OrderCorners(Point2f[] corners)

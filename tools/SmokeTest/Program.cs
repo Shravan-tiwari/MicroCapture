@@ -11,6 +11,7 @@ using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
 using MicroCapture.Processing;
+using OpenCvSharp;
 using SkiaSharp;
 
 var failures = 0;
@@ -24,6 +25,10 @@ await TestSupersedeRaceDoesNotDuplicateExport();
 await TestBatchResumeDoesNotDuplicateBatch();
 TestDocumentBoundaryDetection();
 TestGutterSplitDetection();
+TestManualOverrideLegacyRectCrop();
+TestManualOverrideQuadCrop();
+TestConvexityClampRejectsSelfIntersection();
+TestEdgePointDetection();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -85,6 +90,21 @@ string WriteGutterTestImage(string path, int imageWidth, int imageHeight, int gu
     canvas.Clear(new SKColor(200, 200, 200));
     using var paint = new SKPaint { Color = new SKColor(60, 60, 60), Style = SKPaintStyle.Fill, IsAntialias = false };
     canvas.DrawRect(new SKRect(gutterCenterX - gutterBandWidth / 2f, 0, gutterCenterX + gutterBandWidth / 2f, imageHeight), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A plain solid-color image with no features — used where the crop-shape math
+/// itself is what's under test, not detection.</summary>
+string WriteSolidImage(string path, int width, int height)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(width, height);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(128, 128, 128));
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -231,4 +251,80 @@ void TestGutterSplitDetection()
 
     Check("Detected split lands near the known gutter position (not a lazy 50/50)",
         Math.Abs(splitPercent - 43.0) <= 3.0);
+}
+
+void TestManualOverrideLegacyRectCrop()
+{
+    Console.WriteLine("\n-- Manual override with a legacy \"x,y,w,h\" rect string crops to the expected size --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_rect.png"), 400, 300);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: true, leftCrop: "50,50,200,150");
+
+    Check("Processing succeeds", result.Success);
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Legacy rect crop produces the expected output size (200x150)", output.Width == 200 && output.Height == 150);
+    }
+}
+
+void TestManualOverrideQuadCrop()
+{
+    Console.WriteLine("\n-- Manual override with a new 8-number quad string perspective-warps to the expected size --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_quad.png"), 400, 300);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // A deliberately skewed (non-axis-aligned) quad, like a keystoned photo:
+    // TL=(40,40) TR=(340,60) BR=(360,260) BL=(20,240). Expected output size is the quad's
+    // own longest top/bottom edge (~341) and longest left/right edge (~201) — see WarpQuad.
+    const string quad = "40,40,340,60,360,260,20,240";
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: true, leftCrop: quad);
+
+    Check("Processing succeeds", result.Success);
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Quad crop width matches the quad's own geometry (~341px)", Math.Abs(output.Width - 341) <= 2);
+        Check("Quad crop height matches the quad's own geometry (~201px)", Math.Abs(output.Height - 201) <= 2);
+    }
+}
+
+void TestConvexityClampRejectsSelfIntersection()
+{
+    Console.WriteLine("\n-- Convexity clamp prevents a corner drag from creating self-intersection --");
+    var square = new[] { new CropPoint(0, 0), new CropPoint(100, 0), new CropPoint(100, 100), new CropPoint(0, 100) };
+    Check("Starting square is convex", CropGeometry.IsConvex(square));
+
+    // Dragging the top-left corner far past the opposite (bottom-right) corner would make
+    // the quad self-intersect into a "bowtie" — the clamp must stop it well short of that.
+    var wildDrag = new CropPoint(500, 500);
+    var clamped = CropGeometry.ClampCornerToConvex(square, 0, wildDrag);
+    var trial = new[] { clamped, square[1], square[2], square[3] };
+    Check("Clamped result keeps the quad convex", CropGeometry.IsConvex(trial));
+    Check("Clamped result actually moved (the drag wasn't just rejected outright)",
+        clamped.X != square[0].X || clamped.Y != square[0].Y);
+
+    // A small, reasonable drag that stays convex should pass through completely unchanged.
+    var reasonableDrag = new CropPoint(10, 10);
+    var unclamped = CropGeometry.ClampCornerToConvex(square, 0, reasonableDrag);
+    Check("A reasonable drag that stays convex is returned unchanged",
+        unclamped.X == reasonableDrag.X && unclamped.Y == reasonableDrag.Y);
+}
+
+void TestEdgePointDetection()
+{
+    Console.WriteLine("\n-- Edge-point detection finds points near a known rectangle edge --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550);
+    var path = WriteBoundaryTestImage(Path.Combine(workDir, "edges.png"), imageWidth, imageHeight, knownRect);
+
+    var points = ImageProcessor.DetectEdgePoints(path);
+    Check("Edge points were found", points.Count > 0);
+
+    var nearTopEdge = points.Count(p => Math.Abs(p.Y - knownRect.Top) <= 5 && p.X > knownRect.Left && p.X < knownRect.Right);
+    Check("Edge points cluster near the known top edge", nearTopEdge > 10);
 }
