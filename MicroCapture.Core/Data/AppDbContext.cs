@@ -13,12 +13,23 @@ public class AppDbContext : DbContext
 
     public string DbPath { get; }
 
-    public AppDbContext()
+    public AppDbContext() : this(DefaultDbPath())
+    {
+    }
+
+    /// <summary>Points the context at a specific SQLite file — used by tests/tools that must
+    /// not touch the operator's real database.</summary>
+    public AppDbContext(string dbPath)
+    {
+        DbPath = dbPath;
+    }
+
+    private static string DefaultDbPath()
     {
         var folder = Environment.SpecialFolder.LocalApplicationData;
         var path = Environment.GetFolderPath(folder);
         // Using a persistent local app data path for offline database
-        DbPath = System.IO.Path.Join(path, "MicroCapture.db");
+        return System.IO.Path.Join(path, "MicroCapture.db");
     }
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)

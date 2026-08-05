@@ -12,14 +12,33 @@ public class CaptureQueueService
 {
     private readonly AppDbContext _dbContext;
 
+    // The background worker constructs a new CaptureQueueService (and AppDbContext) on
+    // every poll iteration, always against the same database file. The schema is only
+    // ever behind on the first construction seen for a given DbPath, so gate the
+    // EnsureCreated/ALTER TABLE work behind a per-path cache instead of re-running
+    // PRAGMA/table_info checks every second forever. Keyed by path (not a single global
+    // flag) so tests/tools that legitimately point at multiple distinct database files
+    // within one process still get correctly initialized schemas for each.
+    private static readonly object SchemaCheckSync = new();
+    private static readonly HashSet<string> _schemaCheckedPaths = new();
+
+    /// <summary>Number of times the schema-compatibility work has actually executed for a
+    /// given DbPath in this process. Exposed for regression testing (see tools/SmokeTest).</summary>
+    public static int SchemaCheckRunCount { get; private set; }
+
     public CaptureQueueService(AppDbContext dbContext)
     {
         _dbContext = dbContext;
-        // Older installations were created with EnsureCreated, so EF migrations were
-        // never recorded. Upgrade those databases in place before any query includes
-        // the newer crop/book-splitting columns.
-        _dbContext.Database.EnsureCreated();
-        EnsureCompatibleSchema();
+        lock (SchemaCheckSync)
+        {
+            if (!_schemaCheckedPaths.Add(dbContext.DbPath)) return;
+            // Older installations were created with EnsureCreated, so EF migrations were
+            // never recorded. Upgrade those databases in place before any query includes
+            // the newer crop/book-splitting columns.
+            _dbContext.Database.EnsureCreated();
+            EnsureCompatibleSchema();
+            SchemaCheckRunCount++;
+        }
     }
 
     private void EnsureCompatibleSchema()
@@ -123,6 +142,12 @@ public class CaptureQueueService
         var job = await _dbContext.CaptureJobs.FindAsync(jobId);
         if (job != null)
         {
+            // A recapture can supersede this job while it is mid-flight. Once superseded,
+            // no later status write (e.g. the worker finishing the now-stale attempt) may
+            // resurrect it, or it becomes eligible for export alongside its replacement.
+            if (job.ProcessingStatus == "Superseded")
+                return;
+
             switch (statusType.ToLower())
             {
                 case "processing": job.ProcessingStatus = newStatus; break;

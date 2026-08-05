@@ -76,7 +76,12 @@ public partial class CropReviewViewModel : ViewModelBase
                         IsSinglePage = !IsSplitBookPages;
                         Console.WriteLine($"[CropReviewViewModel] IsSplitBookPages: {IsSplitBookPages}, IsSinglePage: {IsSinglePage}");
                         if (job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox))
-                            LoadCrop(job.LeftCropBox);
+                        {
+                            if (IsSplitBookPages)
+                                LoadSplitPercent(job.LeftCropBox, (int)Image.Size.Width);
+                            else
+                                LoadCrop(job.LeftCropBox);
+                        }
                     }
                     catch (Exception uiEx)
                     {
@@ -167,5 +172,15 @@ public partial class CropReviewViewModel : ViewModelBase
         if (values.Length != 4 || !int.TryParse(values[0], out var x) || !int.TryParse(values[1], out var y) ||
             !int.TryParse(values[2], out var width) || !int.TryParse(values[3], out var height)) return;
         CropX = x; CropY = y; CropWidth = width; CropHeight = height;
+    }
+
+    /// <summary>Recovers the previously chosen split ratio from the saved left-crop width
+    /// so reopening review on a split page doesn't silently reset it to 50/50.</summary>
+    private void LoadSplitPercent(string leftCrop, int imageWidth)
+    {
+        if (imageWidth <= 0) return;
+        var values = leftCrop.Split(',');
+        if (values.Length != 4 || !int.TryParse(values[2], out var leftWidth)) return;
+        SplitPercent = Math.Clamp(leftWidth * 100.0 / imageWidth, 1.0, 99.0);
     }
 }

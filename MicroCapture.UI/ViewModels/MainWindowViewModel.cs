@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Microsoft.EntityFrameworkCore;
 using MicroCapture.Core.Data;
 using MicroCapture.Core.Interfaces;
 using MicroCapture.Core.Models;
@@ -42,6 +43,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private string? _currentProjectId;
     private string? _currentBatchId;
+    // Snapshotted at StartBatchAsync, sanitized so operator-entered text can never
+    // escape the intended output directory or produce an invalid filename.
+    private string _activeProjectCode = string.Empty;
+    private string _activeBatchCode = string.Empty;
     private string _outputDirectory = string.Empty;
     private string _connectedCameraModel = "Not connected";
     private int _liveViewFramePending;
@@ -208,47 +213,105 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
+            var projectCode = MicroCapture.Core.FileNaming.Sanitize(ProjectCode);
+            var batchCode = MicroCapture.Core.FileNaming.Sanitize(BatchCode);
+
             // Ensure project exists
-            var project = _dbContext.Projects.FirstOrDefault(p => p.Name == ProjectCode);
+            var project = _dbContext.Projects.FirstOrDefault(p => p.Name == projectCode);
             if (project == null)
             {
                 project = new Project
                 {
-                    Name = ProjectCode,
+                    Name = projectCode,
                     Customer = "",
                     Description = "Auto-created from scanning session",
                     CreatedBy = Environment.UserName,
                     OutputDirectory = Path.Combine(
                         Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
-                        "MicroCapture", ProjectCode)
+                        "MicroCapture", projectCode)
                 };
                 _dbContext.Projects.Add(project);
                 await _dbContext.SaveChangesAsync();
             }
             _currentProjectId = project.Id;
+            _activeProjectCode = projectCode;
+            _activeBatchCode = batchCode;
             _outputDirectory = project.OutputDirectory;
 
-            // Create batch
-            var batch = new Batch
-            {
-                ProjectId = project.Id,
-                Name = BatchCode,
-                BatchCode = BatchCode,
-                Operator = Environment.UserName,
-                SplitBookPages = SplitBookPages
-            };
-            _dbContext.Batches.Add(batch);
-            await _dbContext.SaveChangesAsync();
+            // Resume an existing active batch with the same code instead of always
+            // creating a new one — otherwise a restart mid-batch (crash, power loss)
+            // silently orphans every page captured before it and starts numbering over.
+            var batch = await _dbContext.Batches
+                .Include(b => b.Captures)
+                .FirstOrDefaultAsync(b => b.ProjectId == project.Id && b.BatchCode == batchCode && b.Status == "Active");
 
-            _currentBatchId = batch.Id;
-            PageCount = 0;
-            RecentCaptures.Clear();
-            StatusText = $"Batch '{BatchCode}' started for project '{ProjectCode}'";
+            if (batch != null)
+            {
+                _currentBatchId = batch.Id;
+                PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
+                await LoadRecentCapturesFromBatchAsync(batch);
+                StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
+            }
+            else
+            {
+                batch = new Batch
+                {
+                    ProjectId = project.Id,
+                    Name = batchCode,
+                    BatchCode = batchCode,
+                    Operator = Environment.UserName,
+                    SplitBookPages = SplitBookPages
+                };
+                _dbContext.Batches.Add(batch);
+                await _dbContext.SaveChangesAsync();
+
+                _currentBatchId = batch.Id;
+                PageCount = 0;
+                RecentCaptures.Clear();
+                StatusText = $"Batch '{batchCode}' started for project '{projectCode}'";
+            }
+
             UpdateCaptureReadiness();
         }
         catch (Exception ex)
         {
             StatusText = $"Could not start batch: {ex.Message}";
+        }
+    }
+
+    /// <summary>Rebuilds the thumbnail strip from a resumed batch's most recent, non-superseded capture per page.</summary>
+    private async Task LoadRecentCapturesFromBatchAsync(Batch batch)
+    {
+        RecentCaptures.Clear();
+        var latestPerPage = batch.Captures
+            .Where(job => job.ProcessingStatus != "Superseded")
+            .GroupBy(job => job.PageNumber)
+            .Select(group => group.OrderByDescending(job => job.Timestamp).First())
+            .OrderByDescending(job => job.PageNumber)
+            .Take(20);
+
+        foreach (var job in latestPerPage)
+        {
+            if (!File.Exists(job.OriginalFilePath)) continue;
+            try
+            {
+                using var stream = File.OpenRead(job.OriginalFilePath);
+                var thumb = await Task.Run(() => Bitmap.DecodeToWidth(stream, 120));
+                RecentCaptures.Add(new ThumbnailItem
+                {
+                    JobId = job.Id,
+                    PageNumber = job.PageNumber,
+                    Thumbnail = thumb,
+                    Status = job.ProcessingStatus == "Completed" ? "Processed"
+                        : job.ProcessingStatus == "Failed" ? "Processing failed"
+                        : "Processing",
+                    FilePath = job.OriginalFilePath
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Thumbnail load failed for '{job.OriginalFilePath}': {ex}");
+            }
         }
     }
 
@@ -263,7 +326,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         PageCount++;
         var pageStr = PageCount.ToString("D6");
-        var prefix = $"{ProjectCode}_{BatchCode}_{pageStr}";
+        var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}";
 
         StatusText = $"Capturing page {pageStr}...";
         try
@@ -297,7 +360,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
         var pageStr = PageCount.ToString("D6");
-        var prefix = $"{ProjectCode}_{BatchCode}_{pageStr}_R";
+        var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}_R";
 
         StatusText = $"Recapturing page {pageStr}...";
         try

@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Tesseract;
 
@@ -203,7 +204,7 @@ public class OcrProcessor
                     dbg.AppendLine(stderr);
                     dbg.AppendLine($"TempTxt: {tempBase}.txt");
                     dbg.AppendLine("--- END DEBUG ---\n");
-                    File.AppendAllText("/tmp/microcapture_tess_debug.log", dbg.ToString());
+                    File.AppendAllText(Path.Combine(Path.GetTempPath(), "microcapture_tess_debug.log"), dbg.ToString());
                 }
                 catch { /* non-fatal logging failure */ }
 
@@ -278,11 +279,14 @@ public class OcrProcessor
     private static bool IsTesseractCliAvailable(out string path)
     {
         path = "tesseract"; // rely on PATH by default
+        var isWindows = OperatingSystem.IsWindows();
+        var lookupCommand = isWindows ? "where" : "which";
         try
         {
-            var p = Process.Start(new ProcessStartInfo { FileName = "which", Arguments = "tesseract", RedirectStandardOutput = true, UseShellExecute = false });
-            p.WaitForExit(2000);
-            var outp = p.StandardOutput.ReadToEnd().Trim();
+            var p = Process.Start(new ProcessStartInfo { FileName = lookupCommand, Arguments = "tesseract", RedirectStandardOutput = true, UseShellExecute = false });
+            p!.WaitForExit(2000);
+            // `where` can print multiple matches, one per line; the first is PATH's preferred pick.
+            var outp = p.StandardOutput.ReadToEnd().Split('\n').Select(line => line.Trim()).FirstOrDefault(line => line.Length > 0);
             if (!string.IsNullOrWhiteSpace(outp))
             {
                 path = outp;
@@ -291,8 +295,14 @@ public class OcrProcessor
         }
         catch { }
 
-        // As a last resort, check common brew locations
-        var candidates = new[] { "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract" };
+        // As a last resort, check common install locations for each platform.
+        var candidates = isWindows
+            ? new[]
+              {
+                  Environment.ExpandEnvironmentVariables(@"%ProgramFiles%\Tesseract-OCR\tesseract.exe"),
+                  Environment.ExpandEnvironmentVariables(@"%ProgramFiles(x86)%\Tesseract-OCR\tesseract.exe")
+              }
+            : new[] { "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract" };
         foreach (var c in candidates)
         {
             if (File.Exists(c)) { path = c; return true; }

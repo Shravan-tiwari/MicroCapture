@@ -40,8 +40,13 @@ public class BatchExportService
 
         // QC is advisory until a dedicated QC-review screen exists. Do not silently
         // discard a successfully produced image solely due to an automatic heuristic.
+        // A recapture landing while the prior attempt is still InProgress can otherwise
+        // leave both attempts "Completed" for the same page — exclude anything marked
+        // Superseded and keep only the latest attempt per page as a second safety net.
         var jobsToExport = batch.Captures
-            .Where(j => j.ProcessingStatus == "Completed")
+            .Where(j => j.ProcessingStatus == "Completed" && j.ExportStatus != "Superseded")
+            .GroupBy(j => j.PageNumber)
+            .Select(group => group.OrderByDescending(j => j.Timestamp).First())
             .OrderBy(j => j.PageNumber)
             .ToList();
 
@@ -216,10 +221,5 @@ public class BatchExportService
 
     private static bool IsExportableImage(string path) => Path.GetExtension(path).ToLowerInvariant() is ".tif" or ".tiff" or ".jpg" or ".jpeg" or ".png";
 
-    private static string SanitizeFileName(string name)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        var clean = new string(name.Select(character => invalid.Contains(character) ? '_' : character).ToArray()).Trim();
-        return string.IsNullOrEmpty(clean) ? "batch" : clean;
-    }
+    private static string SanitizeFileName(string name) => MicroCapture.Core.FileNaming.Sanitize(name);
 }

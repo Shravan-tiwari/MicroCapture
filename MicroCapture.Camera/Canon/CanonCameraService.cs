@@ -408,17 +408,32 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         {
             TaskCompletionSource<string>? tcs; string directory, prefix;
             lock (_sync) { tcs = _captureTcs; directory = _currentSaveDirectory; prefix = _currentFilePrefix; }
-            if (tcs == null)
-            {
-                Log("DownloadImage", "Transfer received with no pending capture; cancelling transfer.");
-                Call("EdsDownloadCancel", () => EDSDK.EdsDownloadCancel(dirItem));
-                return;
-            }
+
             var info = default(EDSDK.EdsDirectoryItemInfo);
             EnsureSuccess("EdsGetDirectoryItemInfo", Call("EdsGetDirectoryItemInfo", () => EDSDK.EdsGetDirectoryItemInfo(dirItem, out info)));
             var extension = Path.GetExtension(info.szFileName);
             if (string.IsNullOrWhiteSpace(extension)) extension = ".jpg";
-            var path = Path.Combine(directory, prefix + extension);
+
+            string path;
+            if (tcs == null)
+            {
+                // No capture is waiting for this transfer — e.g. a prior CaptureAsync already
+                // timed out, or the camera's drive mode produced more than one frame for a
+                // single shutter press. The shutter has already fired: cancelling the transfer
+                // here would permanently discard a real photograph, which violates zero-data-loss.
+                // Salvage it to a side folder instead so nothing captured is ever thrown away.
+                var salvageDir = Path.Combine(string.IsNullOrWhiteSpace(directory)
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MicroCapture")
+                    : directory, "Unmatched");
+                Directory.CreateDirectory(salvageDir);
+                path = Path.Combine(salvageDir, $"unmatched_{DateTime.Now:yyyyMMdd_HHmmss_fff}{extension}");
+                Log("DownloadImage", $"Transfer received with no pending capture; salvaging to {path}.");
+            }
+            else
+            {
+                path = Path.Combine(directory, prefix + extension);
+            }
+
             IntPtr stream = IntPtr.Zero;
             try
             {
@@ -427,7 +442,8 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 EnsureSuccess("EdsDownloadComplete", Call("EdsDownloadComplete", () => EDSDK.EdsDownloadComplete(dirItem)));
             }
             finally { Release(stream, "capture file stream"); }
-            tcs.TrySetResult(path);
+
+            tcs?.TrySetResult(path);
         }
         catch (Exception ex) { Log("DownloadImageAsync", ex.ToString()); FailCapture(ex); }
         finally
