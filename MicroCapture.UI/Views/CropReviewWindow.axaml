@@ -55,11 +55,17 @@
                                Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
                     <TextBlock Text="{Binding BoundaryHintText}"
                                Foreground="#a0a0b0" VerticalAlignment="Center" FontSize="13"/>
+                    <Button Content="Switch to page-by-page" Command="{Binding ToggleSplitEditModeCommand}"
+                            IsVisible="{Binding IsLineSplitMode}"
+                            Background="#2a2a3c" Foreground="#00d2ff" Padding="10,4" CornerRadius="4" FontSize="12"/>
+                    <Button Content="Switch to split line" Command="{Binding ToggleSplitEditModeCommand}"
+                            IsVisible="{Binding IsQuadSplitMode}"
+                            Background="#2a2a3c" Foreground="#00d2ff" Padding="10,4" CornerRadius="4" FontSize="12"/>
                 </StackPanel>
 
-                <!-- Book Split Slider (Visible only in Split mode) -->
+                <!-- Book Split Slider (Visible only in line-split mode) -->
                 <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center"
-                            IsVisible="{Binding IsSplitBookPages}" Spacing="10" VerticalAlignment="Center">
+                            IsVisible="{Binding IsLineSplitMode}" Spacing="10" VerticalAlignment="Center">
                     <TextBlock Text="Split Point:" Foreground="#a0a0b0" VerticalAlignment="Center"/>
                     <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" Width="200" VerticalAlignment="Center"/>
                     <TextBlock Text="{Binding SplitPercent, StringFormat='{}{0:F0}%'}" Foreground="#00d2ff" FontWeight="Bold" Width="40" VerticalAlignment="Center"/>

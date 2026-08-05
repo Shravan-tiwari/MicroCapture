@@ -310,12 +310,10 @@ public class ImageProcessor
 
     private readonly record struct BoundaryDetection(bool Found, double Confidence, Rect PaddedRect, Point2f[]? Quad);
 
-    /// <summary>Shared contour-based document detection used by both the mutating
-    /// auto-crop pass (<see cref="TryAutoCrop"/>) and the read-only boundary lookup
-    /// exposed to the UI (<see cref="DetectDocumentBoundary"/>). Returns the largest
-    /// sufficiently-large contour's padded bounding rect, plus its 4-point approximation
-    /// when the contour is quadrilateral (usable for perspective correction).</summary>
-    private BoundaryDetection DetectBoundary(Mat src)
+    /// <summary>Shared edge-detection step behind every contour-based detector in this class
+    /// (single-document auto-crop, the UI's boundary lookup, and two-page split detection) —
+    /// defined once so all of them see the same document edges.</summary>
+    private static Point[][] FindDocumentContours(Mat src)
     {
         using var gray = new Mat();
         Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
@@ -329,34 +327,109 @@ public class ImageProcessor
         Cv2.Dilate(edged, dilated, kernel, iterations: 2);
 
         Cv2.FindContours(dilated, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-        if (contours.Length == 0) return default;
+        return contours;
+    }
 
-        double maxArea = 0;
-        int maxIdx = 0;
-        for (int i = 0; i < contours.Length; i++)
-        {
-            var area = Cv2.ContourArea(contours[i]);
-            if (area > maxArea) { maxArea = area; maxIdx = i; }
-        }
-
-        var imageArea = src.Rows * src.Cols;
-        var ratio = maxArea / imageArea;
+    /// <summary>Builds a <see cref="BoundaryDetection"/> from one contour: its padded bounding
+    /// rect, confidence (area ratio), and 4-point approximation when the contour is
+    /// quadrilateral. Shared by single-document and two-page detection so "what makes a good
+    /// crop shape from a contour" is defined exactly once.</summary>
+    private BoundaryDetection BuildDetection(Point[] contour, double imageArea, int srcCols, int srcRows)
+    {
+        var ratio = Cv2.ContourArea(contour) / imageArea;
         if (ratio < 0.1) return default;
 
-        var rect = Cv2.BoundingRect(contours[maxIdx]);
+        var rect = Cv2.BoundingRect(contour);
         int x = Math.Max(0, rect.X - CropPadding);
         int y = Math.Max(0, rect.Y - CropPadding);
-        int w = Math.Min(src.Cols - x, rect.Width + 2 * CropPadding);
-        int h = Math.Min(src.Rows - y, rect.Height + 2 * CropPadding);
+        int w = Math.Min(srcCols - x, rect.Width + 2 * CropPadding);
+        int h = Math.Min(srcRows - y, rect.Height + 2 * CropPadding);
         var paddedRect = new Rect(x, y, w, h);
 
-        var perimeter = Cv2.ArcLength(contours[maxIdx], true);
-        var polygon = Cv2.ApproxPolyDP(contours[maxIdx], perimeter * 0.02, true);
+        var perimeter = Cv2.ArcLength(contour, true);
+        var polygon = Cv2.ApproxPolyDP(contour, perimeter * 0.02, true);
         Point2f[]? quad = polygon.Length == 4
             ? OrderCorners(polygon.Select(point => new Point2f(point.X, point.Y)).ToArray())
             : null;
 
         return new BoundaryDetection(true, ratio, paddedRect, quad);
+    }
+
+    /// <summary>Single-document detection used by both the mutating auto-crop pass
+    /// (<see cref="TryAutoCrop"/>) and the read-only boundary lookup exposed to the UI
+    /// (<see cref="DetectDocumentBoundary"/>): the largest sufficiently-large contour.</summary>
+    private BoundaryDetection DetectBoundary(Mat src)
+    {
+        var contours = FindDocumentContours(src);
+        if (contours.Length == 0) return default;
+
+        var best = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
+        return BuildDetection(best, src.Rows * (double)src.Cols, src.Cols, src.Rows);
+    }
+
+    private readonly record struct TwoPageDetection(bool Found, BoundaryDetection Left, BoundaryDetection Right);
+
+    /// <summary>Best-effort detection of two separate pages in one spread image (an open
+    /// book), instead of a single shared boundary. Requires two contours that are each
+    /// plausibly "about half the spread" (15%-60% of the frame) and don't substantially
+    /// overlap horizontally — a spread with no visible gap between pages (flat lighting, no
+    /// gutter shadow, pages pressed together) will usually trace as one large contour instead,
+    /// which correctly fails this and should fall back to the simpler split-line flow rather
+    /// than guess.</summary>
+    private TwoPageDetection DetectTwoPageBoundaries(Mat src)
+    {
+        var contours = FindDocumentContours(src);
+        if (contours.Length < 2) return default;
+
+        var imageArea = src.Rows * (double)src.Cols;
+        var candidates = contours
+            .Select(c => (Contour: c, Ratio: Cv2.ContourArea(c) / imageArea))
+            .Where(c => c.Ratio is >= 0.15 and <= 0.6)
+            .OrderByDescending(c => c.Ratio)
+            .Take(2)
+            .ToList();
+        if (candidates.Count < 2) return default;
+
+        var ordered = candidates
+            .Select(c => (c.Contour, Rect: Cv2.BoundingRect(c.Contour)))
+            .OrderBy(c => c.Rect.X + c.Rect.Width / 2.0)
+            .ToList();
+        var (leftContour, leftRect) = ordered[0];
+        var (rightContour, rightRect) = ordered[1];
+
+        var overlapX = Math.Max(0, Math.Min(leftRect.Right, rightRect.Right) - Math.Max(leftRect.X, rightRect.X));
+        var narrowerWidth = Math.Min(leftRect.Width, rightRect.Width);
+        if (narrowerWidth > 0 && overlapX / (double)narrowerWidth > 0.25) return default;
+
+        var left = BuildDetection(leftContour, imageArea, src.Cols, src.Rows);
+        var right = BuildDetection(rightContour, imageArea, src.Cols, src.Rows);
+        return left.Found && right.Found ? new TwoPageDetection(true, left, right) : default;
+    }
+
+    /// <summary>Read-only two-page boundary lookup for the UI's split-mode Crop Review, in the
+    /// image's own pixel coordinates. Returns null when confident detection of two separate
+    /// pages fails — callers should fall back to the single-line split flow rather than guess.</summary>
+    public (DocumentBoundary Left, DocumentBoundary Right)? DetectSplitPageBoundaries(string imagePath)
+    {
+        if (!File.Exists(imagePath)) return null;
+        try
+        {
+            using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
+            if (src.Empty()) return null;
+            var detection = DetectTwoPageBoundaries(src);
+            return detection.Found ? (ToDocumentBoundary(detection.Left), ToDocumentBoundary(detection.Right)) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static DocumentBoundary ToDocumentBoundary(BoundaryDetection detection)
+    {
+        var rect = detection.PaddedRect;
+        var quad = detection.Quad?.Select(p => new CropPoint(p.X, p.Y)).ToArray();
+        return new DocumentBoundary(rect.X, rect.Y, rect.Width, rect.Height, detection.Confidence, quad);
     }
 
     private Mat TryAutoCrop(Mat src, ProcessingResult result)
@@ -414,9 +487,7 @@ public class ImageProcessor
             if (src.Empty()) return null;
             var detection = DetectBoundary(src);
             if (!detection.Found || detection.Confidence < CropConfidenceThreshold) return null;
-            var rect = detection.PaddedRect;
-            var quad = detection.Quad?.Select(p => new CropPoint(p.X, p.Y)).ToArray();
-            return new DocumentBoundary(rect.X, rect.Y, rect.Width, rect.Height, detection.Confidence, quad);
+            return ToDocumentBoundary(detection);
         }
         catch
         {

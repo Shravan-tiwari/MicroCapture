@@ -13,10 +13,18 @@ namespace MicroCapture.UI.Views;
 
 public partial class CropReviewWindow : Window
 {
-    private enum DragTarget { None, Corner0, Corner1, Corner2, Corner3, SplitLine }
+    private enum DragTarget
+    {
+        None, Corner0, Corner1, Corner2, Corner3, SplitLine,
+        LeftCorner0, LeftCorner1, LeftCorner2, LeftCorner3,
+        RightCorner0, RightCorner1, RightCorner2, RightCorner3
+    }
 
     private const double HandleHitRadius = 16.0;
     private const double SplitLineHitMargin = 12.0;
+    private static readonly Color SingleQuadColor = Color.Parse("#00d2ff");
+    private static readonly Color LeftQuadColor = Color.Parse("#00d2ff");
+    private static readonly Color RightQuadColor = Color.Parse("#7dd3fc");
 
     private DragTarget _activeDrag = DragTarget.None;
 
@@ -33,7 +41,8 @@ public partial class CropReviewWindow : Window
             vm.PropertyChanged += (s, ev) =>
             {
                 if (ev.PropertyName is nameof(vm.TopLeft) or nameof(vm.TopRight) or nameof(vm.BottomRight) or nameof(vm.BottomLeft)
-                    or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages))
+                    or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages)
+                    or nameof(vm.LeftQuad) or nameof(vm.RightQuad) or nameof(vm.IsTwoQuadSplit))
                 {
                     RenderOverlay();
                 }
@@ -55,26 +64,49 @@ public partial class CropReviewWindow : Window
 
         if (vm.IsSplitBookPages)
         {
-            var lineX = imgRect.X + vm.ImageWidth * (vm.SplitPercent / 100.0) * scale;
-            if (Math.Abs(pt.X - lineX) <= SplitLineHitMargin)
+            if (vm.IsTwoQuadSplit)
             {
-                _activeDrag = DragTarget.SplitLine;
-                e.Pointer.Capture(canvas);
+                if (TryHitQuad(vm.LeftQuad, imgRect, scale, pt, out var leftIdx))
+                {
+                    _activeDrag = DragTarget.LeftCorner0 + leftIdx;
+                    e.Pointer.Capture(canvas);
+                    return;
+                }
+                if (TryHitQuad(vm.RightQuad, imgRect, scale, pt, out var rightIdx))
+                {
+                    _activeDrag = DragTarget.RightCorner0 + rightIdx;
+                    e.Pointer.Capture(canvas);
+                }
+            }
+            else
+            {
+                var lineX = imgRect.X + vm.ImageWidth * (vm.SplitPercent / 100.0) * scale;
+                if (Math.Abs(pt.X - lineX) <= SplitLineHitMargin)
+                {
+                    _activeDrag = DragTarget.SplitLine;
+                    e.Pointer.Capture(canvas);
+                }
             }
             return;
         }
 
         var corners = new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft };
+        if (TryHitQuad(corners, imgRect, scale, pt, out var idx))
+        {
+            _activeDrag = DragTarget.Corner0 + idx;
+            e.Pointer.Capture(canvas);
+        }
+    }
+
+    private static bool TryHitQuad(CropPoint[] corners, Rect imgRect, double scale, Point pointerPos, out int index)
+    {
         for (var i = 0; i < corners.Length; i++)
         {
             var canvasPt = new Point(imgRect.X + corners[i].X * scale, imgRect.Y + corners[i].Y * scale);
-            if (Distance(canvasPt, pt) <= HandleHitRadius)
-            {
-                _activeDrag = DragTarget.Corner0 + i;
-                e.Pointer.Capture(canvas);
-                return;
-            }
+            if (Distance(canvasPt, pointerPos) <= HandleHitRadius) { index = i; return true; }
         }
+        index = -1;
+        return false;
     }
 
     protected override void OnPointerMoved(PointerEventArgs e)
@@ -96,17 +128,38 @@ public partial class CropReviewWindow : Window
             return;
         }
 
-        var cornerIndex = _activeDrag - DragTarget.Corner0;
         var rawX = Math.Clamp((pt.X - imgRect.X) / scale, 0, vm.ImageWidth);
         var rawY = Math.Clamp((pt.Y - imgRect.Y) / scale, 0, vm.ImageHeight);
-        var resolved = vm.ResolveCornerDrag(cornerIndex, new CropPoint(rawX, rawY));
+        var rawPoint = new CropPoint(rawX, rawY);
 
+        if (_activeDrag >= DragTarget.LeftCorner0 && _activeDrag <= DragTarget.LeftCorner3)
+        {
+            var idx = _activeDrag - DragTarget.LeftCorner0;
+            var resolved = vm.ResolveSplitCornerDrag(isLeftPage: true, idx, rawPoint);
+            var arr = (CropPoint[])vm.LeftQuad.Clone();
+            arr[idx] = resolved;
+            vm.LeftQuad = arr;
+            return;
+        }
+
+        if (_activeDrag >= DragTarget.RightCorner0 && _activeDrag <= DragTarget.RightCorner3)
+        {
+            var idx = _activeDrag - DragTarget.RightCorner0;
+            var resolved = vm.ResolveSplitCornerDrag(isLeftPage: false, idx, rawPoint);
+            var arr = (CropPoint[])vm.RightQuad.Clone();
+            arr[idx] = resolved;
+            vm.RightQuad = arr;
+            return;
+        }
+
+        var cornerIndex = _activeDrag - DragTarget.Corner0;
+        var resolvedSingle = vm.ResolveCornerDrag(cornerIndex, rawPoint);
         switch (cornerIndex)
         {
-            case 0: vm.TopLeft = resolved; break;
-            case 1: vm.TopRight = resolved; break;
-            case 2: vm.BottomRight = resolved; break;
-            case 3: vm.BottomLeft = resolved; break;
+            case 0: vm.TopLeft = resolvedSingle; break;
+            case 1: vm.TopRight = resolvedSingle; break;
+            case 2: vm.BottomRight = resolvedSingle; break;
+            case 3: vm.BottomLeft = resolvedSingle; break;
         }
     }
 
@@ -158,28 +211,36 @@ public partial class CropReviewWindow : Window
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;
 
-        if (vm.IsSplitBookPages)
+        if (vm.IsSplitBookPages && vm.IsTwoQuadSplit)
+        {
+            RenderQuad(canvas, vm.LeftQuad, imgRect, scale, LeftQuadColor);
+            RenderQuad(canvas, vm.RightQuad, imgRect, scale, RightQuadColor);
+        }
+        else if (vm.IsSplitBookPages)
+        {
             RenderSplitLine(canvas, vm, imgRect, scale);
+        }
         else
-            RenderQuad(canvas, vm, imgRect, scale);
+        {
+            RenderQuad(canvas, new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft }, imgRect, scale, SingleQuadColor);
+        }
     }
 
-    private void RenderQuad(Canvas canvas, CropReviewViewModel vm, Rect imgRect, double scale)
+    private void RenderQuad(Canvas canvas, CropPoint[] corners, Rect imgRect, double scale, Color color)
     {
-        var corners = new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft };
         var canvasPoints = corners.Select(c => new Point(imgRect.X + c.X * scale, imgRect.Y + c.Y * scale)).ToList();
 
         var polygon = new Polygon
         {
             Points = canvasPoints,
-            Stroke = new SolidColorBrush(Color.Parse("#00d2ff")),
+            Stroke = new SolidColorBrush(color),
             StrokeThickness = 2,
-            Fill = new SolidColorBrush(Color.FromArgb(40, 0, 210, 255))
+            Fill = new SolidColorBrush(Color.FromArgb(40, color.R, color.G, color.B))
         };
         canvas.Children.Add(polygon);
 
         foreach (var p in canvasPoints)
-            AddHandle(canvas, p.X, p.Y);
+            AddHandle(canvas, p.X, p.Y, color);
     }
 
     private void RenderSplitLine(Canvas canvas, CropReviewViewModel vm, Rect imgRect, double scale)
@@ -217,10 +278,10 @@ public partial class CropReviewWindow : Window
         Canvas.SetTop(line, imgRect.Y);
         canvas.Children.Add(line);
 
-        AddHandle(canvas, lineX, imgRect.Y + imgRect.Height / 2);
+        AddHandle(canvas, lineX, imgRect.Y + imgRect.Height / 2, Color.Parse("#e94560"));
     }
 
-    private void AddHandle(Canvas canvas, double cx, double cy)
+    private void AddHandle(Canvas canvas, double cx, double cy, Color strokeColor)
     {
         const double radius = 7;
         var handle = new Ellipse
@@ -228,7 +289,7 @@ public partial class CropReviewWindow : Window
             Width = radius * 2,
             Height = radius * 2,
             Fill = new SolidColorBrush(Color.Parse("#ffffff")),
-            Stroke = new SolidColorBrush(Color.Parse("#00d2ff")),
+            Stroke = new SolidColorBrush(strokeColor),
             StrokeThickness = 2
         };
         Canvas.SetLeft(handle, cx - radius);

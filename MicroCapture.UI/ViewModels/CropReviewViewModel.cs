@@ -27,6 +27,8 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     // to an unhelpful full-frame box or an unconditioned 50/50 split.
     private CropPoint[]? _detectedCorners;
     private double _detectedSplitPercent = 50.0;
+    private CropPoint[]? _detectedLeftQuad;
+    private CropPoint[]? _detectedRightQuad;
 
     // Cached once at load for fast, non-blocking corner-snapping and live preview during
     // interactive dragging — never re-computed per drag frame.
@@ -48,6 +50,30 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private CropPoint _topRight;
     [ObservableProperty] private CropPoint _bottomRight;
     [ObservableProperty] private CropPoint _bottomLeft;
+
+    // Split mode has two editing styles: a single shared line (simple, always available), or
+    // two independent per-page quads when detection is confident enough to offer it (or the
+    // operator switches to it manually). Each array is always exactly 4 corners, same order
+    // as above.
+    [ObservableProperty] private bool _isTwoQuadSplit;
+    [ObservableProperty] private CropPoint[] _leftQuad = new CropPoint[4];
+    [ObservableProperty] private CropPoint[] _rightQuad = new CropPoint[4];
+
+    // XAML-facing computed flags for which split sub-editor should be visible.
+    public bool IsLineSplitMode => IsSplitBookPages && !IsTwoQuadSplit;
+    public bool IsQuadSplitMode => IsSplitBookPages && IsTwoQuadSplit;
+
+    partial void OnIsSplitBookPagesChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsLineSplitMode));
+        OnPropertyChanged(nameof(IsQuadSplitMode));
+    }
+
+    partial void OnIsTwoQuadSplitChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsLineSplitMode));
+        OnPropertyChanged(nameof(IsQuadSplitMode));
+    }
 
     // Live preview of the corrected image as it's edited. Split mode uses both (left/right);
     // single-page mode uses only PreviewImage.
@@ -99,19 +125,40 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 var imageHeight = (int)bmp.Size.Height;
 
                 CropPoint[]? savedCorners = null;
+                CropPoint[]? savedRightCorners = null;
+                bool? savedIsTwoQuad = null;
                 CropPoint[]? detectedCorners = null;
+                CropPoint[]? detectedLeftQuad = null;
+                CropPoint[]? detectedRightQuad = null;
                 double detectedSplit = 50.0;
 
                 if (hasSavedCrop)
                 {
                     savedCorners = ImageProcessor.ParseCropShape(job.LeftCropBox!, imageWidth, imageHeight);
+                    if (isSplit && !string.IsNullOrWhiteSpace(job.RightCropBox))
+                    {
+                        savedRightCorners = ImageProcessor.ParseCropShape(job.RightCropBox!, imageWidth, imageHeight);
+                        // 8 comma-separated numbers means this was saved as an independent quad
+                        // (two-quad mode was used); 4 means a plain rect/strip (line mode).
+                        savedIsTwoQuad = job.LeftCropBox!.Split(',').Length == 8;
+                    }
                 }
                 else
                 {
                     var processor = new ImageProcessor();
                     if (isSplit)
                     {
-                        detectedSplit = processor.DetectGutterSplitPercent(_imagePath);
+                        var twoPage = processor.DetectSplitPageBoundaries(_imagePath);
+                        if (twoPage.HasValue)
+                        {
+                            var (left, right) = twoPage.Value;
+                            detectedLeftQuad = left.Quad ?? RectCorners(left.X, left.Y, left.Width, left.Height);
+                            detectedRightQuad = right.Quad ?? RectCorners(right.X, right.Y, right.Width, right.Height);
+                        }
+                        else
+                        {
+                            detectedSplit = processor.DetectGutterSplitPercent(_imagePath);
+                        }
                     }
                     else
                     {
@@ -138,13 +185,22 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                         _previewRenderer = previewRenderer;
                         _detectedCorners = detectedCorners;
                         _detectedSplitPercent = detectedSplit;
+                        _detectedLeftQuad = detectedLeftQuad;
+                        _detectedRightQuad = detectedRightQuad;
 
                         if (hasSavedCrop && savedCorners != null)
                         {
-                            if (isSplit)
+                            if (isSplit && savedIsTwoQuad == true && savedRightCorners != null)
+                            {
+                                IsTwoQuadSplit = true;
+                                LeftQuad = savedCorners;
+                                RightQuad = savedRightCorners;
+                            }
+                            else if (isSplit)
                             {
                                 // Derive the split ratio from the saved left box's own width —
-                                // works whether it was saved as a legacy rect or a quad.
+                                // works whether it was saved as a legacy rect or an axis-aligned quad.
+                                IsTwoQuadSplit = false;
                                 var leftWidth = savedCorners[1].X - savedCorners[0].X;
                                 SplitPercent = imageWidth > 0
                                     ? Math.Clamp(leftWidth / imageWidth * 100.0, 1.0, 99.0)
@@ -156,8 +212,16 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                             }
                             BoundaryHintText = "Previously saved crop restored — adjust if needed.";
                         }
+                        else if (isSplit && detectedLeftQuad != null && detectedRightQuad != null)
+                        {
+                            IsTwoQuadSplit = true;
+                            LeftQuad = detectedLeftQuad;
+                            RightQuad = detectedRightQuad;
+                            BoundaryHintText = "Auto-detected two separate pages — drag a corner to adjust.";
+                        }
                         else if (isSplit)
                         {
+                            IsTwoQuadSplit = false;
                             SplitPercent = detectedSplit;
                             BoundaryHintText = "Estimated split point — drag the line to adjust.";
                         }
@@ -210,6 +274,42 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         return resolved;
     }
 
+    /// <summary>Same as <see cref="ResolveCornerDrag"/>, for a corner of one of the two
+    /// independent per-page quads in split mode.</summary>
+    public CropPoint ResolveSplitCornerDrag(bool isLeftPage, int cornerIndex, CropPoint rawPosition)
+    {
+        var snapped = TrySnapToEdge(rawPosition);
+        var corners = isLeftPage ? LeftQuad : RightQuad;
+        var resolved = CropGeometry.ClampCornerToConvex(corners, cornerIndex, snapped);
+        SchedulePreviewUpdate();
+        return resolved;
+    }
+
+    [RelayCommand]
+    private void ToggleSplitEditMode()
+    {
+        if (!IsSplitBookPages || Image == null) return;
+
+        if (IsTwoQuadSplit)
+        {
+            // Switching to line mode: derive an approximate split percent from the current quads.
+            var rightEdgeOfLeft = (LeftQuad[1].X + LeftQuad[2].X) / 2.0;
+            SplitPercent = ImageWidth > 0 ? Math.Clamp(rightEdgeOfLeft / ImageWidth * 100.0, 1.0, 99.0) : 50.0;
+            IsTwoQuadSplit = false;
+            BoundaryHintText = "Split line — drag to adjust, or switch to page-by-page.";
+        }
+        else
+        {
+            // Switching to page-by-page mode: seed both quads from the current split line.
+            var splitX = ImageWidth * (SplitPercent / 100.0);
+            LeftQuad = RectCorners(0, 0, splitX, ImageHeight);
+            RightQuad = RectCorners(splitX, 0, ImageWidth - splitX, ImageHeight);
+            IsTwoQuadSplit = true;
+            BoundaryHintText = "Two independent pages — drag a corner to adjust.";
+        }
+        SchedulePreviewUpdate();
+    }
+
     private CropPoint TrySnapToEdge(CropPoint dragged)
     {
         if (_edgePoints.Count == 0) return dragged;
@@ -237,13 +337,16 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     {
         if (_previewRenderer == null) return;
 
-        if (IsSplitBookPages)
+        if (IsSplitBookPages && IsTwoQuadSplit)
+        {
+            RenderPreviewInto(LeftQuad, isPrimary: true);
+            RenderPreviewInto(RightQuad, isPrimary: false);
+        }
+        else if (IsSplitBookPages)
         {
             var splitX = ImageWidth * (SplitPercent / 100.0);
-            var left = RectCorners(0, 0, splitX, ImageHeight);
-            var right = RectCorners(splitX, 0, ImageWidth - splitX, ImageHeight);
-            RenderPreviewInto(left, isPrimary: true);
-            RenderPreviewInto(right, isPrimary: false);
+            RenderPreviewInto(RectCorners(0, 0, splitX, ImageHeight), isPrimary: true);
+            RenderPreviewInto(RectCorners(splitX, 0, ImageWidth - splitX, ImageHeight), isPrimary: false);
         }
         else
         {
@@ -289,13 +392,23 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     }
 
     partial void OnSplitPercentChanged(double value) => SchedulePreviewUpdate();
+    partial void OnLeftQuadChanged(CropPoint[] value) => SchedulePreviewUpdate();
+    partial void OnRightQuadChanged(CropPoint[] value) => SchedulePreviewUpdate();
 
     [RelayCommand]
     private void Reset()
     {
         if (Image == null) return;
 
-        if (IsSplitBookPages)
+        if (IsSplitBookPages && IsTwoQuadSplit)
+        {
+            if (_detectedLeftQuad != null && _detectedRightQuad != null)
+            {
+                LeftQuad = _detectedLeftQuad;
+                RightQuad = _detectedRightQuad;
+            }
+        }
+        else if (IsSplitBookPages)
         {
             SplitPercent = _detectedSplitPercent;
         }
@@ -320,7 +433,12 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)
         {
-            if (IsSplitBookPages)
+            if (IsSplitBookPages && IsTwoQuadSplit)
+            {
+                job.LeftCropBox = FormatCorners(LeftQuad);
+                job.RightCropBox = FormatCorners(RightQuad);
+            }
+            else if (IsSplitBookPages)
             {
                 var leftWidth = Math.Clamp((int)(ImageWidth * (SplitPercent / 100.0)), 1, ImageWidth - 1);
                 job.LeftCropBox = $"0,0,{leftWidth},{ImageHeight}";

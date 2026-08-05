@@ -31,6 +31,8 @@ TestConvexityClampRejectsSelfIntersection();
 TestEdgePointDetection();
 TestManualOverrideSplitCrop();
 await TestSplitCropReviewSaveThenExport();
+TestTwoPageBoundaryDetection();
+TestIndependentSkewedQuadsPerPage();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -92,6 +94,25 @@ string WriteGutterTestImage(string path, int imageWidth, int imageHeight, int gu
     canvas.Clear(new SKColor(200, 200, 200));
     using var paint = new SKPaint { Color = new SKColor(60, 60, 60), Style = SKPaintStyle.Fill, IsAntialias = false };
     canvas.DrawRect(new SKRect(gutterCenterX - gutterBandWidth / 2f, 0, gutterCenterX + gutterBandWidth / 2f, imageHeight), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>Two separate sharp white rectangles on a dark background, side by side with a
+/// gap between them — analogous to an open book photographed with a visible gutter shadow,
+/// for exercising ImageProcessor's two-page split detection.</summary>
+string WriteTwoPageTestImage(string path, int imageWidth, int imageHeight, SKRectI leftRect, SKRectI rightRect)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(20, 20, 20));
+    using var paint = new SKPaint { Color = SKColors.White, Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(leftRect.Left, leftRect.Top, leftRect.Right, leftRect.Bottom), paint);
+    canvas.DrawRect(new SKRect(rightRect.Left, rightRect.Top, rightRect.Right, rightRect.Bottom), paint);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -409,5 +430,61 @@ async Task TestSplitCropReviewSaveThenExport()
             exportedLeft.Width < imageWidth);
         Check("Exported right page is narrower than the full original (actually cropped, not the raw spread)",
             exportedRight.Width < imageWidth);
+    }
+}
+
+void TestTwoPageBoundaryDetection()
+{
+    Console.WriteLine("\n-- Two-page split detection finds two separate known rectangles --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 1000, imageHeight = 600;
+    var leftRect = new SKRectI(50, 50, 470, 550);   // width=420, height=500 -> 35% of frame area
+    var rightRect = new SKRectI(530, 50, 950, 550); // same size, clear gap between them
+
+    var path = WriteTwoPageTestImage(Path.Combine(workDir, "two_page.png"), imageWidth, imageHeight, leftRect, rightRect);
+    var detected = new ImageProcessor().DetectSplitPageBoundaries(path);
+
+    Check("Two separate pages are detected", detected.HasValue);
+    if (detected is { } pages)
+    {
+        Check("Detected left page is actually on the left", pages.Left.X < pages.Right.X);
+        Check("Detected left page X is close to the known rectangle", Math.Abs(pages.Left.X - (leftRect.Left - 10)) <= 20);
+        Check("Detected left page width is close to the known rectangle", Math.Abs(pages.Left.Width - (leftRect.Width + 20)) <= 30);
+        Check("Detected right page X is close to the known rectangle", Math.Abs(pages.Right.X - (rightRect.Left - 10)) <= 20);
+        Check("Detected right page width is close to the known rectangle", Math.Abs(pages.Right.Width - (rightRect.Width + 20)) <= 30);
+    }
+
+    // A single merged spread (no visible gap) must NOT be misreported as two confident pages —
+    // it should fail gracefully so the caller falls back to the simple split-line flow.
+    Console.WriteLine("-- Two-page detection declines a single merged spread rather than guessing --");
+    var mergedPath = WriteBoundaryTestImage(Path.Combine(workDir, "merged_spread.png"), imageWidth, imageHeight, new SKRectI(50, 50, 950, 550));
+    var mergedDetection = new ImageProcessor().DetectSplitPageBoundaries(mergedPath);
+    Check("A single merged contour is not misreported as two pages", !mergedDetection.HasValue);
+}
+
+void TestIndependentSkewedQuadsPerPage()
+{
+    Console.WriteLine("\n-- Split manual override with two independently skewed quads (not just strips) --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_two_quads.png"), 1000, 500);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // Two independently skewed quads (as page-by-page corner editing would produce) —
+    // deliberately different shapes on each side, unlike a shared straight split line.
+    const string leftQuad = "20,30,460,10,470,470,10,490";     // slightly tilted left page
+    const string rightQuad = "540,15,980,25,975,480,545,460"; // differently tilted right page
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, manualOverride: true, leftCrop: leftQuad, rightCrop: rightQuad);
+
+    Check("Processing succeeds", result.Success);
+    Check("Exactly two output files are produced", result.OutputFilePaths.Count == 2);
+    if (result.OutputFilePaths.Count == 2)
+    {
+        using var left = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        using var right = Cv2.ImRead(result.OutputFilePaths[1], ImreadModes.Unchanged);
+        Check("Left and right outputs are genuinely different shapes (independent quads, not one shared line)",
+            left.Width != right.Width || left.Height != right.Height);
+        Check("Left output is a real, non-trivial image", left.Width > 100 && left.Height > 100);
+        Check("Right output is a real, non-trivial image", right.Width > 100 && right.Height > 100);
     }
 }
