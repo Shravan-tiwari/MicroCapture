@@ -8,6 +8,7 @@ using CommunityToolkit.Mvvm.Input;
 using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
+using MicroCapture.Processing;
 
 namespace MicroCapture.UI.ViewModels;
 
@@ -17,7 +18,12 @@ public partial class CropReviewViewModel : ViewModelBase
     private readonly AppDbContext _dbContext;
     private readonly CaptureQueueService _queueService;
     private readonly string _imagePath;
-    
+
+    // Cached so Reset can re-apply the smart-detected starting point instead of
+    // falling back to the (usually unhelpful) full-frame / exact-50% default.
+    private DocumentBoundary? _detectedBoundary;
+    private double _detectedSplitPercent = 50.0;
+
     [ObservableProperty] private Bitmap? _image;
     [ObservableProperty] private double _splitPercent = 50.0;
     [ObservableProperty] private bool _isSplitBookPages;
@@ -26,6 +32,7 @@ public partial class CropReviewViewModel : ViewModelBase
     [ObservableProperty] private int _cropY;
     [ObservableProperty] private int _cropWidth;
     [ObservableProperty] private int _cropHeight;
+    [ObservableProperty] private string _boundaryHintText = string.Empty;
 
     public CropReviewViewModel() { _jobId = ""; _dbContext = null!; _queueService = null!; _imagePath = ""; }
 
@@ -63,6 +70,23 @@ public partial class CropReviewViewModel : ViewModelBase
                 var bmp = new Bitmap(stream);
                 var batch = _dbContext.Batches.Find(job.BatchId);
                 var isSplit = batch?.SplitBookPages == true;
+                var hasSavedCrop = job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox);
+
+                // Run the same smart detection the standard pipeline already uses, so the
+                // review box starts from a sensible boundary/gutter instead of the full raw
+                // frame or an unconditioned 50/50 split. Only needed when there's nothing
+                // previously saved to restore instead.
+                DocumentBoundary? detected = null;
+                double detectedSplit = 50.0;
+                if (!hasSavedCrop)
+                {
+                    var processor = new ImageProcessor();
+                    if (isSplit)
+                        detectedSplit = processor.DetectGutterSplitPercent(_imagePath);
+                    else
+                        detected = processor.DetectDocumentBoundary(_imagePath);
+                }
+
                 // Marshal results back to UI thread
                 Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
@@ -70,17 +94,43 @@ public partial class CropReviewViewModel : ViewModelBase
                     {
                         Image = bmp;
                         Console.WriteLine($"[CropReviewViewModel] Image loaded successfully. Size: {Image.Size}");
-                        CropWidth = (int)Image.Size.Width;
-                        CropHeight = (int)Image.Size.Height;
                         IsSplitBookPages = isSplit;
                         IsSinglePage = !IsSplitBookPages;
                         Console.WriteLine($"[CropReviewViewModel] IsSplitBookPages: {IsSplitBookPages}, IsSinglePage: {IsSinglePage}");
-                        if (job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox))
+
+                        _detectedBoundary = detected;
+                        _detectedSplitPercent = detectedSplit;
+
+                        if (hasSavedCrop)
                         {
+                            CropWidth = (int)Image.Size.Width;
+                            CropHeight = (int)Image.Size.Height;
                             if (IsSplitBookPages)
-                                LoadSplitPercent(job.LeftCropBox, (int)Image.Size.Width);
+                                LoadSplitPercent(job.LeftCropBox!, (int)Image.Size.Width);
                             else
-                                LoadCrop(job.LeftCropBox);
+                                LoadCrop(job.LeftCropBox!);
+                            BoundaryHintText = "Previously saved crop restored — adjust if needed.";
+                        }
+                        else if (IsSplitBookPages)
+                        {
+                            SplitPercent = detectedSplit;
+                            BoundaryHintText = "Estimated split point — drag to adjust.";
+                        }
+                        else if (detected is { } boundary)
+                        {
+                            CropX = boundary.X;
+                            CropY = boundary.Y;
+                            CropWidth = boundary.Width;
+                            CropHeight = boundary.Height;
+                            BoundaryHintText = "Auto-detected boundary — adjust if needed.";
+                        }
+                        else
+                        {
+                            CropX = 0;
+                            CropY = 0;
+                            CropWidth = (int)Image.Size.Width;
+                            CropHeight = (int)Image.Size.Height;
+                            BoundaryHintText = "No boundary detected — showing full image.";
                         }
                     }
                     catch (Exception uiEx)
@@ -99,13 +149,25 @@ public partial class CropReviewViewModel : ViewModelBase
     [RelayCommand]
     private void Reset()
     {
-        if (Image != null)
+        if (Image == null) return;
+
+        if (IsSplitBookPages)
+        {
+            SplitPercent = _detectedSplitPercent;
+        }
+        else if (_detectedBoundary is { } boundary)
+        {
+            CropX = boundary.X;
+            CropY = boundary.Y;
+            CropWidth = boundary.Width;
+            CropHeight = boundary.Height;
+        }
+        else
         {
             CropX = 0;
             CropY = 0;
             CropWidth = (int)Image.Size.Width;
             CropHeight = (int)Image.Size.Height;
-            SplitPercent = 50.0;
         }
     }
 

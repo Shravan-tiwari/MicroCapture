@@ -21,6 +21,18 @@
     </Content>
   </ItemGroup>
 
+  <!-- Local macOS dev/test convenience only: OpenCvSharp4.runtime.osx_arm64's native
+       library resolves its own dependencies (libfreetype, libharfbuzz, etc.) via
+       "@executable_path/../libs", which doesn't match `dotnet build`'s output layout.
+       Mirror the native folder there so Cv2 calls actually work when testing on Mac.
+       No effect on Windows builds/publishes. -->
+  <Target Name="FixOpenCvMacOsLibraryPath" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <ItemGroup>
+      <OpenCvMacNativeDeps Include="$(OutDir)runtimes/osx-arm64/native/*.dylib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OpenCvMacNativeDeps)" DestinationFolder="$(OutDir)..\libs" SkipUnchangedFiles="true" Condition="'@(OpenCvMacNativeDeps)' != ''" />
+  </Target>
+
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.1.3" />
     <PackageReference Include="Avalonia.Desktop" Version="11.1.3" />

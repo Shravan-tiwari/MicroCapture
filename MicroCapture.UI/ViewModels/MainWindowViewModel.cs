@@ -51,8 +51,17 @@ public partial class MainWindowViewModel : ViewModelBase
     private string _connectedCameraModel = "Not connected";
     private int _liveViewFramePending;
     private int _captureInProgress;
-    private DateTime _lastAutoCaptureUtc = DateTime.MinValue;
     private DateTime _lastDocumentCheckUtc = DateTime.MinValue;
+
+    // Assisted auto-capture guidance state (never fires the shutter on its own — only
+    // decides when to show "Ready — press SPACE"). See UpdateDocumentStatus.
+    private const int StableFramesRequired = 3; // ~1.5s at the existing 500ms check interval
+    private const double LiveSharpnessThreshold = 40.0; // live-view frames are lower detail than a full capture, so a lower bar than the QC BlurThreshold (100)
+    private const double StablePositionToleranceFraction = 0.03; // allowed drift between checks, as a fraction of frame size
+    private int _stableFrameCount;
+    private (int X, int Y, int Width, int Height)? _lastDetectedRect;
+    private (int X, int Y, int Width, int Height)? _lastCapturedRect;
+    private bool _awaitingPageChange;
 
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
@@ -131,21 +140,16 @@ public partial class MainWindowViewModel : ViewModelBase
                     LiveViewImage = bitmap;
                     old?.Dispose();
                     // Boundary detection is throttled to keep the live-view path
-                    // responsive while still providing a meaningful auto-capture gate.
+                    // responsive while still providing a meaningful capture-readiness gate.
                     if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
                     {
                         _lastDocumentCheckUtc = DateTime.UtcNow;
-                        var detected = MicroCapture.Processing.ImageProcessor.IsDocumentDetected(frameBytes);
-                        DocumentStatus = detected ? "✓ Boundary detected" : "Waiting for boundary";
+                        var check = MicroCapture.Processing.ImageProcessor.CheckLiveFrame(frameBytes);
+                        UpdateDocumentStatus(check);
                     }
                     FocusStatus = "Camera-controlled";
                     ExposureStatus = "Camera-controlled";
                     UpdateCaptureReadiness();
-                    if (IsAutoCapture && DocumentStatus.StartsWith("✓") && _currentBatchId != null && DateTime.UtcNow - _lastAutoCaptureUtc >= TimeSpan.FromSeconds(1.5))
-                    {
-                        _lastAutoCaptureUtc = DateTime.UtcNow;
-                        _ = CaptureAsync();
-                    }
                 }
                 catch (Exception ex) { Console.Error.WriteLine($"Live View frame decode failed: {ex}"); }
                 finally { Volatile.Write(ref _liveViewFramePending, 0); }
@@ -159,10 +163,77 @@ public partial class MainWindowViewModel : ViewModelBase
             CaptureReadiness = "NOT READY";
         else if (string.IsNullOrWhiteSpace(ProjectCode) || string.IsNullOrWhiteSpace(BatchCode))
             CaptureReadiness = "SET PROJECT & BATCH";
-        else if (!DocumentStatus.StartsWith("✓"))
-            CaptureReadiness = "WAITING FOR DOCUMENT";
+        else if (IsAutoCapture)
+            // Assisted guidance requires the stricter stable/in-focus/new-page state —
+            // a bare boundary isn't enough to call it "ready" when guidance is on.
+            CaptureReadiness = DocumentStatus == "✓ Ready — press SPACE" ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
         else
-            CaptureReadiness = "READY TO CAPTURE";
+            CaptureReadiness = DocumentStatus.StartsWith("✓") ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
+    }
+
+    /// <summary>Assisted auto-capture guidance state machine. Never captures anything on its
+    /// own — it only decides what to show the operator. When <see cref="IsAutoCapture"/> is
+    /// off, behavior is unchanged from the original simple boundary-present/absent check.</summary>
+    private void UpdateDocumentStatus(MicroCapture.Processing.LiveFrameCheck check)
+    {
+        if (!check.Detected)
+        {
+            _stableFrameCount = 0;
+            _lastDetectedRect = null;
+            _awaitingPageChange = false; // the page was removed from frame — always re-arms
+            DocumentStatus = "Waiting for boundary";
+            return;
+        }
+
+        var rect = (check.X, check.Y, check.Width, check.Height);
+
+        if (!IsAutoCapture)
+        {
+            _stableFrameCount = 0;
+            _lastDetectedRect = rect;
+            DocumentStatus = "✓ Boundary detected";
+            return;
+        }
+
+        if (check.Sharpness < LiveSharpnessThreshold)
+        {
+            _stableFrameCount = 0;
+            _lastDetectedRect = rect;
+            DocumentStatus = "✓ Boundary detected — focusing…";
+            return;
+        }
+
+        var wasStable = _lastDetectedRect.HasValue && IsRectStable(_lastDetectedRect.Value, rect, check.ImageWidth, check.ImageHeight);
+        _lastDetectedRect = rect;
+        _stableFrameCount = wasStable ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
+
+        if (_stableFrameCount < StableFramesRequired)
+        {
+            DocumentStatus = "✓ Boundary detected — hold still…";
+            return;
+        }
+
+        // Require the page to actually change before nagging "Ready" again for the same
+        // physical page that was just captured.
+        var sameAsLastCapture = _awaitingPageChange && _lastCapturedRect.HasValue &&
+            IsRectStable(_lastCapturedRect.Value, rect, check.ImageWidth, check.ImageHeight);
+        if (sameAsLastCapture)
+        {
+            DocumentStatus = "✓ Captured — swap page to continue";
+            return;
+        }
+
+        _awaitingPageChange = false;
+        DocumentStatus = "✓ Ready — press SPACE";
+    }
+
+    private static bool IsRectStable((int X, int Y, int Width, int Height) a, (int X, int Y, int Width, int Height) b, int imageWidth, int imageHeight)
+    {
+        if (imageWidth <= 0 || imageHeight <= 0) return false;
+        var toleranceX = imageWidth * StablePositionToleranceFraction;
+        var toleranceY = imageHeight * StablePositionToleranceFraction;
+        return Math.Abs(a.X - b.X) <= toleranceX && Math.Abs(a.Width - b.Width) <= toleranceX &&
+               Math.Abs(a.Y - b.Y) <= toleranceY && Math.Abs(a.Height - b.Height) <= toleranceY;
     }
 
     // ---------- Commands ----------
@@ -340,6 +411,12 @@ public partial class MainWindowViewModel : ViewModelBase
             // Add thumbnail
             AddThumbnail(job.Id, filePath, PageCount);
 
+            // Require the page to change before the assisted-guidance "Ready" cue can
+            // reappear for what is still the same physical page sitting in frame.
+            _lastCapturedRect = _lastDetectedRect;
+            _awaitingPageChange = true;
+            _stableFrameCount = 0;
+
             StatusText = $"Page {pageStr} captured — {Path.GetFileName(filePath)}";
         }
         catch (Exception ex)
@@ -378,6 +455,10 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
 
+            _lastCapturedRect = _lastDetectedRect;
+            _awaitingPageChange = true;
+            _stableFrameCount = 0;
+
             StatusText = $"Page {pageStr} recaptured";
         }
         catch (Exception ex)
@@ -392,7 +473,15 @@ public partial class MainWindowViewModel : ViewModelBase
     private void ToggleAutoCapture()
     {
         IsAutoCapture = !IsAutoCapture;
-        StatusText = IsAutoCapture ? "AUTO CAPTURE: ON" : "AUTO CAPTURE: OFF";
+        // Start the guidance state machine fresh so a stale reading from before the
+        // toggle can't immediately claim "Ready".
+        _stableFrameCount = 0;
+        _lastDetectedRect = null;
+        _awaitingPageChange = false;
+        StatusText = IsAutoCapture
+            ? "Assisted capture guidance: ON — you'll be prompted when a page is ready; capture still requires SPACE."
+            : "Assisted capture guidance: OFF";
+        UpdateCaptureReadiness();
     }
 
     private async Task LoadCameraSettingsAsync()

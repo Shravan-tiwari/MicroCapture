@@ -22,6 +22,8 @@ Console.WriteLine("=== MicroCapture regression smoke test ===");
 TestSchemaCheckRunsOnce();
 await TestSupersedeRaceDoesNotDuplicateExport();
 await TestBatchResumeDoesNotDuplicateBatch();
+TestDocumentBoundaryDetection();
+TestGutterSplitDetection();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -51,6 +53,40 @@ string WriteDummyImage(string path)
     canvas.Clear(SKColors.White);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 90);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A sharp white rectangle on a dark background — analogous to a photographed page
+/// against a dark mat, for exercising ImageProcessor's contour-based boundary detection.</summary>
+string WriteBoundaryTestImage(string path, int imageWidth, int imageHeight, SKRectI rect)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(20, 20, 20));
+    using var paint = new SKPaint { Color = SKColors.White, Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Right, rect.Bottom), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A light two-page spread with a distinct darker vertical band standing in for a
+/// book's spine shadow, for exercising ImageProcessor's gutter detection.</summary>
+string WriteGutterTestImage(string path, int imageWidth, int imageHeight, int gutterCenterX, int gutterBandWidth)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(200, 200, 200));
+    using var paint = new SKPaint { Color = new SKColor(60, 60, 60), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(gutterCenterX - gutterBandWidth / 2f, 0, gutterCenterX + gutterBandWidth / 2f, imageHeight), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
     data.SaveTo(stream);
     return path;
@@ -158,4 +194,41 @@ async Task TestBatchResumeDoesNotDuplicateBatch()
 
     var totalBatches = await freshDb.Batches.CountAsync(b => b.ProjectId == project.Id);
     Check("No duplicate batch row exists for the same project/batch code", totalBatches == 1);
+}
+
+void TestDocumentBoundaryDetection()
+{
+    Console.WriteLine("\n-- Crop review boundary detection finds a known rectangle --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550); // width=700, height=500 -> 73% of frame area
+
+    var path = WriteBoundaryTestImage(Path.Combine(workDir, "boundary.png"), imageWidth, imageHeight, knownRect);
+    var detected = new ImageProcessor().DetectDocumentBoundary(path);
+
+    Check("A confident boundary is detected", detected.HasValue);
+    if (detected is { } boundary)
+    {
+        // ImageProcessor pads the detected contour by CropPadding (10px, default) before
+        // clamping to the image bounds — allow generous slack for Canny/dilate edge slop
+        // on top of that on what is otherwise a perfectly sharp synthetic rectangle.
+        Check("Detected X is close to the known rectangle", Math.Abs(boundary.X - (knownRect.Left - 10)) <= 20);
+        Check("Detected Y is close to the known rectangle", Math.Abs(boundary.Y - (knownRect.Top - 10)) <= 20);
+        Check("Detected width is close to the known rectangle", Math.Abs(boundary.Width - (knownRect.Width + 20)) <= 30);
+        Check("Detected height is close to the known rectangle", Math.Abs(boundary.Height - (knownRect.Height + 20)) <= 30);
+    }
+}
+
+void TestGutterSplitDetection()
+{
+    Console.WriteLine("\n-- Book-split gutter detection finds a known spine position --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 1000, imageHeight = 400;
+    const int gutterCenterX = 430; // 43% of width — intentionally off-center from 50/50
+
+    var path = WriteGutterTestImage(Path.Combine(workDir, "gutter.png"), imageWidth, imageHeight, gutterCenterX, gutterBandWidth: 30);
+    var splitPercent = new ImageProcessor().DetectGutterSplitPercent(path);
+
+    Check("Detected split lands near the known gutter position (not a lazy 50/50)",
+        Math.Abs(splitPercent - 43.0) <= 3.0);
 }

@@ -28,9 +28,11 @@
             <Grid ColumnDefinitions="Auto, *, Auto">
                 <!-- Mode & Instruction Text -->
                 <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
-                    <TextBlock Text="{Binding IsSplitBookPages, Converter={x:Null}, FallbackValue='Single Page Crop'}"
+                    <TextBlock Text="Split Book Pages" IsVisible="{Binding IsSplitBookPages}"
                                Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
-                    <TextBlock Text="• Drag box or handles to adjust boundary"
+                    <TextBlock Text="Single Page Crop" IsVisible="{Binding IsSinglePage}"
+                               Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding BoundaryHintText}"
                                Foreground="#a0a0b0" VerticalAlignment="Center" FontSize="13"/>
                 </StackPanel>
 
