@@ -60,8 +60,13 @@ public partial class MainWindowViewModel : ViewModelBase
     private const double LiveSharpnessThreshold = 40.0; // live-view frames are lower detail than a full capture, so a lower bar than the QC BlurThreshold (100)
     private const double StablePositionToleranceFraction = 0.03; // allowed drift between checks, as a fraction of frame size
     private const double ContentChangeThreshold = 18.0; // mean abs pixel difference (0-255) considered a genuinely different page
+    private const double PositionSmoothingFactor = 0.35; // weight toward each new detection when updating the smoothed reference
     private int _stableFrameCount;
-    private (int X, int Y, int Width, int Height)? _lastDetectedRect;
+    // A smoothed (not raw) reference position: comparing each new detection against this
+    // instead of the previous raw frame absorbs small per-frame jitter (hand tremor, minor
+    // auto-exposure/focus hunting) without resetting stability progress, while a genuine
+    // page swap still diverges from it quickly and resets normally.
+    private (double X, double Y, double Width, double Height)? _smoothedRect;
     private byte[]? _lastDetectedSignature;
     private byte[]? _lastCapturedSignature;
 
@@ -183,19 +188,19 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!check.Detected)
         {
             _stableFrameCount = 0;
-            _lastDetectedRect = null;
+            _smoothedRect = null;
             _lastDetectedSignature = null;
             DocumentStatus = "Waiting for boundary";
             return;
         }
 
-        var rect = (check.X, check.Y, check.Width, check.Height);
+        var rect = ((double)check.X, (double)check.Y, (double)check.Width, (double)check.Height);
         _lastDetectedSignature = check.ContentSignature;
 
         if (!IsAutoCapture)
         {
             _stableFrameCount = 0;
-            _lastDetectedRect = rect;
+            _smoothedRect = rect;
             DocumentStatus = "✓ Boundary detected";
             return;
         }
@@ -203,13 +208,17 @@ public partial class MainWindowViewModel : ViewModelBase
         if (check.Sharpness < LiveSharpnessThreshold)
         {
             _stableFrameCount = 0;
-            _lastDetectedRect = rect;
+            _smoothedRect = rect;
             DocumentStatus = "✓ Boundary detected — focusing…";
             return;
         }
 
-        var wasStable = _lastDetectedRect.HasValue && IsRectStable(_lastDetectedRect.Value, rect, check.ImageWidth, check.ImageHeight);
-        _lastDetectedRect = rect;
+        // Compare against the smoothed reference from before this update, then blend it
+        // toward the new detection — comparing against the raw previous frame instead would
+        // make ordinary hand/camera jitter reset stability far too often.
+        var previousSmoothed = _smoothedRect;
+        var wasStable = previousSmoothed.HasValue && IsRectStable(previousSmoothed.Value, rect, check.ImageWidth, check.ImageHeight);
+        _smoothedRect = previousSmoothed.HasValue ? LerpRect(previousSmoothed.Value, rect, PositionSmoothingFactor) : rect;
         _stableFrameCount = wasStable ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
 
         if (_stableFrameCount < StableFramesRequired)
@@ -249,7 +258,7 @@ public partial class MainWindowViewModel : ViewModelBase
         return sum / (double)a.Length;
     }
 
-    private static bool IsRectStable((int X, int Y, int Width, int Height) a, (int X, int Y, int Width, int Height) b, int imageWidth, int imageHeight)
+    private static bool IsRectStable((double X, double Y, double Width, double Height) a, (double X, double Y, double Width, double Height) b, int imageWidth, int imageHeight)
     {
         if (imageWidth <= 0 || imageHeight <= 0) return false;
         var toleranceX = imageWidth * StablePositionToleranceFraction;
@@ -257,6 +266,15 @@ public partial class MainWindowViewModel : ViewModelBase
         return Math.Abs(a.X - b.X) <= toleranceX && Math.Abs(a.Width - b.Width) <= toleranceX &&
                Math.Abs(a.Y - b.Y) <= toleranceY && Math.Abs(a.Height - b.Height) <= toleranceY;
     }
+
+    private static (double X, double Y, double Width, double Height) LerpRect(
+        (double X, double Y, double Width, double Height) from,
+        (double X, double Y, double Width, double Height) to,
+        double t) => (
+            from.X + (to.X - from.X) * t,
+            from.Y + (to.Y - from.Y) * t,
+            from.Width + (to.Width - from.Width) * t,
+            from.Height + (to.Height - from.Height) * t);
 
     // ---------- Commands ----------
 
@@ -497,7 +515,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // immediately fire — but deliberately keep _lastCapturedSignature, so toggling AUTO
         // off and back on while the same page is still sitting there doesn't re-fire for it.
         _stableFrameCount = 0;
-        _lastDetectedRect = null;
+        _smoothedRect = null;
         StatusText = IsAutoCapture
             ? "Auto-capture: ON — captures automatically once a page is stable, in focus, and new."
             : "Auto-capture: OFF";

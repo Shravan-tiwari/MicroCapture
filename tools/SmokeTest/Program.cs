@@ -34,6 +34,9 @@ await TestSplitCropReviewSaveThenExport();
 TestTwoPageBoundaryDetection();
 TestIndependentSkewedQuadsPerPage();
 await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
+TestLowContrastDetection();
+TestShadowedPageDetection();
+TestBorderTouchingPageIsNotOverPadded();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -114,6 +117,45 @@ string WriteTwoPageTestImage(string path, int imageWidth, int imageHeight, SKRec
     using var paint = new SKPaint { Color = SKColors.White, Style = SKPaintStyle.Fill, IsAntialias = false };
     canvas.DrawRect(new SKRect(leftRect.Left, leftRect.Top, leftRect.Right, leftRect.Bottom), paint);
     canvas.DrawRect(new SKRect(rightRect.Left, rightRect.Top, rightRect.Right, rightRect.Bottom), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A subtle-contrast rectangle on a similarly-toned background — analogous to a
+/// washed-out or low-contrast photographed page, for exercising adaptive Canny thresholding.</summary>
+string WriteLowContrastTestImage(string path, int imageWidth, int imageHeight, SKRectI rect, byte backgroundGray, byte pageGray)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(backgroundGray, backgroundGray, backgroundGray));
+    using var paint = new SKPaint { Color = new SKColor(pageGray, pageGray, pageGray), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Right, rect.Bottom), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A bright page on a dark background with a semi-transparent dark band overlapping
+/// one edge of the page — analogous to a cast shadow falling across part of a photographed
+/// page — for exercising illumination normalization / shadow suppression.</summary>
+string WriteShadowedTestImage(string path, int imageWidth, int imageHeight, SKRectI rect, int shadowBandWidth)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(20, 20, 20));
+    using var pagePaint = new SKPaint { Color = new SKColor(230, 230, 230), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Right, rect.Bottom), pagePaint);
+    // A cast shadow band inside the left edge of the page — a gradual darkening, not a hard
+    // second edge, so a naive detector might mistake its inner boundary for the page edge.
+    using var shadowPaint = new SKPaint { Color = new SKColor(0, 0, 0, 110), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Left + shadowBandWidth, rect.Bottom), shadowPaint);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -351,6 +393,72 @@ void TestEdgePointDetection()
 
     var nearTopEdge = points.Count(p => Math.Abs(p.Y - knownRect.Top) <= 5 && p.X > knownRect.Left && p.X < knownRect.Right);
     Check("Edge points cluster near the known top edge", nearTopEdge > 10);
+}
+
+void TestLowContrastDetection()
+{
+    Console.WriteLine("\n-- Adaptive thresholding still detects a subtle-contrast page --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550);
+    // Only a 30-level gray delta between page and background — a fixed Canny(50,200)
+    // threshold pair can miss an edge this weak; median-based adaptive thresholds scale to
+    // the image's own contrast instead.
+    var path = WriteLowContrastTestImage(Path.Combine(workDir, "low_contrast.png"), imageWidth, imageHeight, knownRect, backgroundGray: 150, pageGray: 180);
+
+    var detected = new ImageProcessor().DetectDocumentBoundary(path);
+    Check("A low-contrast page boundary is still detected", detected.HasValue);
+    if (detected is { } boundary)
+        Check("Low-contrast detection is reasonably close to the known rectangle", Math.Abs(boundary.Width - knownRect.Width) <= 60);
+}
+
+void TestShadowedPageDetection()
+{
+    Console.WriteLine("\n-- Illumination normalization keeps a shadowed page from fragmenting detection --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550);
+    var path = WriteShadowedTestImage(Path.Combine(workDir, "shadowed.png"), imageWidth, imageHeight, knownRect, shadowBandWidth: 100);
+
+    var detected = new ImageProcessor().DetectDocumentBoundary(path);
+    Check("A page with a partial cast shadow is still detected", detected.HasValue);
+    if (detected is { } boundary)
+    {
+        // The key assertion: detection should still find the page's TRUE full extent
+        // (including the shadowed portion), not shrink to exclude it because the shadow's
+        // inner edge got mistaken for the page boundary.
+        Check("Detected width still covers the full page, not just the unshadowed portion",
+            boundary.Width >= knownRect.Width - 60);
+    }
+}
+
+void TestBorderTouchingPageIsNotOverPadded()
+{
+    Console.WriteLine("\n-- A page touching the frame edge doesn't get phantom extra padding on the far side --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    // A 2px margin, not a pixel-exact 0 — OpenCV's Sobel/Canny use border-reflection by
+    // default, so content starting at literal pixel 0 can have no detectable gradient there
+    // at all (the "reflected" neighbor looks identical to the real one). A couple of pixels
+    // of true margin gives Sobel genuine contrast to work with while dilation still pushes
+    // the detected rect out to the frame edge — which is the realistic case anyway; a
+    // document framed with truly zero margin at the sensor's exact boundary pixel is rare.
+    var knownRect = new SKRectI(2, 50, 300, 550);
+    var path = WriteBoundaryTestImage(Path.Combine(workDir, "border_touch.png"), imageWidth, imageHeight, knownRect);
+
+    // A larger CropPadding widens the gap between "correct" (~330) and the old bug's
+    // behavior (~360, since the left side's unusable padding used to leak into the width)
+    // well beyond normal Canny/dilate detection noise.
+    var processor = new ImageProcessor { CropPadding = 30 };
+    var detected = processor.DetectDocumentBoundary(path);
+    Check("Border-touching page is detected", detected.HasValue);
+    if (detected is { } boundary)
+    {
+        var rightEdge = boundary.X + boundary.Width;
+        Check("Detected left edge stays at the frame border (no room to pad)", boundary.X <= 5);
+        Check("Right edge reflects only its own padding, not the left side's unused padding too",
+            Math.Abs(rightEdge - (knownRect.Right + 30)) <= 20);
+    }
 }
 
 void TestManualOverrideSplitCrop()

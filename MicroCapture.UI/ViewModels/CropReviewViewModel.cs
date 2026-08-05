@@ -131,6 +131,8 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 CropPoint[]? detectedLeftQuad = null;
                 CropPoint[]? detectedRightQuad = null;
                 double detectedSplit = 50.0;
+                double detectedConfidence = 0.0;
+                double highConfidenceThreshold = 0.5;
 
                 if (hasSavedCrop)
                 {
@@ -146,6 +148,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 else
                 {
                     var processor = new ImageProcessor();
+                    highConfidenceThreshold = processor.CropConfidenceThreshold;
                     if (isSplit)
                     {
                         var twoPage = processor.DetectSplitPageBoundaries(_imagePath);
@@ -166,6 +169,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                         detectedCorners = boundary?.Quad ?? (boundary is { } b
                             ? RectCorners(b.X, b.Y, b.Width, b.Height)
                             : null);
+                        detectedConfidence = boundary?.Confidence ?? 0.0;
                     }
                 }
 
@@ -228,7 +232,13 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                         else if (detectedCorners != null)
                         {
                             SetCorners(detectedCorners);
-                            BoundaryHintText = "Auto-detected boundary — drag a corner to adjust.";
+                            // Medium-confidence detections are still pre-filled — a suggestion
+                            // beats a blank full-frame box — but flagged so the operator knows
+                            // to actually check it rather than trusting it the way a
+                            // high-confidence detection earns.
+                            BoundaryHintText = detectedConfidence >= highConfidenceThreshold
+                                ? "Auto-detected boundary — drag a corner to adjust."
+                                : "Suggested boundary (lower confidence) — please check it carefully.";
                         }
                         else
                         {

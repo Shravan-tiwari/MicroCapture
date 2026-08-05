@@ -36,6 +36,11 @@ public class ImageProcessor
 {
     // --- Configuration ---
     public double CropConfidenceThreshold { get; set; } = 0.5;
+    // Below this, detection is unreliable enough that Crop Review shouldn't pre-fill a
+    // suggestion at all — full-frame/manual is the safer default. Between this and
+    // CropConfidenceThreshold, a suggestion is still shown, but flagged as lower-confidence
+    // rather than presented with the same certainty as a high-confidence detection.
+    public double MediumConfidenceThreshold { get; set; } = 0.3;
     public double MaxDeskewDegrees { get; set; } = 5.0;
     public int CropPadding { get; set; } = 10;
     public double BlurThreshold { get; set; } = 100.0;
@@ -312,15 +317,53 @@ public class ImageProcessor
 
     /// <summary>Shared edge-detection step behind every contour-based detector in this class
     /// (single-document auto-crop, the UI's boundary lookup, and two-page split detection) —
-    /// defined once so all of them see the same document edges.</summary>
+    /// defined once so all of them see the same document edges.
+    ///
+    /// Two passes, not one: illumination normalization (dividing by a heavily-blurred copy of
+    /// the image, to flatten gradual shadows before edge detection) and a genuinely
+    /// low-contrast page are in real tension — a page that fills most of the frame with only
+    /// a subtle tone difference from its background looks, to a local blur, just like "gradual
+    /// lighting variation to remove," so normalizing unconditionally can wash out exactly the
+    /// case adaptive thresholding was meant to help. Try the direct (adaptively-thresholded,
+    /// no normalization) pass first — it's what correctly handles low-contrast pages — and
+    /// only fall back to illumination normalization if that finds nothing, which is when a
+    /// strong cast shadow is the more likely cause.</summary>
     private static Point[][] FindDocumentContours(Mat src)
     {
         using var gray = new Mat();
         Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
         using var blurred = new Mat();
         Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+
+        var direct = FindContoursWithAdaptiveCanny(blurred);
+        // "Found something" isn't enough to skip the fallback — a stray noise fragment
+        // shouldn't count. Only accept the direct pass if it found something plausibly
+        // page-sized; otherwise a strong cast shadow (or other structured noise) may have
+        // fragmented the real boundary, which is exactly what the illumination-normalized
+        // fallback pass is for.
+        var imageArea = src.Rows * (double)src.Cols;
+        var bestDirectArea = direct.Length > 0 ? direct.Max(c => Cv2.ContourArea(c)) : 0;
+        if (bestDirectArea / imageArea >= 0.05) return direct;
+
+        using var illumination = new Mat();
+        Cv2.GaussianBlur(gray, illumination, new Size(0, 0), sigmaX: 25);
+        using var normalized = new Mat();
+        Cv2.Divide(gray, illumination, normalized, scale: 255);
+        using var normalizedBlurred = new Mat();
+        Cv2.GaussianBlur(normalized, normalizedBlurred, new Size(5, 5), 0);
+        var fallback = FindContoursWithAdaptiveCanny(normalizedBlurred);
+
+        // Prefer whichever pass actually found something bigger/more useful — the fallback
+        // isn't strictly better, it's just a different hypothesis (shadow vs. genuine edge).
+        var bestFallbackArea = fallback.Length > 0 ? fallback.Max(c => Cv2.ContourArea(c)) : 0;
+        return bestFallbackArea > bestDirectArea ? fallback : direct;
+    }
+
+    private static Point[][] FindContoursWithAdaptiveCanny(Mat blurredGray)
+    {
+        var (low, high) = AutoCannyThresholds(blurredGray);
         using var edged = new Mat();
-        Cv2.Canny(blurred, edged, 50, 200);
+        Cv2.Canny(blurredGray, edged, low, high);
 
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
         using var dilated = new Mat();
@@ -330,21 +373,64 @@ public class ImageProcessor
         return contours;
     }
 
+    /// <summary>Adaptive Canny thresholds anchored to the strongest edges actually present in
+    /// the image, not overall pixel brightness — the commonly-cited "median pixel intensity"
+    /// auto-Canny heuristic correlates with edge strength in a busy natural photo, but fails
+    /// on a mostly-flat document image (a low-contrast page filling most of the frame has a
+    /// pixel-intensity median dominated by the page itself, unrelated to how strong its edge
+    /// against the background actually is).
+    ///
+    /// Anchored near the top of the gradient-magnitude distribution (99.5th percentile)
+    /// rather than a more central one (e.g. the 90th): for a mostly flat/textureless document
+    /// photo, the vast majority of pixels have near-zero gradient, so a percentile that isn't
+    /// close to the very top sits in that near-zero noise floor — numerically unstable and,
+    /// confirmed while building this, literally non-deterministic run-to-run from
+    /// floating-point summation order in OpenCV's internal parallelism. Anchoring near the
+    /// max instead lands on the real dominant edge (the page boundary) even in a flat scene,
+    /// and still scales down appropriately for a busy/noisy one.</summary>
+    private static (double Low, double High) AutoCannyThresholds(Mat gray)
+    {
+        using var gx = new Mat();
+        using var gy = new Mat();
+        Cv2.Sobel(gray, gx, MatType.CV_32F, 1, 0, ksize: 3);
+        Cv2.Sobel(gray, gy, MatType.CV_32F, 0, 1, ksize: 3);
+        using var magnitude = new Mat();
+        Cv2.Magnitude(gx, gy, magnitude);
+
+        magnitude.GetArray(out float[] values);
+        if (values.Length == 0) return (50, 200);
+
+        var sorted = (float[])values.Clone();
+        Array.Sort(sorted);
+        var anchorIndex = Math.Clamp((int)(sorted.Length * 0.995), 0, sorted.Length - 1);
+        var strongEdge = sorted[anchorIndex];
+        // Absolute floors/ceilings keep an extremely flat or extremely busy image from
+        // pushing thresholds to unstable extremes at either end.
+        var high = Math.Clamp(strongEdge * 0.5, 30, 220);
+        // Canny's own recommended hysteresis ratio is roughly 1:2 to 1:3.
+        var low = Math.Clamp(high * 0.4, 15, high);
+        return (low, high);
+    }
+
     /// <summary>Builds a <see cref="BoundaryDetection"/> from one contour: its padded bounding
-    /// rect, confidence (area ratio), and 4-point approximation when the contour is
+    /// rect, a multi-factor confidence score, and 4-point approximation when the contour is
     /// quadrilateral. Shared by single-document and two-page detection so "what makes a good
     /// crop shape from a contour" is defined exactly once.</summary>
     private BoundaryDetection BuildDetection(Point[] contour, double imageArea, int srcCols, int srcRows)
     {
-        var ratio = Cv2.ContourArea(contour) / imageArea;
+        var contourArea = Cv2.ContourArea(contour);
+        var ratio = contourArea / imageArea;
         if (ratio < 0.1) return default;
 
         var rect = Cv2.BoundingRect(contour);
-        int x = Math.Max(0, rect.X - CropPadding);
-        int y = Math.Max(0, rect.Y - CropPadding);
-        int w = Math.Min(srcCols - x, rect.Width + 2 * CropPadding);
-        int h = Math.Min(srcRows - y, rect.Height + 2 * CropPadding);
-        var paddedRect = new Rect(x, y, w, h);
+
+        // Rectangularity: how much of the contour's own minimum-area rectangle it actually
+        // fills. A true rectangle scores near 1.0; a blobby or irregular shape scores lower
+        // even at the same overall area — so two detections of equal size no longer score
+        // identically just because "area ratio" was the only signal.
+        var minAreaRect = Cv2.MinAreaRect(contour);
+        var minAreaRectArea = (double)minAreaRect.Size.Width * minAreaRect.Size.Height;
+        var rectangularity = minAreaRectArea > 0 ? Math.Min(1.0, contourArea / minAreaRectArea) : 0.0;
 
         var perimeter = Cv2.ArcLength(contour, true);
         var polygon = Cv2.ApproxPolyDP(contour, perimeter * 0.02, true);
@@ -352,7 +438,58 @@ public class ImageProcessor
             ? OrderCorners(polygon.Select(point => new Point2f(point.X, point.Y)).ToArray())
             : null;
 
-        return new BoundaryDetection(true, ratio, paddedRect, quad);
+        // Corner-angle regularity: how close each corner is to a true 90 degrees, when a
+        // clean 4-point approximation exists. A page photographed square scores near 1.0; a
+        // sharply skewed or non-rectangular quad scores lower.
+        var angleScore = quad != null ? CornerAngleScore(quad) : 1.0;
+
+        // Size still matters — a tiny confident-looking rectangle is still a bad crop — but
+        // shape quality now genuinely pulls the score down for irregular detections.
+        var confidence = Math.Clamp(ratio, 0, 1) * 0.5 + rectangularity * 0.3 + angleScore * 0.2;
+
+        // Don't add padding on a side that's already at the image border: the contour
+        // reaching the frame edge means the real page edge likely extends past what the
+        // camera captured, not that there's genuine background margin to include — padding
+        // there would clip toward the opposite side for nothing.
+        var touchesLeft = rect.X <= 1;
+        var touchesTop = rect.Y <= 1;
+        var touchesRight = rect.X + rect.Width >= srcCols - 1;
+        var touchesBottom = rect.Y + rect.Height >= srcRows - 1;
+
+        var padLeft = touchesLeft ? 0 : CropPadding;
+        var padTop = touchesTop ? 0 : CropPadding;
+        var padRight = touchesRight ? 0 : CropPadding;
+        var padBottom = touchesBottom ? 0 : CropPadding;
+
+        var x = Math.Max(0, rect.X - padLeft);
+        var y = Math.Max(0, rect.Y - padTop);
+        var w = Math.Min(srcCols - x, rect.Width + padLeft + padRight);
+        var h = Math.Min(srcRows - y, rect.Height + padTop + padBottom);
+        var paddedRect = new Rect(x, y, w, h);
+
+        return new BoundaryDetection(true, confidence, paddedRect, quad);
+    }
+
+    /// <summary>Scores how close a quad's 4 corners are to true right angles (1.0 = perfect
+    /// rectangle, tapering to 0 by 45 degrees of average deviation).</summary>
+    private static double CornerAngleScore(Point2f[] quad)
+    {
+        double totalDeviation = 0;
+        for (var i = 0; i < 4; i++)
+        {
+            var curr = quad[i];
+            var prev = quad[(i + 3) % 4];
+            var next = quad[(i + 1) % 4];
+            var v1 = new Point2f(prev.X - curr.X, prev.Y - curr.Y);
+            var v2 = new Point2f(next.X - curr.X, next.Y - curr.Y);
+            var mag1 = Math.Sqrt(v1.X * v1.X + v1.Y * v1.Y);
+            var mag2 = Math.Sqrt(v2.X * v2.X + v2.Y * v2.Y);
+            if (mag1 < 1e-3 || mag2 < 1e-3) continue;
+            var cosAngle = Math.Clamp((v1.X * v2.X + v1.Y * v2.Y) / (mag1 * mag2), -1.0, 1.0);
+            var angleDegrees = Math.Acos(cosAngle) * 180.0 / Math.PI;
+            totalDeviation += Math.Abs(angleDegrees - 90.0);
+        }
+        return Math.Clamp(1.0 - totalDeviation / 4.0 / 45.0, 0.0, 1.0);
     }
 
     /// <summary>Single-document detection used by both the mutating auto-crop pass
@@ -486,7 +623,11 @@ public class ImageProcessor
             using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
             if (src.Empty()) return null;
             var detection = DetectBoundary(src);
-            if (!detection.Found || detection.Confidence < CropConfidenceThreshold) return null;
+            // Medium-confidence detections are still returned (and pre-filled in Crop
+            // Review) — just flagged by the caller as a lower-confidence suggestion via the
+            // returned Confidence value, rather than rejected outright the way anything
+            // below CropConfidenceThreshold used to be.
+            if (!detection.Found || detection.Confidence < MediumConfidenceThreshold) return null;
             return ToDocumentBoundary(detection);
         }
         catch
