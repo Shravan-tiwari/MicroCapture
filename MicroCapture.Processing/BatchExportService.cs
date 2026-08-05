@@ -74,7 +74,7 @@ public class BatchExportService
                     var files = GetProcessedFilesForJob(job);
                     foreach (var f in files)
                     {
-                        using var bitmap = SKBitmap.Decode(f);
+                        using var bitmap = DecodeImage(f);
                         if (bitmap == null) continue;
                         using var canvas = document.BeginPage(bitmap.Width, bitmap.Height);
                         canvas.DrawBitmap(bitmap, 0, 0, SKSamplingOptions.Default);
@@ -111,8 +111,7 @@ public class BatchExportService
                     
                     if (normalizedFormat is "JPG" or "PNG")
                     {
-                        // Use SkiaSharp to convert
-                        using var bitmap = SKBitmap.Decode(f);
+                        using var bitmap = DecodeImage(f);
                         if (bitmap != null)
                         {
                             using var img = SKImage.FromBitmap(bitmap);
@@ -220,6 +219,26 @@ public class BatchExportService
     }
 
     private static bool IsExportableImage(string path) => Path.GetExtension(path).ToLowerInvariant() is ".tif" or ".tiff" or ".jpg" or ".jpeg" or ".png";
+
+    /// <summary>Decodes an image file to an <see cref="SKBitmap"/> for PDF/JPG/PNG export.
+    /// SkiaSharp's own decoder cannot read the TIFF files <see cref="ImageProcessor"/> writes
+    /// (confirmed: <c>SKBitmap.Decode</c> reliably returns null for a plain OpenCV-written
+    /// TIFF) — every processed derivative is a TIFF, so this silently dropped pages from PDF
+    /// exports and crashed JPG/PNG exports. For .tif/.tiff, bridge through OpenCV's own
+    /// decoder (which already correctly reads these files for the TIFF export path below) and
+    /// re-encode to PNG in memory, a format both libraries handle natively. JPG/PNG derivatives
+    /// (the emergency SkiaSharp fallback path's output) decode directly as before.</summary>
+    private static SKBitmap? DecodeImage(string path)
+    {
+        var extension = Path.GetExtension(path).ToLowerInvariant();
+        if (extension is not (".tif" or ".tiff"))
+            return SKBitmap.Decode(path);
+
+        using var mat = Cv2.ImRead(path, ImreadModes.Color);
+        if (mat.Empty()) return null;
+        Cv2.ImEncode(".png", mat, out var pngBytes);
+        return SKBitmap.Decode(pngBytes);
+    }
 
     private static string SanitizeFileName(string name) => MicroCapture.Core.FileNaming.Sanitize(name);
 }

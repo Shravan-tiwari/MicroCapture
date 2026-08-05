@@ -53,15 +53,17 @@ public partial class MainWindowViewModel : ViewModelBase
     private int _captureInProgress;
     private DateTime _lastDocumentCheckUtc = DateTime.MinValue;
 
-    // Assisted auto-capture guidance state (never fires the shutter on its own — only
-    // decides when to show "Ready — press SPACE"). See UpdateDocumentStatus.
+    // Auto-capture state machine: fires the shutter automatically once a page has been
+    // stable, in-focus, and different from whatever was last captured for
+    // StableFramesRequired consecutive checks. See UpdateDocumentStatus.
     private const int StableFramesRequired = 3; // ~1.5s at the existing 500ms check interval
     private const double LiveSharpnessThreshold = 40.0; // live-view frames are lower detail than a full capture, so a lower bar than the QC BlurThreshold (100)
     private const double StablePositionToleranceFraction = 0.03; // allowed drift between checks, as a fraction of frame size
+    private const double ContentChangeThreshold = 18.0; // mean abs pixel difference (0-255) considered a genuinely different page
     private int _stableFrameCount;
     private (int X, int Y, int Width, int Height)? _lastDetectedRect;
-    private (int X, int Y, int Width, int Height)? _lastCapturedRect;
-    private bool _awaitingPageChange;
+    private byte[]? _lastDetectedSignature;
+    private byte[]? _lastCapturedSignature;
 
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
@@ -164,28 +166,31 @@ public partial class MainWindowViewModel : ViewModelBase
         else if (string.IsNullOrWhiteSpace(ProjectCode) || string.IsNullOrWhiteSpace(BatchCode))
             CaptureReadiness = "SET PROJECT & BATCH";
         else if (IsAutoCapture)
-            // Assisted guidance requires the stricter stable/in-focus/new-page state —
-            // a bare boundary isn't enough to call it "ready" when guidance is on.
-            CaptureReadiness = DocumentStatus == "✓ Ready — press SPACE" ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
+            CaptureReadiness = DocumentStatus.StartsWith("✓") ? "AUTO CAPTURE ACTIVE" : "WAITING FOR DOCUMENT";
         else
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
     }
 
-    /// <summary>Assisted auto-capture guidance state machine. Never captures anything on its
-    /// own — it only decides what to show the operator. When <see cref="IsAutoCapture"/> is
-    /// off, behavior is unchanged from the original simple boundary-present/absent check.</summary>
+    /// <summary>Auto-capture state machine. Fires the shutter automatically once a page has
+    /// held stable and in focus for <see cref="StableFramesRequired"/> consecutive checks and
+    /// its content actually differs from whatever was last captured — content, not just
+    /// position, because a fixed copy-stand/page guide places every page in nearly the same
+    /// spot, so position alone can't tell a page turn from the same page still sitting there.
+    /// When <see cref="IsAutoCapture"/> is off, behavior is unchanged from a simple
+    /// boundary-present/absent check with no stability, focus, or auto-firing.</summary>
     private void UpdateDocumentStatus(MicroCapture.Processing.LiveFrameCheck check)
     {
         if (!check.Detected)
         {
             _stableFrameCount = 0;
             _lastDetectedRect = null;
-            _awaitingPageChange = false; // the page was removed from frame — always re-arms
+            _lastDetectedSignature = null;
             DocumentStatus = "Waiting for boundary";
             return;
         }
 
         var rect = (check.X, check.Y, check.Width, check.Height);
+        _lastDetectedSignature = check.ContentSignature;
 
         if (!IsAutoCapture)
         {
@@ -213,18 +218,35 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        // Require the page to actually change before nagging "Ready" again for the same
-        // physical page that was just captured.
-        var sameAsLastCapture = _awaitingPageChange && _lastCapturedRect.HasValue &&
-            IsRectStable(_lastCapturedRect.Value, rect, check.ImageWidth, check.ImageHeight);
-        if (sameAsLastCapture)
+        var contentDiff = ContentDifference(check.ContentSignature, _lastCapturedSignature);
+        var isSameAsLastCapture = _lastCapturedSignature != null && contentDiff < ContentChangeThreshold;
+        if (isSameAsLastCapture)
         {
             DocumentStatus = "✓ Captured — swap page to continue";
             return;
         }
 
-        _awaitingPageChange = false;
-        DocumentStatus = "✓ Ready — press SPACE";
+        if (Volatile.Read(ref _captureInProgress) != 0)
+        {
+            DocumentStatus = "✓ Capturing…";
+            return;
+        }
+
+        DocumentStatus = "✓ Capturing…";
+        _lastCapturedSignature = check.ContentSignature;
+        _stableFrameCount = 0;
+        _ = CaptureAsync();
+    }
+
+    /// <summary>Mean absolute difference between two content signatures (0-255 scale).
+    /// Missing or mismatched signatures are treated as "definitely different" so a
+    /// comparison failure never blocks a real capture.</summary>
+    private static double ContentDifference(byte[]? a, byte[]? b)
+    {
+        if (a == null || b == null || a.Length != b.Length || a.Length == 0) return double.MaxValue;
+        long sum = 0;
+        for (var i = 0; i < a.Length; i++) sum += Math.Abs(a[i] - b[i]);
+        return sum / (double)a.Length;
     }
 
     private static bool IsRectStable((int X, int Y, int Width, int Height) a, (int X, int Y, int Width, int Height) b, int imageWidth, int imageHeight)
@@ -411,10 +433,9 @@ public partial class MainWindowViewModel : ViewModelBase
             // Add thumbnail
             AddThumbnail(job.Id, filePath, PageCount);
 
-            // Require the page to change before the assisted-guidance "Ready" cue can
-            // reappear for what is still the same physical page sitting in frame.
-            _lastCapturedRect = _lastDetectedRect;
-            _awaitingPageChange = true;
+            // Require the page's content to actually change before auto-capture (or the
+            // readiness indicator) can trigger again for this same physical page.
+            _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
             StatusText = $"Page {pageStr} captured — {Path.GetFileName(filePath)}";
@@ -455,8 +476,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
 
-            _lastCapturedRect = _lastDetectedRect;
-            _awaitingPageChange = true;
+            _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
             StatusText = $"Page {pageStr} recaptured";
@@ -473,14 +493,14 @@ public partial class MainWindowViewModel : ViewModelBase
     private void ToggleAutoCapture()
     {
         IsAutoCapture = !IsAutoCapture;
-        // Start the guidance state machine fresh so a stale reading from before the
-        // toggle can't immediately claim "Ready".
+        // Start the stability state fresh so a stale reading from before the toggle can't
+        // immediately fire — but deliberately keep _lastCapturedSignature, so toggling AUTO
+        // off and back on while the same page is still sitting there doesn't re-fire for it.
         _stableFrameCount = 0;
         _lastDetectedRect = null;
-        _awaitingPageChange = false;
         StatusText = IsAutoCapture
-            ? "Assisted capture guidance: ON — you'll be prompted when a page is ready; capture still requires SPACE."
-            : "Assisted capture guidance: OFF";
+            ? "Auto-capture: ON — captures automatically once a page is stable, in focus, and new."
+            : "Auto-capture: OFF";
         UpdateCaptureReadiness();
     }
 

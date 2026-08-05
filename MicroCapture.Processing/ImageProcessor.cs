@@ -18,9 +18,12 @@ public readonly record struct CropPoint(double X, double Y);
 public readonly record struct DocumentBoundary(int X, int Y, int Width, int Height, double Confidence, CropPoint[]? Quad = null);
 
 /// <summary>Result of a single live-view frame check: whether a document-sized boundary is
-/// present, where it is, and how sharp (in-focus) that region is. Used to drive assisted
-/// auto-capture guidance without ever triggering a capture on its own.</summary>
-public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Width, int Height, int ImageWidth, int ImageHeight, double Sharpness)
+/// present, where it is, how sharp (in-focus) that region is, and a small content signature
+/// of the boundary region (a 24x24 grayscale thumbnail's raw bytes) so the caller can tell a
+/// genuinely new page apart from the same page still sitting in a fixed copy-stand position —
+/// position alone isn't a reliable "did the page change" signal when a physical page guide
+/// places every page in nearly the same spot.</summary>
+public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Width, int Height, int ImageWidth, int ImageHeight, double Sharpness, byte[]? ContentSignature)
 {
     public static readonly LiveFrameCheck None = default;
 }
@@ -72,7 +75,25 @@ public class ImageProcessor
             Cv2.MeanStdDev(laplacian, out _, out var stddev);
             var sharpness = stddev.Val0 * stddev.Val0;
 
-            return new LiveFrameCheck(true, rect.X, rect.Y, rect.Width, rect.Height, image.Width, image.Height, sharpness);
+            byte[]? signature = null;
+            try
+            {
+                var safeX = Math.Clamp(rect.X, 0, image.Width - 1);
+                var safeY = Math.Clamp(rect.Y, 0, image.Height - 1);
+                var safeRect = new Rect(safeX, safeY, Math.Clamp(rect.Width, 1, image.Width - safeX), Math.Clamp(rect.Height, 1, image.Height - safeY));
+                using var region = new Mat(image, safeRect);
+                using var thumb = new Mat();
+                Cv2.Resize(region, thumb, new Size(24, 24), 0, 0, InterpolationFlags.Area);
+                thumb.GetArray(out byte[] pixels);
+                signature = pixels;
+            }
+            catch
+            {
+                // The signature is only used for an extra "did the page actually change" check —
+                // detection and focus results above remain fully valid without it.
+            }
+
+            return new LiveFrameCheck(true, rect.X, rect.Y, rect.Width, rect.Height, image.Width, image.Height, sharpness, signature);
         }
         catch
         {

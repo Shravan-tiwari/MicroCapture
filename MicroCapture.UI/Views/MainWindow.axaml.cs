@@ -13,6 +13,13 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        // Global shortcuts must win even when a button currently has keyboard focus.
+        // Avalonia's Button handles Space/Enter as its own "activate" key at the focused
+        // control during the normal bubble phase, which otherwise consumes the event before
+        // it ever reaches OnKeyDown below — that's why Space was re-clicking whatever button
+        // was last clicked instead of firing Capture. Intercepting during the tunnel phase
+        // (root to focused control, before the focused control's own handling runs) fixes it.
+        AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDown, RoutingStrategies.Tunnel);
     }
 
     private void OnCameraControlButtonClick(object? sender, RoutedEventArgs e)
@@ -147,10 +154,8 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
-    protected override void OnKeyDown(KeyEventArgs e)
+    private void OnGlobalKeyDown(object? sender, KeyEventArgs e)
     {
-        base.OnKeyDown(e);
-
         // Don't fire shortcuts when typing in text fields
         if (e.Source is TextBox) return;
 

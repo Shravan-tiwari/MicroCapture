@@ -29,6 +29,8 @@ TestManualOverrideLegacyRectCrop();
 TestManualOverrideQuadCrop();
 TestConvexityClampRejectsSelfIntersection();
 TestEdgePointDetection();
+TestManualOverrideSplitCrop();
+await TestSplitCropReviewSaveThenExport();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -327,4 +329,85 @@ void TestEdgePointDetection()
 
     var nearTopEdge = points.Count(p => Math.Abs(p.Y - knownRect.Top) <= 5 && p.X > knownRect.Left && p.X < knownRect.Right);
     Check("Edge points cluster near the known top edge", nearTopEdge > 10);
+}
+
+void TestManualOverrideSplitCrop()
+{
+    Console.WriteLine("\n-- Manual override split (both leftCrop and rightCrop) produces two distinct halves --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_split.png"), 1000, 400);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // Mirrors exactly what CropReviewViewModel.Save() writes for a 46% split.
+    const int imageWidth = 1000, imageHeight = 400;
+    var leftWidth = (int)(imageWidth * 0.46);
+    var leftCrop = $"0,0,{leftWidth},{imageHeight}";
+    var rightCrop = $"{leftWidth},0,{imageWidth - leftWidth},{imageHeight}";
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, manualOverride: true, leftCrop: leftCrop, rightCrop: rightCrop);
+
+    Check("Processing succeeds", result.Success);
+    Check("Exactly two output files are produced", result.OutputFilePaths.Count == 2);
+    if (result.OutputFilePaths.Count == 2)
+    {
+        Check("First output is the left half", result.OutputFilePaths[0].Contains("_1_left"));
+        Check("Second output is the right half", result.OutputFilePaths[1].Contains("_2_right"));
+        using var left = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        using var right = Cv2.ImRead(result.OutputFilePaths[1], ImreadModes.Unchanged);
+        Check("Left half width matches the requested split (~460px)", Math.Abs(left.Width - leftWidth) <= 2);
+        Check("Right half width matches the requested split (~540px)", Math.Abs(right.Width - (imageWidth - leftWidth)) <= 2);
+    }
+}
+
+async Task TestSplitCropReviewSaveThenExport()
+{
+    Console.WriteLine("\n-- Full flow: split Crop Review save -> reprocess -> export produces two distinct cropped pages --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+
+    var project = new Project { Name = "SMOKE-SPLIT", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+    var batch = new Batch { ProjectId = project.Id, Name = "SPLIT", BatchCode = "SPLIT", SplitBookPages = true };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    const int imageWidth = 1000, imageHeight = 400;
+    var originalPath = WriteSolidImage(Path.Combine(workDir, "spread.png"), imageWidth, imageHeight);
+    var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, 1);
+
+    // Mirrors CropReviewViewModel.Save() for a 46% split.
+    var leftWidth = (int)(imageWidth * 0.46);
+    job.LeftCropBox = $"0,0,{leftWidth},{imageHeight}";
+    job.RightCropBox = $"{leftWidth},0,{imageWidth - leftWidth},{imageHeight}";
+    job.ManualOverrideApplied = true;
+    job.ProcessingStatus = "Pending";
+    await db.SaveChangesAsync();
+
+    // Mirrors what BackgroundProcessingWorker does for a Pending job whose batch has SplitBookPages set.
+    var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
+    var processResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox);
+    Check("Worker-equivalent reprocessing succeeds", processResult.Success);
+    Check("Worker-equivalent reprocessing writes two files", processResult.OutputFilePaths.Count == 2);
+    await queue.UpdateJobStatusAsync(job.Id, "processing", processResult.Success ? "Completed" : "Failed");
+
+    using var exportDb = new AppDbContext(dbPath);
+    var exporter = new BatchExportService(exportDb);
+    var exportDir = Path.Combine(workDir, "Export");
+    var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
+    var exportedFiles = Directory.GetFiles(resultDir, "*.png").OrderBy(f => f).ToArray();
+
+    Check("Export produces exactly two pages for the one split capture", exportedFiles.Length == 2);
+    if (exportedFiles.Length == 2)
+    {
+        using var exportedLeft = Cv2.ImRead(exportedFiles[0], ImreadModes.Unchanged);
+        using var exportedRight = Cv2.ImRead(exportedFiles[1], ImreadModes.Unchanged);
+        Check("Exported left page is narrower than the full original (actually cropped, not the raw spread)",
+            exportedLeft.Width < imageWidth);
+        Check("Exported right page is narrower than the full original (actually cropped, not the raw spread)",
+            exportedRight.Width < imageWidth);
+    }
 }
