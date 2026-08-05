@@ -33,6 +33,7 @@ TestManualOverrideSplitCrop();
 await TestSplitCropReviewSaveThenExport();
 TestTwoPageBoundaryDetection();
 TestIndependentSkewedQuadsPerPage();
+await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -461,6 +462,95 @@ void TestTwoPageBoundaryDetection()
     var mergedDetection = new ImageProcessor().DetectSplitPageBoundaries(mergedPath);
     Check("A single merged contour is not misreported as two pages", !mergedDetection.HasValue);
 }
+
+async Task TestTwoQuadCropReviewSaveReloadReSaveThenExport()
+{
+    Console.WriteLine("\n-- Two-quad split: save, reopen (restore), re-save, reprocess, export reflects the tight crop --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+
+    var project = new Project { Name = "SMOKE-TWOQUAD", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+    var batch = new Batch { ProjectId = project.Id, Name = "TWOQUAD", BatchCode = "TWOQUAD", SplitBookPages = true };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    const int imageWidth = 1000, imageHeight = 500;
+    var originalPath = WriteSolidImage(Path.Combine(workDir, "spread.png"), imageWidth, imageHeight);
+    var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, 1);
+
+    // Step 1: first Crop Review save — a tight independent quad on each side (mirrors
+    // dragging the two-quad editor, as CropReviewViewModel.Save() formats them).
+    var leftQuad = "20,30,460,10,470,470,10,490";
+    var rightQuad = "540,15,980,25,975,480,545,460";
+    job.LeftCropBox = leftQuad;
+    job.RightCropBox = rightQuad;
+    job.ManualOverrideApplied = true;
+    job.ProcessingStatus = "Pending";
+    await db.SaveChangesAsync();
+
+    // Step 2: worker reprocesses it (mirrors BackgroundProcessingWorker exactly).
+    var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
+    var firstResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox);
+    Check("First reprocess succeeds", firstResult.Success && firstResult.OutputFilePaths.Count == 2);
+    await queue.UpdateJobStatusAsync(job.Id, "processing", "Completed");
+
+    // Step 3: reopen Crop Review — mirrors CropReviewViewModel's restore logic exactly.
+    using var reopenDb = new AppDbContext(dbPath);
+    var reopenedJob = await reopenDb.CaptureJobs.FindAsync(job.Id);
+    var hasSavedCrop = reopenedJob!.ManualOverrideApplied && !string.IsNullOrWhiteSpace(reopenedJob.LeftCropBox);
+    var savedIsTwoQuad = hasSavedCrop && reopenedJob.LeftCropBox!.Split(',').Length == 8;
+    var restoredLeft = ImageProcessor.ParseCropShape(reopenedJob.LeftCropBox!, imageWidth, imageHeight);
+    var restoredRight = ImageProcessor.ParseCropShape(reopenedJob.RightCropBox!, imageWidth, imageHeight);
+    Check("Reopening restores two-quad mode", savedIsTwoQuad);
+    Check("Restored left quad matches what was saved", Math.Abs(restoredLeft[0].X - 20) < 0.5 && Math.Abs(restoredLeft[0].Y - 30) < 0.5);
+
+    // Step 4: hit Save & Reprocess again with the restored (unedited) quads — exactly what
+    // happens if an operator reopens review and re-saves without changing anything.
+    reopenedJob.LeftCropBox = FormatCornersForTest(restoredLeft);
+    reopenedJob.RightCropBox = FormatCornersForTest(restoredRight);
+    reopenedJob.ProcessingStatus = "Pending";
+    // Mirror Save()'s stale-derivative cleanup.
+    var baseName = Path.GetFileNameWithoutExtension(reopenedJob.OriginalFilePath);
+    foreach (var derivative in Directory.EnumerateFiles(outputDir, $"{baseName}*")) File.Delete(derivative);
+    await reopenDb.SaveChangesAsync();
+
+    // Step 5: worker reprocesses the re-save — using a fresh context/queue, exactly like
+    // BackgroundProcessingWorker.ProcessLoop does on every real poll iteration (reusing the
+    // original stale-tracked `queue` here would be a test-harness bug, not a real one: its
+    // locally-tracked entity wouldn't see reopenDb's "Pending" write below the ORM layer).
+    var secondResult = new ImageProcessor().Process(reopenedJob.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: reopenedJob.ManualOverrideApplied, leftCrop: reopenedJob.LeftCropBox, rightCrop: reopenedJob.RightCropBox);
+    Check("Re-save reprocess succeeds", secondResult.Success && secondResult.OutputFilePaths.Count == 2);
+    using (var workerDb = new AppDbContext(dbPath))
+    {
+        await new CaptureQueueService(workerDb).UpdateJobStatusAsync(job.Id, "processing", "Completed");
+    }
+
+    // Step 6: export and verify the exported pages are tightly cropped, not the raw spread.
+    using var exportDb = new AppDbContext(dbPath);
+    var exporter = new BatchExportService(exportDb);
+    var exportDir = Path.Combine(workDir, "Export");
+    var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
+    var exportedFiles = Directory.GetFiles(resultDir, "*.png").OrderBy(f => f).ToArray();
+
+    Check("Export produces exactly two pages", exportedFiles.Length == 2);
+    if (exportedFiles.Length == 2)
+    {
+        using var exportedLeft = Cv2.ImRead(exportedFiles[0], ImreadModes.Unchanged);
+        using var exportedRight = Cv2.ImRead(exportedFiles[1], ImreadModes.Unchanged);
+        // The full spread is 1000x500; a tight ~450x460 quad crop should be far smaller —
+        // if this fails, the export is reflecting the raw/uncropped capture, not the saved crop.
+        Check("Exported left page reflects the tight crop, not the full 1000-wide spread", exportedLeft.Width < 600);
+        Check("Exported right page reflects the tight crop, not the full 1000-wide spread", exportedRight.Width < 600);
+    }
+}
+
+string FormatCornersForTest(CropPoint[] corners) => string.Join(",", corners.SelectMany(c =>
+    new[] { c.X.ToString("F1", System.Globalization.CultureInfo.InvariantCulture), c.Y.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) }));
 
 void TestIndependentSkewedQuadsPerPage()
 {

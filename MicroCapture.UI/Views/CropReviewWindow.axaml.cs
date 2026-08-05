@@ -247,12 +247,14 @@ public partial class CropReviewWindow : Window
     {
         var lineX = imgRect.X + vm.ImageWidth * (vm.SplitPercent / 100.0) * scale;
 
-        // Shade both halves so it's visually unambiguous which side is which.
+        // Outline + shade both halves so each reads as an actual crop box, not just a tint.
         var leftShade = new Rectangle
         {
             Width = Math.Max(0, lineX - imgRect.X),
             Height = imgRect.Height,
-            Fill = new SolidColorBrush(Color.FromArgb(35, 0, 210, 255))
+            Fill = new SolidColorBrush(Color.FromArgb(35, 0, 210, 255)),
+            Stroke = new SolidColorBrush(LeftQuadColor),
+            StrokeThickness = 2
         };
         Canvas.SetLeft(leftShade, imgRect.X);
         Canvas.SetTop(leftShade, imgRect.Y);
@@ -262,7 +264,9 @@ public partial class CropReviewWindow : Window
         {
             Width = Math.Max(0, imgRect.Right - lineX),
             Height = imgRect.Height,
-            Fill = new SolidColorBrush(Color.FromArgb(20, 255, 255, 255))
+            Fill = new SolidColorBrush(Color.FromArgb(20, 255, 255, 255)),
+            Stroke = new SolidColorBrush(RightQuadColor),
+            StrokeThickness = 2
         };
         Canvas.SetLeft(rightShade, lineX);
         Canvas.SetTop(rightShade, imgRect.Y);
