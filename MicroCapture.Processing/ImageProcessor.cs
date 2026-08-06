@@ -577,14 +577,24 @@ public class ImageProcessor
             if (!detection.Found)
             {
                 result.Warnings.Add("No document contour detected — skipping auto-crop.");
+                result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
                 return src;
             }
 
             result.CropConfidence = detection.Confidence;
 
-            if (detection.Confidence < CropConfidenceThreshold)
+            // Gate on the same medium-confidence bar Crop Review already shows as its default
+            // suggestion (MediumConfidenceThreshold), not the stricter CropConfidenceThreshold.
+            // These two used to differ: Crop Review would happily pre-fill and display a
+            // medium-confidence box, while this pipeline — the one that actually determines
+            // what gets exported for every page nobody manually reviews — discarded that same
+            // detection and shipped the full, uncropped frame instead. On real photos (as
+            // opposed to the clean synthetic test images the confidence formula was tuned
+            // against), medium confidence is the common case, not the exception.
+            if (detection.Confidence < MediumConfidenceThreshold)
             {
-                result.Warnings.Add($"Crop confidence low ({detection.Confidence:P1}). Keeping full image.");
+                result.Warnings.Add($"Crop confidence low ({detection.Confidence:P1}). Keeping full image — needs manual crop review.");
+                result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
                 return src;
             }
 
@@ -601,12 +611,20 @@ public class ImageProcessor
                 cropped = src[detection.PaddedRect].Clone();
                 result.Warnings.Add("Document boundary was not quadrilateral; applied rectangular auto-crop.");
             }
+
+            if (detection.Confidence < CropConfidenceThreshold)
+            {
+                result.Warnings.Add($"Crop confidence medium ({detection.Confidence:P1}) — applied automatically; recommend reviewing in Crop Review.");
+                result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
+            }
+
             result.WasCropped = true;
             return cropped;
         }
         catch (Exception ex)
         {
             result.Warnings.Add($"Auto-crop failed: {ex.Message}");
+            result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
             return src;
         }
     }
@@ -907,19 +925,36 @@ public class ImageProcessor
         bool blurOk = variance >= BlurThreshold;
         bool exposureOk = hist.Val0 > 30 && hist.Val0 < 225;
 
+        string verdict;
         if (!blurOk)
         {
             result.Warnings.Add($"Blur score ({variance:F1}) below threshold ({BlurThreshold}).");
-            result.QcVerdict = "FAIL";
+            verdict = "FAIL";
         }
         else if (!exposureOk)
         {
             result.Warnings.Add($"Exposure mean ({hist.Val0:F1}) outside acceptable range.");
-            result.QcVerdict = "WARNING";
+            verdict = "WARNING";
         }
         else
         {
-            result.QcVerdict = "PASS";
+            verdict = "PASS";
         }
+
+        // Blur/exposure aren't the only thing that can flag a page for review — TryAutoCrop
+        // may already have set WARNING (low/medium crop confidence, no boundary found). Take
+        // the worse of the two rather than letting whichever check runs last silently erase
+        // the other's concern.
+        result.QcVerdict = CombineVerdict(result.QcVerdict, verdict);
+    }
+
+    /// <summary>Combines two QC verdicts, keeping the more severe one. Multiple independent
+    /// checks (crop confidence, blur, exposure) each contribute a verdict for the same page;
+    /// the operator needs to see the worst one, not just whichever check happened to run
+    /// last.</summary>
+    private static string CombineVerdict(string current, string candidate)
+    {
+        static int Rank(string v) => v switch { "FAIL" => 2, "WARNING" => 1, "PASS" => 0, _ => -1 };
+        return Rank(candidate) > Rank(current) ? candidate : current;
     }
 }

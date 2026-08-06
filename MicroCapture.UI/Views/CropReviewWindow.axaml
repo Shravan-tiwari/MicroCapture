@@ -1,16 +1,18 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
+        xmlns:conv="using:MicroCapture.UI.Converters"
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
         Title="Crop Review"
         Width="1280" Height="760"
         WindowStartupLocation="CenterScreen"
-        Background="#12121e">
+        Background="{StaticResource CanvasBrush}">
     <Grid RowDefinitions="*, Auto">
         <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
             <!-- Main Image & Interactive Crop Canvas Area -->
-            <Border Grid.Column="0" Background="#080811" Margin="12" CornerRadius="8" ClipToBounds="True">
+            <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="1" Margin="14" CornerRadius="10" ClipToBounds="True">
                 <Grid Name="ContainerGrid">
                     <Image Name="TargetImage"
                            Source="{Binding Image}"
@@ -25,19 +27,23 @@
             </Border>
 
             <!-- Live Preview -->
-            <Border Grid.Column="1" Background="#080811" Margin="0,12,12,12" CornerRadius="8" Padding="12">
-                <StackPanel Spacing="10">
-                    <TextBlock Text="LIVE PREVIEW" Foreground="#00d2ff" FontWeight="Bold" FontSize="12"/>
+            <Border Grid.Column="1" Classes="panel" Margin="0,14,14,14" Padding="14">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="LIVE PREVIEW" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
                     <Image Source="{Binding PreviewImage}" Stretch="Uniform"
                            IsVisible="{Binding IsSinglePage}" MaxHeight="500"/>
-                    <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding IsSplitBookPages}">
-                        <StackPanel Spacing="4" Width="150">
-                            <TextBlock Text="Left" Foreground="#a0a0b0" FontSize="11"/>
-                            <Image Source="{Binding PreviewImage}" Stretch="Uniform"/>
+                    <StackPanel Orientation="Horizontal" Spacing="10" IsVisible="{Binding IsSplitBookPages}">
+                        <StackPanel Spacing="5" Width="150">
+                            <TextBlock Text="Left" Classes="caption"/>
+                            <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface2Brush}">
+                                <Image Source="{Binding PreviewImage}" Stretch="Uniform"/>
+                            </Border>
                         </StackPanel>
-                        <StackPanel Spacing="4" Width="150">
-                            <TextBlock Text="Right" Foreground="#a0a0b0" FontSize="11"/>
-                            <Image Source="{Binding SecondaryPreviewImage}" Stretch="Uniform"/>
+                        <StackPanel Spacing="5" Width="150">
+                            <TextBlock Text="Right" Classes="caption"/>
+                            <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface2Brush}">
+                                <Image Source="{Binding SecondaryPreviewImage}" Stretch="Uniform"/>
+                            </Border>
                         </StackPanel>
                     </StackPanel>
                 </StackPanel>
@@ -45,42 +51,44 @@
         </Grid>
 
         <!-- Bottom Action Bar -->
-        <Border Grid.Row="1" Margin="12,0,12,12" Background="#1c1c2e" Padding="14,10" CornerRadius="8">
+        <Border Grid.Row="1" Classes="panel" Margin="14,0,14,14" Padding="16,12">
             <Grid ColumnDefinitions="Auto, *, Auto">
                 <!-- Mode & Instruction Text -->
-                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
                     <TextBlock Text="Split Book Pages" IsVisible="{Binding IsSplitBookPages}"
-                               Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
+                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" VerticalAlignment="Center"/>
                     <TextBlock Text="Single Page Crop" IsVisible="{Binding IsSinglePage}"
-                               Foreground="#00d2ff" FontWeight="Bold" VerticalAlignment="Center"/>
-                    <TextBlock Text="{Binding BoundaryHintText}"
-                               Foreground="#a0a0b0" VerticalAlignment="Center" FontSize="13"/>
+                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" VerticalAlignment="Center"/>
+
+                    <StackPanel Orientation="Horizontal" Spacing="7" VerticalAlignment="Center">
+                        <Ellipse Width="7" Height="7" VerticalAlignment="Center"
+                                 Fill="{Binding BoundaryHintText, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
+                        <TextBlock Text="{Binding BoundaryHintText}"
+                                   Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="13"/>
+                    </StackPanel>
+
                     <Button Content="Switch to page-by-page" Command="{Binding ToggleSplitEditModeCommand}"
-                            IsVisible="{Binding IsLineSplitMode}"
-                            Background="#2a2a3c" Foreground="#00d2ff" Padding="10,4" CornerRadius="4" FontSize="12"/>
+                            IsVisible="{Binding IsLineSplitMode}" Classes="accentGhost"/>
                     <Button Content="Switch to split line" Command="{Binding ToggleSplitEditModeCommand}"
-                            IsVisible="{Binding IsQuadSplitMode}"
-                            Background="#2a2a3c" Foreground="#00d2ff" Padding="10,4" CornerRadius="4" FontSize="12"/>
+                            IsVisible="{Binding IsQuadSplitMode}" Classes="accentGhost"/>
                 </StackPanel>
 
                 <!-- Book Split Slider (Visible only in line-split mode) -->
                 <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center"
                             IsVisible="{Binding IsLineSplitMode}" Spacing="10" VerticalAlignment="Center">
-                    <TextBlock Text="Split Point:" Foreground="#a0a0b0" VerticalAlignment="Center"/>
+                    <TextBlock Text="Split Point" Foreground="{StaticResource InkSubtleBrush}" FontSize="13" VerticalAlignment="Center"/>
                     <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" Width="200" VerticalAlignment="Center"/>
-                    <TextBlock Text="{Binding SplitPercent, StringFormat='{}{0:F0}%'}" Foreground="#00d2ff" FontWeight="Bold" Width="40" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding SplitPercent, StringFormat='{}{0:F0}%'}"
+                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" Width="40" VerticalAlignment="Center"/>
                 </StackPanel>
 
                 <!-- Action Buttons -->
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
-                    <Button Content="Reset" Command="{Binding ResetCommand}"
-                            Background="#2a2a3c" Foreground="#e0e0e0" Padding="14,6" CornerRadius="4"/>
-                    <Button Content="Cancel" Command="{Binding CancelCommand}" 
-                            CommandParameter="{Binding $parent[Window]}"
-                            Background="#2a2a3c" Foreground="#e0e0e0" Padding="14,6" CornerRadius="4"/>
+                    <Button Content="Reset" Command="{Binding ResetCommand}" Classes="secondary"/>
+                    <Button Content="Cancel" Command="{Binding CancelCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Classes="secondary"/>
                     <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}"
-                            CommandParameter="{Binding $parent[Window]}"
-                            Background="#e94560" Foreground="White" Padding="16,6" FontWeight="Bold" CornerRadius="4"/>
+                            CommandParameter="{Binding $parent[Window]}" Classes="primary"/>
                 </StackPanel>
             </Grid>
         </Border>

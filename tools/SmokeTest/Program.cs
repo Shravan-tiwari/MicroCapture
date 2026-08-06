@@ -5,6 +5,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using MicroCapture.Core.Data;
@@ -13,10 +14,26 @@ using MicroCapture.Core.Services;
 using MicroCapture.Processing;
 using OpenCvSharp;
 using SkiaSharp;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Headless;
+using Avalonia.Threading;
+using MicroCapture.UI.ViewModels;
+using MicroCapture.UI.Views;
 
 var failures = 0;
 
 Console.WriteLine("=== MicroCapture regression smoke test ===");
+
+// Headless Avalonia platform (no real display) — gives a working Dispatcher/window
+// implementation so the tests below can drive the actual MainWindowViewModel/
+// CropReviewViewModel/Window classes exactly as the real app does, not a hand-rolled
+// stand-in. SetupWithoutStarting() initializes platform services only — it does not run
+// App.OnFrameworkInitializationCompleted, so none of App's real camera-selection/MainWindow
+// creation logic fires here.
+AppBuilder.Configure<MicroCapture.UI.App>()
+    .UseHeadless(new AvaloniaHeadlessPlatformOptions())
+    .SetupWithoutStarting();
 
 // Run the "schema check runs once" test FIRST — it relies on being the very first
 // CaptureQueueService constructed in this process to observe the true before/after.
@@ -37,6 +54,13 @@ await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
 TestLowContrastDetection();
 TestShadowedPageDetection();
 TestBorderTouchingPageIsNotOverPadded();
+TestMediumConfidenceCropIsStillApplied();
+TestLowConfidenceCropIsSkippedAndFlagged();
+TestTiffDisplayDecodeRoundTrip();
+await TestDeleteCaptureExcludesFromExport();
+TestMockCameraStyleFrameAutoCrops();
+await TestManualCropReviewFlowOnMockCameraStyleFrame();
+await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -47,6 +71,42 @@ void Check(string name, bool condition)
 {
     if (condition) Console.WriteLine($"[PASS] {name}");
     else { Console.WriteLine($"[FAIL] {name}"); failures++; }
+}
+
+/// <summary>Blocks the calling thread until <paramref name="condition"/> is true, actively
+/// pumping the headless dispatcher's job queue on every iteration. Plain `await` cannot be
+/// used to wait on anything here: once <c>AppBuilder...SetupWithoutStarting()</c> installs a
+/// dispatcher-bound SynchronizationContext on this thread, any `await` whose continuation
+/// needs that same context (which includes ordinary `Task.Delay`/EF Core calls made from
+/// deep inside application code, not just explicit Dispatcher.Post) can only resume once
+/// something calls Dispatcher.UIThread.RunJobs() — but this thread is the only thing that
+/// ever would, and it's the one sitting suspended at the `await`. Polling with a real,
+/// non-async Thread.Sleep sidesteps that entirely: nothing here is ever suspended waiting on
+/// the dispatcher, so there is no cycle to deadlock on.</summary>
+void PumpUntil(Func<bool> condition, int timeoutMs = 15000, int pollMs = 20)
+{
+    var start = Environment.TickCount64;
+    while (!condition())
+    {
+        Dispatcher.UIThread.RunJobs();
+        if (condition()) return;
+        if (Environment.TickCount64 - start > timeoutMs)
+            throw new TimeoutException($"PumpUntil timed out after {timeoutMs}ms.");
+        Thread.Sleep(pollMs);
+    }
+}
+
+/// <summary>Starts an async application call (a RelayCommand, an EF Core save, anything) and
+/// pumps the dispatcher until it finishes, instead of `await`-blocking this thread on it
+/// directly — see <see cref="PumpUntil"/> for why a direct `await` here would deadlock.
+/// Awaiting the already-completed `task` at the end is safe: the compiler-generated state
+/// machine takes a synchronous fast path for an already-completed task and never actually
+/// suspends, so no context capture happens at that point.</summary>
+async Task RunPumped(Func<Task> start, int timeoutMs = 15000)
+{
+    var task = start();
+    PumpUntil(() => task.IsCompleted, timeoutMs);
+    await task;
 }
 
 string TempDbPath() => Path.Combine(Path.GetTempPath(), $"microcapture_smoketest_{Guid.NewGuid():N}.db");
@@ -685,4 +745,358 @@ void TestIndependentSkewedQuadsPerPage()
         Check("Left output is a real, non-trivial image", left.Width > 100 && left.Height > 100);
         Check("Right output is a real, non-trivial image", right.Width > 100 && right.Height > 100);
     }
+}
+
+void TestMediumConfidenceCropIsStillApplied()
+{
+    Console.WriteLine("\n-- A medium-confidence detection (below CropConfidenceThreshold) is still auto-cropped, not silently skipped --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550);
+    var sourcePath = WriteBoundaryTestImage(Path.Combine(workDir, "medium_conf.png"), imageWidth, imageHeight, knownRect);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // Raising CropConfidenceThreshold above what this (otherwise clean) detection will ever
+    // score simulates a real-world medium-confidence photo without needing to hand-craft an
+    // exact numeric contour. MediumConfidenceThreshold is left at its default (0.3) — the
+    // bar TryAutoCrop must now actually apply the crop, matching what Crop Review already
+    // shows as its default suggestion. Before this fix, TryAutoCrop gated on
+    // CropConfidenceThreshold directly, so this same setup would have kept the full,
+    // uncropped frame — exactly the "cropped images aren't saved" bug reported from real
+    // hardware.
+    var processor = new ImageProcessor { CropConfidenceThreshold = 0.99 };
+    var result = processor.Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+
+    Check("Processing succeeds", result.Success);
+    Check("A medium-confidence detection is still cropped", result.WasCropped);
+    Check("Medium-confidence auto-crop is flagged for review, not silently treated as fully trusted",
+        result.QcVerdict == "WARNING");
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Output is genuinely smaller than the full source frame (a real crop happened)",
+            output.Width < imageWidth && output.Height < imageHeight);
+    }
+}
+
+void TestLowConfidenceCropIsSkippedAndFlagged()
+{
+    Console.WriteLine("\n-- A genuinely low-confidence detection keeps the full frame and is flagged --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var knownRect = new SKRectI(50, 50, 750, 550);
+    var sourcePath = WriteBoundaryTestImage(Path.Combine(workDir, "low_conf.png"), imageWidth, imageHeight, knownRect);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // Both thresholds pushed out of reach — nothing should qualify even as a medium-confidence
+    // suggestion. The pipeline must still degrade safely: keep the full frame and flag it,
+    // not crash or crop to something wrong.
+    var processor = new ImageProcessor { CropConfidenceThreshold = 0.99, MediumConfidenceThreshold = 0.99 };
+    var result = processor.Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+
+    Check("Processing succeeds", result.Success);
+    Check("A low-confidence detection is not auto-cropped", !result.WasCropped);
+    Check("Low-confidence pages are flagged for manual review, not marked clean", result.QcVerdict == "WARNING");
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Output keeps the full source frame when confidence is too low to trust",
+            output.Width == imageWidth && output.Height == imageHeight);
+    }
+}
+
+void TestTiffDisplayDecodeRoundTrip()
+{
+    Console.WriteLine("\n-- ImageDecodeHelper bridges OpenCV-written TIFFs for on-screen display --");
+    var workDir = TempWorkDir();
+
+    // A plain OpenCV-written TIFF — exactly what ImageProcessor writes for every processed
+    // derivative, and exactly what SkiaSharp/Avalonia's Skia-backed decoder cannot read
+    // directly (confirmed earlier this session). This is the same file type the thumbnail
+    // strip failed to refresh after Save & Reprocess.
+    var tifPath = Path.Combine(workDir, "sample.tif");
+    using (var mat = new Mat(30, 40, MatType.CV_8UC3, new Scalar(60, 120, 200)))
+        Cv2.ImWrite(tifPath, mat);
+
+    var tifBytes = ImageDecodeHelper.GetDisplayBytes(tifPath);
+    Check("TIFF produces non-null display bytes", tifBytes != null);
+    if (tifBytes != null)
+    {
+        using var decoded = SKBitmap.Decode(tifBytes);
+        Check("Bridged TIFF bytes decode successfully via SkiaSharp", decoded != null);
+        if (decoded != null)
+        {
+            Check("Decoded width matches the source TIFF", decoded.Width == 40);
+            Check("Decoded height matches the source TIFF", decoded.Height == 30);
+        }
+    }
+
+    // A plain PNG/JPG derivative (the emergency fallback path's output) should pass through
+    // unchanged, decoding directly with no OpenCV round-trip needed.
+    var pngPath = WriteSolidImage(Path.Combine(workDir, "sample.png"), 25, 15);
+    var pngBytes = ImageDecodeHelper.GetDisplayBytes(pngPath);
+    Check("Non-TIFF files pass through unchanged", pngBytes != null && pngBytes.SequenceEqual(File.ReadAllBytes(pngPath)));
+
+    Check("A missing file returns null instead of throwing", ImageDecodeHelper.GetDisplayBytes(Path.Combine(workDir, "missing.tif")) == null);
+}
+
+async Task TestDeleteCaptureExcludesFromExport()
+{
+    Console.WriteLine("\n-- Deleting a mis-captured page excludes it from the pending queue and from export --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+
+    var project = new Project { Name = "SMOKE-DELETE", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+    var batch = new Batch { ProjectId = project.Id, Name = "DEL", BatchCode = "DEL" };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    var keptPath = WriteDummyImage(Path.Combine(workDir, "page1_keep.png"));
+    var keptJob = await queue.EnqueueCaptureAsync(batch.Id, keptPath, 1);
+    await queue.UpdateJobStatusAsync(keptJob.Id, "processing", "Completed");
+    await queue.UpdateJobStatusAsync(keptJob.Id, "qc", "PASS");
+
+    var mistakePath = WriteDummyImage(Path.Combine(workDir, "page2_mistake.png"));
+    var mistakeJob = await queue.EnqueueCaptureAsync(batch.Id, mistakePath, 2);
+    await queue.UpdateJobStatusAsync(mistakeJob.Id, "processing", "Completed");
+    await queue.UpdateJobStatusAsync(mistakeJob.Id, "qc", "PASS");
+
+    // A third page captured by mistake but never even processed yet — the common real case
+    // ("wrong page, delete it immediately").
+    var stillPendingPath = WriteDummyImage(Path.Combine(workDir, "page3_pending_mistake.png"));
+    var pendingMistakeJob = await queue.EnqueueCaptureAsync(batch.Id, stillPendingPath, 3);
+
+    await queue.DeleteCaptureAsync(mistakeJob.Id);
+    await queue.DeleteCaptureAsync(pendingMistakeJob.Id);
+
+    using var verifyDb = new AppDbContext(dbPath);
+    var reloadedMistake = await verifyDb.CaptureJobs.FindAsync(mistakeJob.Id);
+    Check("Deleted completed job is marked Superseded, not removed from the audit trail",
+        reloadedMistake!.ProcessingStatus == "Superseded" && reloadedMistake.ExportStatus == "Superseded");
+
+    var pendingJobs = await queue.GetPendingJobsAsync();
+    Check("Deleted pending job no longer appears in the processing queue",
+        pendingJobs.All(j => j.Id != pendingMistakeJob.Id));
+
+    using var exportDb = new AppDbContext(dbPath);
+    var exporter = new BatchExportService(exportDb);
+    var exportDir = Path.Combine(workDir, "Export");
+    var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
+    var exportedFiles = Directory.GetFiles(resultDir, "*.png");
+    Check("Export includes only the kept page, not the deleted mistake", exportedFiles.Length == 1);
+}
+
+/// <summary>Draws exactly what MicroCapture.Camera.MockCameraService.GenerateMockFrame draws
+/// (text over a stroked, not filled, rectangle) — the real dev-time stand-in for a photographed
+/// page, and meaningfully different from this file's other synthetic images (a filled block).
+/// A real regression here would have caught the exact scenario reported from live testing.</summary>
+string WriteMockCameraStyleImage(string path, int width, int height)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var surface = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(width, height));
+    var canvas = surface.Canvas;
+    canvas.Clear(SkiaSharp.SKColors.DarkBlue);
+    using var font = new SkiaSharp.SKFont { Size = width / 15f };
+    using var textPaint = new SkiaSharp.SKPaint { Color = SkiaSharp.SKColors.White, IsAntialias = true };
+    var lines = new[] { "MOCK CAPTURE", "h_b_000002_20260805_234246.jpg" };
+    float y = height / 2f - (lines.Length * font.Size) / 2f;
+    foreach (var line in lines)
+    {
+        canvas.DrawText(line, width / 2f, y, SkiaSharp.SKTextAlign.Center, font, textPaint);
+        y += font.Size + 10;
+    }
+    using var rectPaint = new SkiaSharp.SKPaint { Color = SkiaSharp.SKColors.White, Style = SkiaSharp.SKPaintStyle.Stroke, StrokeWidth = 5, IsAntialias = true };
+    var inset = width / 10f;
+    canvas.DrawRect(inset, inset, width - inset * 2, height - inset * 2, rectPaint);
+    using var image = surface.Snapshot();
+    using var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Jpeg, 80);
+    File.WriteAllBytes(path, data.ToArray());
+    return path;
+}
+
+void TestMockCameraStyleFrameAutoCrops()
+{
+    Console.WriteLine("\n-- A mock-camera-style frame (text over a stroked rect, 3840x2160) auto-crops --");
+    var workDir = TempWorkDir();
+    var path = WriteMockCameraStyleImage(Path.Combine(workDir, "mock_realistic.jpg"), 3840, 2160);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var result = new ImageProcessor().Process(path, outDir, splitPages: false, manualOverride: false);
+
+    Check("Processing succeeds", result.Success);
+    Check("The realistic mock frame is auto-cropped, not passed through raw", result.WasCropped);
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Output is genuinely smaller than the 3840x2160 source",
+            output.Width < 3840 && output.Height < 2160);
+    }
+}
+
+async Task TestManualCropReviewFlowOnMockCameraStyleFrame()
+{
+    Console.WriteLine("\n-- Full DB flow on a mock-camera-style frame: capture, manual Crop Review save, worker reprocess, export --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+    var project = new Project { Name = "DIAG", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+    var batch = new Batch { ProjectId = project.Id, Name = "DIAG", BatchCode = "DIAG" };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    var capturePath = WriteMockCameraStyleImage(Path.Combine(workDir, "capture_mock.jpg"), 3840, 2160);
+    var job = await queue.EnqueueCaptureAsync(batch.Id, capturePath, 1);
+    var outputDir = Path.Combine(workDir, "Processed");
+    var processor = new ImageProcessor();
+
+    // First pass — worker auto-processes exactly like BackgroundProcessingWorker does.
+    var autoResult = processor.Process(job.OriginalFilePath, outputDir, splitPages: false, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox);
+    await queue.UpdateJobStatusAsync(job.Id, "processing", "Completed");
+    await queue.UpdateJobStatusAsync(job.Id, "qc", autoResult.QcVerdict);
+
+    // Simulate opening Crop Review and saving a much tighter manual crop than auto-crop found.
+    using var reviewDb = new AppDbContext(dbPath);
+    var reviewJob = await reviewDb.CaptureJobs.FindAsync(job.Id);
+    reviewJob!.LeftCropBox = "600,500,2600,1100";
+    reviewJob.RightCropBox = null;
+    reviewJob.ManualOverrideApplied = true;
+    reviewJob.ProcessingStatus = "Pending";
+    reviewJob.QcStatus = "Pending";
+    await reviewDb.SaveChangesAsync();
+
+    // Worker's next pass — fresh DbContext, exactly like BackgroundProcessingWorker.
+    using var workerDb2 = new AppDbContext(dbPath);
+    var workerQueue2 = new CaptureQueueService(workerDb2);
+    var pending = await workerQueue2.GetPendingJobsAsync();
+    Check("Crop Review save re-queues the job for reprocessing", pending.Count == 1);
+    foreach (var pendingJob in pending)
+    {
+        var reprocessResult = processor.Process(pendingJob.OriginalFilePath, outputDir, splitPages: false, manualOverride: pendingJob.ManualOverrideApplied, leftCrop: pendingJob.LeftCropBox, rightCrop: pendingJob.RightCropBox);
+        Check("Reprocessing with the manual crop succeeds", reprocessResult.Success);
+        if (reprocessResult.OutputFilePaths.Count > 0)
+        {
+            using var reOut = Cv2.ImRead(reprocessResult.OutputFilePaths[0], ImreadModes.Unchanged);
+            Check("Reprocessed output matches the manually saved crop rect (2600x1100)",
+                reOut.Width == 2600 && reOut.Height == 1100);
+        }
+        await workerQueue2.UpdateJobStatusAsync(pendingJob.Id, "processing", "Completed");
+        await workerQueue2.UpdateJobStatusAsync(pendingJob.Id, "qc", reprocessResult.QcVerdict);
+    }
+
+    using var exportDb = new AppDbContext(dbPath);
+    var exporter = new BatchExportService(exportDb);
+    var exportDir = Path.Combine(workDir, "Export");
+    var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
+    var exportedFiles = Directory.GetFiles(resultDir, "*.png");
+    Check("Export produces exactly one file", exportedFiles.Length == 1);
+    if (exportedFiles.Length == 1)
+    {
+        using var exported = Cv2.ImRead(exportedFiles[0], ImreadModes.Unchanged);
+        Check("Exported file reflects the manual crop, not the raw 3840x2160 capture",
+            exported.Width == 2600 && exported.Height == 1100);
+    }
+}
+
+async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
+{
+    Console.WriteLine("\n-- REAL UI FLOW: actual MainWindowViewModel + CropReviewViewModel + commands, isolated DB/dir --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    // Pre-seed the Project with our own temp OutputDirectory so StartBatchAsync finds an
+    // existing project (matched by name) instead of creating one under the operator's real
+    // ~/Pictures/MicroCapture folder — the one piece of MainWindowViewModel that still
+    // hardcodes a real user-facing path.
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb); // triggers schema creation, same as every real AppDbContext use
+        seedDb.Projects.Add(new Project { Name = "UITEST", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    Check("Real UI flow: camera connects", vm.IsConnected);
+
+    vm.ProjectCode = "UITEST";
+    vm.BatchCode = "UITEST";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+    Check("Real UI flow: batch starts without touching the real Pictures folder", Directory.Exists(workDir));
+
+    await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null));
+    PumpUntil(() => vm.RecentCaptures.Count == 1);
+    Check("Real UI flow: capture adds exactly one thumbnail", vm.RecentCaptures.Count == 1);
+    if (vm.RecentCaptures.Count == 0) return;
+
+    var jobId = vm.RecentCaptures[0].JobId;
+
+    // The real BackgroundProcessingWorker (owned by vm, polling once a second) should pick
+    // this up on its own — wait for it instead of forcing a pass by hand.
+    PumpUntil(() => vm.RecentCaptures[0].Status != "Processing", timeoutMs: 20000);
+    Check("Real UI flow: worker auto-processes the capture", vm.RecentCaptures[0].Status.StartsWith("Processed"));
+    Check("Real UI flow: thumbnail bitmap is populated after auto-processing", vm.RecentCaptures[0].Thumbnail != null);
+    var thumbBeforeReprocess = vm.RecentCaptures[0].Thumbnail;
+
+    // Open Crop Review exactly the way MainWindowViewModel.ReviewCrop does internally
+    // (same jobId, a fresh context against the same file) — the command itself doesn't
+    // expose the window/viewmodel it creates, so this constructs it the same way instead of
+    // going through the command.
+    using var reviewDb = new AppDbContext(dbPath);
+    var reviewQueue = new CaptureQueueService(reviewDb);
+    var cropVm = new CropReviewViewModel(jobId, reviewDb, reviewQueue);
+    PumpUntil(() => cropVm.Image != null);
+    Check("Real UI flow: Crop Review loads the captured image", cropVm.Image != null);
+
+    // Drag the top-left handle inward by a large, deliberate amount — the same call the
+    // View's OnPointerMoved makes (resolve through the ViewModel, then assign the property).
+    var draggedTopLeft = new CropPoint(cropVm.TopLeft.X + 500, cropVm.TopLeft.Y + 400);
+    cropVm.TopLeft = cropVm.ResolveCornerDrag(0, draggedTopLeft);
+    Dispatcher.UIThread.RunJobs();
+
+    // Mirrors the subscription MainWindowViewModel.ReviewCrop wires up in the real app.
+    var sawImmediateReprocessingFeedback = false;
+    cropVm.Saved += (_, _) =>
+    {
+        var thumbnail = vm.RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
+        if (thumbnail != null)
+        {
+            thumbnail.Status = "Reprocessing…";
+            sawImmediateReprocessingFeedback = true;
+        }
+    };
+
+    var cropReviewWindow = new CropReviewWindow { DataContext = cropVm };
+    await RunPumped(() => cropVm.SaveCommand.ExecuteAsync(cropReviewWindow));
+    Check("Real UI flow: thumbnail shows immediate feedback on save, not a stale-looking state",
+        sawImmediateReprocessingFeedback && vm.RecentCaptures[0].Status == "Reprocessing…");
+
+    // The real worker should pick the re-queued job back up on its own within ~1s.
+    PumpUntil(() => vm.RecentCaptures[0].Thumbnail != thumbBeforeReprocess, timeoutMs: 20000);
+    Check("Real UI flow: thumbnail actually refreshes after Save & Reprocess (this is the exact reported bug)",
+        vm.RecentCaptures[0].Thumbnail != thumbBeforeReprocess);
+    Check("Real UI flow: status reflects the reprocess completed", vm.RecentCaptures[0].Status.StartsWith("Processed"));
+
+    await RunPumped(() => vm.ExportBatchCommand.ExecuteAsync(null));
+    Check("Real UI flow: export completed and left output in the isolated temp directory, not ~/Pictures",
+        Directory.GetFiles(workDir, "*.pdf", SearchOption.AllDirectories).Length > 0);
+
+    var pdfFiles = Directory.GetFiles(workDir, "*.pdf", SearchOption.AllDirectories);
+    if (pdfFiles.Length > 0)
+    {
+        var pdfInfo = new FileInfo(pdfFiles[0]);
+        Check("Real UI flow: exported PDF is non-trivial in size", pdfInfo.Length > 1000);
+    }
+
+    await RunPumped(() => vm.ShutdownAsync());
 }

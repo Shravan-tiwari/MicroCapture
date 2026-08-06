@@ -82,13 +82,21 @@ public partial class MainWindowViewModel : ViewModelBase
         _queueService = null!;
     }
 
-    public MainWindowViewModel(ICameraService cameraService)
+    public MainWindowViewModel(ICameraService cameraService) : this(cameraService, null)
+    {
+    }
+
+    /// <param name="dbPath">Overrides the database file this window and its background worker
+    /// use — used by tests so they can exercise this exact class without touching the
+    /// operator's real database (AppDbContext's own default path). Null (the real app's
+    /// usage, via the single-argument constructor above) keeps existing behavior exactly.</param>
+    public MainWindowViewModel(ICameraService cameraService, string? dbPath)
     {
         _cameraService = cameraService;
-        _dbContext = new AppDbContext();
+        _dbContext = dbPath == null ? new AppDbContext() : new AppDbContext(dbPath);
         _queueService = new CaptureQueueService(_dbContext);
-        
-        _worker = new MicroCapture.Processing.BackgroundProcessingWorker();
+
+        _worker = new MicroCapture.Processing.BackgroundProcessingWorker(dbPath);
         _worker.StatusChanged += (s, msg) => {
             Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = $"Background: {msg}");
         };
@@ -100,20 +108,32 @@ public partial class MainWindowViewModel : ViewModelBase
                 {
                     thumbnail.Status = !result.Success ? "Processing failed"
                         : result.OcrStatus == "Failed" ? "Processed — OCR failed"
-                        : result.QcVerdict == "FAIL" ? "Processed — QC warning"
+                        : result.QcVerdict == "FAIL" ? "Processed — QC fail"
+                        : result.QcVerdict == "WARNING" ? "Processed — needs review"
                         : "Processed";
 
-                    if (result.Success && result.OutputFilePaths.Count > 0 && File.Exists(result.OutputFilePaths[0]))
+                    if (result.Success && result.OutputFilePaths.Count > 0)
                     {
                         try
                         {
-                            using var stream = File.OpenRead(result.OutputFilePaths[0]);
-                            var newThumb = Bitmap.DecodeToWidth(stream, 120);
-                            var old = thumbnail.Thumbnail;
-                            thumbnail.Thumbnail = newThumb;
-                            old?.Dispose();
+                            // The processed derivative is a TIFF that Avalonia's Skia-backed
+                            // Bitmap decoder can't read directly — bridge through the same
+                            // OpenCV-based decode path batch export uses, or the thumbnail
+                            // silently never updates past the raw just-captured preview.
+                            var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(result.OutputFilePaths[0]);
+                            if (bytes != null)
+                            {
+                                using var stream = new MemoryStream(bytes);
+                                var newThumb = Bitmap.DecodeToWidth(stream, 120);
+                                var old = thumbnail.Thumbnail;
+                                thumbnail.Thumbnail = newThumb;
+                                old?.Dispose();
+                            }
                         }
-                        catch { }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"Thumbnail refresh failed for '{result.OutputFilePaths[0]}': {ex}");
+                        }
                     }
                 }
             });
@@ -574,7 +594,15 @@ public partial class MainWindowViewModel : ViewModelBase
         Console.WriteLine($"[ReviewCrop] Opening crop review for {jobId}");
         var cropWindow = new CropReviewWindow();
         Console.WriteLine($"[ReviewCrop] CropReviewWindow created");
-        cropWindow.DataContext = new CropReviewViewModel(jobId, _dbContext, _queueService);
+        var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService);
+        // Give the thumbnail immediate feedback on save instead of leaving it looking
+        // unchanged for the ~1s the background worker takes to actually pick the job back up.
+        cropReviewViewModel.Saved += (_, _) =>
+        {
+            var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
+            if (thumbnail != null) thumbnail.Status = "Reprocessing…";
+        };
+        cropWindow.DataContext = cropReviewViewModel;
         Console.WriteLine($"[ReviewCrop] CropReviewViewModel set as DataContext");
         
         // Show as a top-level window (since we don't have a direct reference to MainWindow here easily without injection, 
@@ -633,6 +661,49 @@ public partial class MainWindowViewModel : ViewModelBase
                 Console.Error.WriteLine($"Thumbnail generation failed for '{filePath}': {ex}");
             }
         });
+    }
+
+    /// <summary>
+    /// Removes a mistakenly captured page: marks it Superseded (excluded from processing and
+    /// export, same as a recapture) and drops it from the thumbnail strip. The original file
+    /// is left on disk — consistent with how a recapture already preserves prior attempts —
+    /// but any processed derivative is deleted since it would otherwise sit unused forever.
+    /// Called from MainWindow.axaml.cs's delete button on each thumbnail.
+    /// </summary>
+    public async Task DeleteCaptureAsync(ThumbnailItem item)
+    {
+        await _queueService.DeleteCaptureAsync(item.JobId);
+
+        // Deleting the most recently captured page is effectively "undo that shot" — the next
+        // real capture should reuse its page number, not leave a permanent gap. Deleting an
+        // earlier page in the batch is different: PageCount must stay put, since decrementing
+        // it would make the next capture collide with a page number that's still in use.
+        // (A gap from deleting a non-tail page is harmless — export renumbers sequentially.)
+        if (item.PageNumber == PageCount)
+            PageCount--;
+
+        try
+        {
+            var processedDir = Path.Combine(Path.GetDirectoryName(item.FilePath) ?? ".", "Processed");
+            var baseName = Path.GetFileNameWithoutExtension(item.FilePath);
+            if (Directory.Exists(processedDir))
+            {
+                foreach (var derivative in Directory.EnumerateFiles(processedDir, $"{baseName}*"))
+                {
+                    try { File.Delete(derivative); }
+                    catch (IOException) { /* best-effort cleanup; the DB status is what actually excludes it */ }
+                    catch (UnauthorizedAccessException) { /* best-effort cleanup */ }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Processed-derivative cleanup failed for '{item.FilePath}': {ex}");
+        }
+
+        item.Thumbnail?.Dispose();
+        RecentCaptures.Remove(item);
+        StatusText = $"Page {item.PageNumber:D6} removed.";
     }
 
     /// <summary>

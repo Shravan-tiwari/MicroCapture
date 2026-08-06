@@ -1,6 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
+        xmlns:conv="using:MicroCapture.UI.Converters"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="1400" d:DesignHeight="800"
@@ -8,62 +9,58 @@
         x:DataType="vm:MainWindowViewModel"
         Title="Micrographics Capture Software"
         Width="1400" Height="800"
-        Background="#1a1a2e">
+        Background="{StaticResource CanvasBrush}">
 
     <Design.DataContext>
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <Grid RowDefinitions="Auto, *, 100, Auto">
+    <Grid RowDefinitions="Auto, *, 112, Auto">
 
         <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
-        <Border Grid.Row="0" Background="#16213e" Padding="12,8" BorderBrush="#0f3460" BorderThickness="0,0,0,1">
+        <Border Grid.Row="0" Background="{StaticResource Surface1Brush}" Padding="14,10"
+                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
             <Grid ColumnDefinitions="Auto, *, Auto">
                 <!-- Left: Connection & batch -->
                 <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
-                    <Button Command="{Binding ConnectCommand}"
-                            Content="{Binding ConnectionStatus}"
-                            Background="#0f3460" Foreground="White"
-                            Padding="16,8" CornerRadius="4" />
-                    <TextBox Text="{Binding ProjectCode}" Watermark="Project Code"
-                             Width="120" Background="#1a1a2e" Foreground="White" />
-                    <TextBox Text="{Binding BatchCode}" Watermark="Batch Code"
-                             Width="120" Background="#1a1a2e" Foreground="White" />
-                    <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages" Foreground="White" VerticalAlignment="Center"/>
-                    <Button Command="{Binding StartBatchCommand}"
-                            Content="Start Batch"
-                            Background="#533483" Foreground="White"
-                            Padding="16,8" CornerRadius="4" />
-                    <Button Width="90" Background="#1a1a2e" Foreground="White" Margin="10,0,0,0" Click="OnExportFormatButtonClick">
+                    <Button Classes="toggle" Classes.active="{Binding IsConnected}"
+                            Command="{Binding ConnectCommand}"
+                            Content="{Binding ConnectionStatus}"/>
+                    <TextBox Text="{Binding ProjectCode}" Watermark="Project Code" Width="120"
+                             Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
+                             BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <TextBox Text="{Binding BatchCode}" Watermark="Batch Code" Width="120"
+                             Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
+                             BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages"
+                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
+                            Margin="6,0,0,0"/>
+                    <Button Classes="secondary" Width="96" Margin="10,0,0,0" Click="OnExportFormatButtonClick"
+                            ToolTip.Tip="Export format">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
                             <TextBlock Text="{Binding ExportFormat}" />
-                            <TextBlock Text="▾" FontSize="12" Opacity="0.85" Margin="6,0,0,0" />
+                            <TextBlock Text="▾" FontSize="11" Opacity="0.7" Foreground="{StaticResource InkSubtleBrush}"/>
                         </StackPanel>
                     </Button>
-                    <Button Command="{Binding ExportBatchCommand}"
-                            Content="Export Batch"
-                            Background="#0f3460" Foreground="White"
-                            Padding="16,8" CornerRadius="4" />
+                    <Button Classes="secondary" Command="{Binding ExportBatchCommand}" Content="Export Batch"/>
                 </StackPanel>
 
                 <!-- Center: Page Count -->
-                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="5">
-                    <TextBlock Text="PAGE:" Foreground="#a0a0a0" VerticalAlignment="Center" FontSize="13" />
-                    <TextBlock Text="{Binding PageCount}" Foreground="#e94560" VerticalAlignment="Center"
-                               FontSize="28" FontWeight="Bold" />
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="PAGE" Classes="sectionLabel" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding PageCount}" Foreground="{StaticResource PrimaryHoverBrush}"
+                               VerticalAlignment="Center" FontSize="28" FontWeight="SemiBold"/>
                 </StackPanel>
 
                 <!-- Right: Auto Capture & Camera Model -->
-                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
-                    <Button Command="{Binding ToggleAutoCaptureCommand}"
-                            Background="#533483"
-                            Foreground="White" Padding="14,8" CornerRadius="4">
-                        <StackPanel Orientation="Horizontal" Spacing="5">
-                            <TextBlock Text="AUTO" FontWeight="Bold" />
-                            <TextBlock Text="{Binding IsAutoCapture}" FontSize="10" VerticalAlignment="Center" />
-                        </StackPanel>
-                    </Button>
-                    <TextBlock Text="{Binding CameraModel}" Foreground="#a0a0a0" VerticalAlignment="Center" FontSize="12" />
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <Button Classes="toggle" Classes.active="{Binding IsAutoCapture}"
+                            Command="{Binding ToggleAutoCaptureCommand}"
+                            Content="AUTO" FontWeight="SemiBold"
+                            ToolTip.Tip="Automatically capture once a page is stable, in focus, and different from the last capture"/>
+                    <TextBlock Text="{Binding CameraModel}" Foreground="{StaticResource InkSubtleBrush}"
+                               VerticalAlignment="Center" FontSize="12" />
                 </StackPanel>
             </Grid>
         </Border>
@@ -72,53 +69,57 @@
         <Grid Grid.Row="1" ColumnDefinitions="*, 280">
 
             <!-- Live View Area -->
-            <Border Grid.Column="0" Background="#0a0a15" Margin="10,10,5,5" CornerRadius="6"
-                    BorderBrush="#0f3460" BorderThickness="2">
+            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
                 <Grid>
                     <Image Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
                     <!-- Overlay: readiness badge -->
-                    <Border Background="#80000000" HorizontalAlignment="Left" VerticalAlignment="Top"
-                            Padding="12,6" Margin="15" CornerRadius="4" IsHitTestVisible="False">
-                        <TextBlock Text="{Binding CaptureReadiness}" Foreground="#e94560"
-                                   FontWeight="Bold" FontSize="14" />
+                    <Border Background="#cc0f1011" HorizontalAlignment="Left" VerticalAlignment="Top"
+                            Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"
+                            BorderBrush="{StaticResource HairlineStrongBrush}" BorderThickness="1">
+                        <TextBlock Text="{Binding CaptureReadiness}"
+                                   Foreground="{Binding CaptureReadiness, Converter={x:Static conv:StatusSeverityConverter.Instance}}"
+                                   FontWeight="SemiBold" FontSize="13" />
                     </Border>
                 </Grid>
             </Border>
 
             <!-- Right Panel: Status & Settings -->
-            <Border Grid.Column="1" Background="#16213e" Margin="5,10,10,5" Padding="14" CornerRadius="6">
+            <Border Grid.Column="1" Classes="panel" Margin="5,10,10,5" Padding="16">
                 <ScrollViewer>
-                    <StackPanel Spacing="14">
+                    <StackPanel Spacing="16">
                         <!-- Status Indicators -->
-                        <TextBlock Text="STATUS" Foreground="#e94560" FontWeight="Bold" FontSize="13" />
-                        <Border Background="#1a1a2e" CornerRadius="4" Padding="10">
-                            <StackPanel Spacing="6">
+                        <TextBlock Text="STATUS" Classes="sectionLabel" />
+                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                            <StackPanel Spacing="8">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Focus:" Foreground="#a0a0a0" Width="80" />
-                                    <TextBlock Text="{Binding FocusStatus}" Foreground="LightGreen" />
+                                    <TextBlock Text="Focus" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="{Binding FocusStatus}" Foreground="{StaticResource InkMutedBrush}" FontSize="13"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Exposure:" Foreground="#a0a0a0" Width="80" />
-                                    <TextBlock Text="{Binding ExposureStatus}" Foreground="LightGreen" />
+                                    <TextBlock Text="Exposure" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="{Binding ExposureStatus}" Foreground="{StaticResource InkMutedBrush}" FontSize="13"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Document:" Foreground="#a0a0a0" Width="80" />
-                                    <TextBlock Text="{Binding DocumentStatus}" Foreground="LightGreen" />
+                                    <TextBlock Text="Document" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="{Binding DocumentStatus}" FontSize="13" FontWeight="Medium"
+                                               Foreground="{Binding DocumentStatus, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                                 </StackPanel>
                             </StackPanel>
                         </Border>
 
-                        <TextBlock Text="CAMERA CONTROLS" Foreground="#e94560" FontWeight="Bold" FontSize="13" />
+                        <TextBlock Text="CAMERA CONTROLS" Classes="sectionLabel" Margin="0,4,0,0"/>
                         <ItemsControl ItemsSource="{Binding CameraControls}">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate x:DataType="vm:CameraControlItem">
-                                    <Grid ColumnDefinitions="*, 120" Margin="0,2">
-                                        <TextBlock Text="{Binding DisplayName}" Foreground="#a0a0a0" VerticalAlignment="Center" />
-                                        <Button Grid.Column="1" Click="OnCameraControlButtonClick"
-                                                  Background="#1a1a2e" Foreground="White" HorizontalAlignment="Stretch">
+                                    <Grid ColumnDefinitions="*, 120" Margin="0,3">
+                                        <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkSubtleBrush}"
+                                                   VerticalAlignment="Center" FontSize="13"/>
+                                        <Button Grid.Column="1" Classes="secondary" Click="OnCameraControlButtonClick"
+                                                HorizontalAlignment="Stretch" Padding="10,7">
                                             <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
-                                                <TextBlock Text="{Binding SelectedOption.DisplayName}" />
-                                                <TextBlock Text="▾" FontSize="12" Opacity="0.85" Margin="6,0,0,0" />
+                                                <TextBlock Text="{Binding SelectedOption.DisplayName}" FontSize="13"/>
+                                                <TextBlock Text="▾" FontSize="11" Opacity="0.7" Foreground="{StaticResource InkSubtleBrush}"/>
                                             </StackPanel>
                                         </Button>
                                     </Grid>
@@ -127,30 +128,37 @@
                         </ItemsControl>
 
                         <!-- Capture Button -->
-                        <Button Command="{Binding CaptureCommand}"
-                                HorizontalAlignment="Stretch"
-                                HorizontalContentAlignment="Center"
-                                Background="#e94560" Foreground="White"
-                                Padding="0,14" CornerRadius="6" FontSize="16" FontWeight="Bold">
-                            CAPTURE (SPACE)
+                        <Button Classes="primary" Command="{Binding CaptureCommand}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                Padding="0,15" FontSize="16" Margin="0,6,0,0">
+                            CAPTURE
                         </Button>
-                        <Button Command="{Binding RecaptureCommand}"
-                                HorizontalAlignment="Stretch"
-                                HorizontalContentAlignment="Center"
-                                Background="#533483" Foreground="White"
-                                Padding="0,10" CornerRadius="6">
-                            RECAPTURE (R)
+                        <Button Classes="secondary" Command="{Binding RecaptureCommand}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                Padding="0,11">
+                            RECAPTURE
                         </Button>
 
                         <!-- Keyboard Shortcuts -->
-                        <TextBlock Text="SHORTCUTS" Foreground="#e94560" FontWeight="Bold" FontSize="13"
-                                   Margin="0,10,0,0" />
-                        <Border Background="#1a1a2e" CornerRadius="4" Padding="10">
-                            <StackPanel Spacing="4">
-                                <TextBlock Text="SPACE — Capture" Foreground="#a0a0a0" FontSize="12" />
-                                <TextBlock Text="R — Recapture" Foreground="#a0a0a0" FontSize="12" />
-                                <TextBlock Text="A — Toggle Auto-Capture" Foreground="#a0a0a0" FontSize="12" />
-                                <TextBlock Text="← → — Browse Pages" Foreground="#a0a0a0" FontSize="12" />
+                        <TextBlock Text="SHORTCUTS" Classes="sectionLabel" Margin="0,4,0,0" />
+                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                            <StackPanel Spacing="7">
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Capture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="SPACE" Classes="caption"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Recapture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="R" Classes="caption"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Toggle auto-capture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="A" Classes="caption"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Browse pages" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="← →" Classes="caption"/>
+                                </StackPanel>
                             </StackPanel>
                         </Border>
                     </StackPanel>
@@ -159,32 +167,42 @@
         </Grid>
 
         <!-- ═══════════════ THUMBNAIL STRIP ═══════════════ -->
-        <Border Grid.Row="2" Background="#16213e" Margin="10,5,10,5" CornerRadius="6" Padding="8">
+        <Border Grid.Row="2" Classes="panel" Margin="10,5,10,5" Padding="10">
             <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
-                            <StackPanel Orientation="Horizontal" Spacing="6" />
+                            <StackPanel Orientation="Horizontal" Spacing="8" />
                         </ItemsPanelTemplate>
                     </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
-                            <Button Background="#1a1a2e" CornerRadius="4" Padding="4" Width="90"
-                                    ToolTip.Tip="Open crop review"
-                                    Click="OnThumbnailClick"
-                                    Tag="{Binding JobId}">
-                                <StackPanel Spacing="2">
-                                    <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform" />
-                                    <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
-                                               Foreground="White" FontSize="10"
-                                               HorizontalAlignment="Center" />
-                                    <TextBlock Text="{Binding Status}"
-                                               Foreground="#a0a0a0" FontSize="9"
-                                               HorizontalAlignment="Center" />
-                                    <TextBlock Text="Click to review" Foreground="#8e8ea8" FontSize="8"
-                                               HorizontalAlignment="Center" />
-                                </StackPanel>
-                            </Button>
+                            <Grid Classes="thumb" Width="100">
+                                <Button Background="{StaticResource Surface2Brush}" BorderBrush="{StaticResource HairlineBrush}"
+                                        BorderThickness="1" CornerRadius="8" Padding="6"
+                                        ToolTip.Tip="Open crop review"
+                                        Click="OnThumbnailClick"
+                                        Tag="{Binding JobId}">
+                                    <StackPanel Spacing="6">
+                                        <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface1Brush}">
+                                            <Image Source="{Binding Thumbnail}" Height="62" Stretch="Uniform" />
+                                        </Border>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="5">
+                                            <Ellipse Width="6" Height="6" VerticalAlignment="Center"
+                                                     Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
+                                            <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
+                                                       Foreground="{StaticResource InkMutedBrush}" FontSize="11"/>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding Status}"
+                                                   Foreground="{StaticResource InkSubtleBrush}" FontSize="10"
+                                                   HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                </Button>
+                                <Button Content="✕" Width="20" Height="20" Padding="0" FontSize="10" Classes="iconDanger"
+                                        HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-4,-4,0"
+                                        ToolTip.Tip="Delete this capture (excludes it from processing and export)"
+                                        Click="OnDeleteThumbnailClick" />
+                            </Grid>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
@@ -192,11 +210,12 @@
         </Border>
 
         <!-- ═══════════════ STATUS BAR ═══════════════ -->
-        <Border Grid.Row="3" Background="#0f3460" Padding="10,6">
+        <Border Grid.Row="3" Background="{StaticResource Surface1Brush}" Padding="12,7"
+                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
             <Grid ColumnDefinitions="*, Auto">
-                <TextBlock Grid.Column="0" Text="{Binding StatusText}" Foreground="White" FontSize="12"
+                <TextBlock Grid.Column="0" Text="{Binding StatusText}" Foreground="{StaticResource InkMutedBrush}" FontSize="12"
                            VerticalAlignment="Center" />
-                <TextBlock Grid.Column="1" Text="Micrographics v0.4.0" Foreground="#606090"
+                <TextBlock Grid.Column="1" Text="Micrographics v0.4.0" Foreground="{StaticResource InkTertiaryBrush}"
                            FontSize="11" VerticalAlignment="Center" />
             </Grid>
         </Border>

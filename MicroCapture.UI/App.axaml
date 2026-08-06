@@ -2,8 +2,13 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="MicroCapture.UI.App"
              xmlns:local="using:MicroCapture.UI"
-             RequestedThemeVariant="Default">
-             <!-- "Default" ThemeVariant follows system theme variant. "Dark" or "Light" are other available options. -->
+             RequestedThemeVariant="Dark">
+             <!-- MicroCapture is a dark-canvas professional imaging tool by deliberate choice
+                  (matching the Linear-philosophy reference system, and the convention of every
+                  comparable tool — Lightroom, Capture One, ABBYY FineReader's dark mode) —
+                  pinned to "Dark" rather than "Default" so built-in Fluent chrome (CheckBox,
+                  Slider, ScrollBar) always matches the app's own hand-painted dark surfaces
+                  instead of flipping light on a light-mode OS. -->
 
     <Application.DataTemplates>
         <local:ViewLocator />
@@ -11,5 +16,6 @@
 
     <Application.Styles>
         <FluentTheme />
+        <StyleInclude Source="avares://MicroCapture.UI/Styles/Theme.axaml"/>
     </Application.Styles>
 </Application>

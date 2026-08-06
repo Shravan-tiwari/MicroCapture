@@ -15,16 +15,22 @@ namespace MicroCapture.Processing;
 public class BackgroundProcessingWorker
 {
     private readonly ImageProcessor _processor;
+    private readonly string? _dbPath;
     private CancellationTokenSource? _cts;
 
     public event EventHandler<ProcessingResult>? JobCompleted;
     public event EventHandler<string>? StatusChanged;
 
-    public BackgroundProcessingWorker()
+    /// <param name="dbPath">Overrides the database file this worker polls — used by tests so
+    /// they can exercise this exact class without touching the operator's real database
+    /// (AppDbContext's own default path). Null (the real app's usage) keeps existing
+    /// behavior exactly.</param>
+    public BackgroundProcessingWorker(string? dbPath = null)
     {
         // The background worker creates its own AppDbContext instances for polling.
         // This avoids DbContext thread-safety issues while still processing the same
         // persisted local database created by the UI layer.
+        _dbPath = dbPath;
         _processor = new ImageProcessor();
     }
 
@@ -49,7 +55,7 @@ public class BackgroundProcessingWorker
         {
             try
             {
-                using var dbContext = new AppDbContext();
+                using var dbContext = _dbPath == null ? new AppDbContext() : new AppDbContext(_dbPath);
                 var queueService = new CaptureQueueService(dbContext);
                 await queueService.RecoverInterruptedJobsAsync();
                 var pendingJobs = await queueService.GetPendingJobsAsync();

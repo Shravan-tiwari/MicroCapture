@@ -147,6 +147,22 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void OnDeleteThumbnailClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (sender is Button btn && btn.DataContext is MicroCapture.UI.ViewModels.ThumbnailItem item
+                && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
+            {
+                await vm.DeleteCaptureAsync(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Thumbnail] OnDeleteThumbnailClick failed: {ex}");
+        }
+    }
+
     protected override async void OnClosed(EventArgs e)
     {
         if (DataContext is MainWindowViewModel vm)

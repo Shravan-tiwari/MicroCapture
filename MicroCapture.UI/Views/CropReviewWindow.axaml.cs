@@ -22,9 +22,11 @@ public partial class CropReviewWindow : Window
 
     private const double HandleHitRadius = 16.0;
     private const double SplitLineHitMargin = 12.0;
-    private static readonly Color SingleQuadColor = Color.Parse("#00d2ff");
-    private static readonly Color LeftQuadColor = Color.Parse("#00d2ff");
-    private static readonly Color RightQuadColor = Color.Parse("#7dd3fc");
+    // Matches the accent tokens in Styles/Theme.axaml (PrimaryBrush / PrimaryHoverBrush) —
+    // kept as literal colors here since this canvas is drawn entirely in code-behind, not XAML.
+    private static readonly Color SingleQuadColor = Color.Parse("#5e6ad2");
+    private static readonly Color LeftQuadColor = Color.Parse("#5e6ad2");
+    private static readonly Color RightQuadColor = Color.Parse("#828fff");
 
     private DragTarget _activeDrag = DragTarget.None;
 
@@ -252,7 +254,7 @@ public partial class CropReviewWindow : Window
         {
             Width = Math.Max(0, lineX - imgRect.X),
             Height = imgRect.Height,
-            Fill = new SolidColorBrush(Color.FromArgb(35, 0, 210, 255)),
+            Fill = new SolidColorBrush(Color.FromArgb(35, 94, 106, 210)),
             Stroke = new SolidColorBrush(LeftQuadColor),
             StrokeThickness = 2
         };
@@ -276,13 +278,13 @@ public partial class CropReviewWindow : Window
         {
             Width = 3,
             Height = imgRect.Height,
-            Fill = new SolidColorBrush(Color.Parse("#e94560"))
+            Fill = new SolidColorBrush(Color.Parse("#d99a3d"))
         };
         Canvas.SetLeft(line, lineX - 1.5);
         Canvas.SetTop(line, imgRect.Y);
         canvas.Children.Add(line);
 
-        AddHandle(canvas, lineX, imgRect.Y + imgRect.Height / 2, Color.Parse("#e94560"));
+        AddHandle(canvas, lineX, imgRect.Y + imgRect.Height / 2, Color.Parse("#d99a3d"));
     }
 
     private void AddHandle(Canvas canvas, double cx, double cy, Color strokeColor)

@@ -137,6 +137,20 @@ public class CaptureQueueService
             await _dbContext.SaveChangesAsync();
     }
 
+    /// <summary>Removes a mistakenly captured page from the batch. Reuses the same "Superseded"
+    /// mechanism a recapture already relies on — the row stays in the database (audit trail
+    /// intact) but is excluded from the pending-processing queue and from export, exactly like
+    /// a superseded recapture attempt. Nothing downstream needs a separate "deleted" concept.</summary>
+    public async Task<CaptureJob?> DeleteCaptureAsync(string jobId)
+    {
+        var job = await _dbContext.CaptureJobs.FindAsync(jobId);
+        if (job == null) return null;
+        job.ProcessingStatus = "Superseded";
+        job.ExportStatus = "Superseded";
+        await _dbContext.SaveChangesAsync();
+        return job;
+    }
+
     public async Task UpdateJobStatusAsync(string jobId, string statusType, string newStatus)
     {
         var job = await _dbContext.CaptureJobs.FindAsync(jobId);

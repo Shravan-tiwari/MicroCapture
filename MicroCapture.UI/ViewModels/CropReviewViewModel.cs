@@ -38,6 +38,12 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
 
     private const double SnapRadiusPixels = 15.0;
 
+    /// <summary>Raised after a successful Save & Reprocess, before the window closes — lets
+    /// MainWindow show immediate "reprocessing" feedback on the matching thumbnail instead of
+    /// leaving it looking unchanged for the ~1s the background worker takes to actually pick
+    /// the job back up.</summary>
+    public event EventHandler? Saved;
+
     [ObservableProperty] private Bitmap? _image;
     [ObservableProperty] private double _splitPercent = 50.0;
     [ObservableProperty] private bool _isSplitBookPages;
@@ -480,6 +486,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             }
 
             await _dbContext.SaveChangesAsync();
+            Saved?.Invoke(this, EventArgs.Empty);
         }
 
         window?.Close();
