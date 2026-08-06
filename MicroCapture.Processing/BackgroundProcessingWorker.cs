@@ -80,7 +80,10 @@ public class BackgroundProcessingWorker
                         "Processed");
 
                     bool splitPages = job.Batch?.SplitBookPages ?? false;
-                    var result = _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox);
+                    bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
+                    var result = useFixedFrames
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {

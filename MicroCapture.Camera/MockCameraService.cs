@@ -100,6 +100,20 @@ public class MockCameraService : ICameraService
         return Task.CompletedTask;
     }
 
+    // No real lens to move — safe no-ops so the UI's focus controls work identically against
+    // the mock camera for dev/testing without a physical body attached.
+    public Task NudgeFocusAsync(FocusStep step)
+    {
+        if (!_isConnected) throw new InvalidOperationException("Camera not connected.");
+        return Task.CompletedTask;
+    }
+
+    public Task TriggerAutoFocusAsync()
+    {
+        if (!_isConnected) throw new InvalidOperationException("Camera not connected.");
+        return Task.CompletedTask;
+    }
+
     public async Task<string> CaptureAsync(string outputDirectory, string fileNamePrefix)
     {
         if (!_isConnected) throw new InvalidOperationException("Camera not connected.");

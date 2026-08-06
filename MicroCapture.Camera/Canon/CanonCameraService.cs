@@ -309,6 +309,41 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         }
     }
 
+    /// <summary>Manual lens focus nudge during live view — the same EDSDK mechanism EOS
+    /// Utility's remote-focus arrows use. Requires live view to be active; the camera returns
+    /// an error otherwise, which surfaces to the caller like any other SDK failure.</summary>
+    public Task NudgeFocusAsync(FocusStep step)
+    {
+        lock (_sync)
+        {
+            ThrowIfDisconnected();
+            var param = step switch
+            {
+                FocusStep.NearSmall => EDSDK.EvfDriveLens_Near1,
+                FocusStep.NearMedium => EDSDK.EvfDriveLens_Near2,
+                FocusStep.NearLarge => EDSDK.EvfDriveLens_Near3,
+                FocusStep.FarSmall => EDSDK.EvfDriveLens_Far1,
+                FocusStep.FarMedium => EDSDK.EvfDriveLens_Far2,
+                FocusStep.FarLarge => EDSDK.EvfDriveLens_Far3,
+                _ => EDSDK.EvfDriveLens_Near1
+            };
+            EnsureSuccess("EdsSendCommand(DriveLensEvf)", Call($"EdsSendCommand(DriveLensEvf, {step})", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DriveLensEvf, unchecked((int)param))));
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Fires one autofocus attempt on demand during live view, independent of capture —
+    /// lets the operator force a refocus without it happening automatically as part of shooting.</summary>
+    public Task TriggerAutoFocusAsync()
+    {
+        lock (_sync)
+        {
+            ThrowIfDisconnected();
+            EnsureSuccess("EdsSendCommand(DoEvfAf)", Call("EdsSendCommand(DoEvfAf)", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, 0)));
+        }
+        return Task.CompletedTask;
+    }
+
     public async Task<string> CaptureAsync(string outputDirectory, string filePrefix)
     {
         if (string.IsNullOrWhiteSpace(outputDirectory) || string.IsNullOrWhiteSpace(filePrefix)) throw new ArgumentException("An output directory and file prefix are required.");

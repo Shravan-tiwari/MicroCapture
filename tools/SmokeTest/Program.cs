@@ -56,6 +56,10 @@ TestShadowedPageDetection();
 TestBorderTouchingPageIsNotOverPadded();
 TestMediumConfidenceCropIsStillApplied();
 TestLowConfidenceCropIsSkippedAndFlagged();
+TestFixedFramesRoundTrip();
+TestProcessFixedFramesProducesNOutputs();
+TestFixedFramesBypassesConfidenceGating();
+await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
 await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
@@ -803,6 +807,136 @@ void TestLowConfidenceCropIsSkippedAndFlagged()
         Check("Output keeps the full source frame when confidence is too low to trust",
             output.Width == imageWidth && output.Height == imageHeight);
     }
+}
+
+void TestFixedFramesRoundTrip()
+{
+    Console.WriteLine("\n-- Fixed-frame format/parse round-trips exactly --");
+    var frames = new[]
+    {
+        new FixedFrameRect(10, 20, 100, 150),
+        new FixedFrameRect(200, 50, 80, 60),
+        new FixedFrameRect(5, 300, 400, 200)
+    };
+    var spec = ImageProcessor.FormatFixedFrames(frames);
+    var parsed = ImageProcessor.ParseFixedFrames(spec);
+
+    Check("Round-trip preserves frame count", parsed.Length == frames.Length);
+    for (var i = 0; i < frames.Length && i < parsed.Length; i++)
+    {
+        Check($"Frame {i} round-trips exactly", Math.Abs(parsed[i].X - frames[i].X) < 0.01 && Math.Abs(parsed[i].Y - frames[i].Y) < 0.01 &&
+            Math.Abs(parsed[i].Width - frames[i].Width) < 0.01 && Math.Abs(parsed[i].Height - frames[i].Height) < 0.01);
+    }
+}
+
+void TestProcessFixedFramesProducesNOutputs()
+{
+    Console.WriteLine("\n-- ProcessFixedFrames crops N independent, correctly-sized outputs, no whole-frame extra --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_fixed.png"), 400, 300);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var frames = new[]
+    {
+        new FixedFrameRect(10, 10, 150, 100),
+        new FixedFrameRect(200, 150, 120, 80),
+        new FixedFrameRect(50, 200, 90, 70)
+    };
+    var spec = ImageProcessor.FormatFixedFrames(frames);
+    var result = new ImageProcessor().ProcessFixedFrames(sourcePath, outDir, spec);
+
+    Check("Processing succeeds", result.Success);
+    Check("Produces exactly N output files (one per frame, no whole-frame extra)", result.OutputFilePaths.Count == frames.Length);
+    if (result.OutputFilePaths.Count == frames.Length)
+    {
+        var sorted = result.OutputFilePaths.OrderBy(f => f, StringComparer.Ordinal).ToArray();
+        Check("Output filenames already sort in frame order (zero-padded _frameNN)", sorted.SequenceEqual(result.OutputFilePaths));
+        for (var i = 0; i < frames.Length; i++)
+        {
+            using var output = Cv2.ImRead(sorted[i], ImreadModes.Unchanged);
+            Check($"Frame {i + 1} output size matches its own calibrated rectangle",
+                Math.Abs(output.Width - (int)frames[i].Width) <= 1 && Math.Abs(output.Height - (int)frames[i].Height) <= 1);
+        }
+    }
+}
+
+void TestFixedFramesBypassesConfidenceGating()
+{
+    Console.WriteLine("\n-- Fixed frames crop unconditionally even where auto-crop's confidence gate keeps the full frame --");
+    var workDir = TempWorkDir();
+    // A flat, featureless image: no contour for auto-crop to ever find — exactly the real-world
+    // shape of the bug this feature exists to route around.
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "flat.png"), 500, 400);
+
+    var autoCropResult = new ImageProcessor().Process(sourcePath, Path.Combine(workDir, "Processed_auto"), splitPages: false, manualOverride: false);
+    Check("Auto-crop on a featureless image keeps the full frame uncropped", !autoCropResult.WasCropped);
+    if (autoCropResult.Success && autoCropResult.OutputFilePaths.Count > 0)
+    {
+        using var autoOutput = Cv2.ImRead(autoCropResult.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Auto-crop output is the full, uncropped source size", autoOutput.Width == 500 && autoOutput.Height == 400);
+    }
+
+    var frameSpec = ImageProcessor.FormatFixedFrames(new[] { new FixedFrameRect(50, 50, 200, 150) });
+    var fixedResult = new ImageProcessor().ProcessFixedFrames(sourcePath, Path.Combine(workDir, "Processed_fixed"), frameSpec);
+    Check("Fixed-frame processing succeeds on the very same featureless image", fixedResult.Success);
+    if (fixedResult.Success && fixedResult.OutputFilePaths.Count > 0)
+    {
+        using var fixedOutput = Cv2.ImRead(fixedResult.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Fixed-frame output is cropped to exactly the calibrated rectangle regardless of confidence",
+            Math.Abs(fixedOutput.Width - 200) <= 1 && Math.Abs(fixedOutput.Height - 150) <= 1);
+    }
+}
+
+async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
+{
+    Console.WriteLine("\n-- Full flow: fixed-frame batch -> worker branch -> export produces one page per frame --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+
+    var project = new Project { Name = "SMOKE-FIXEDFRAMES", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+
+    const int calibW = 800, calibH = 600;
+    var frames = new[]
+    {
+        new FixedFrameRect(20, 20, 300, 250),
+        new FixedFrameRect(400, 20, 300, 250)
+    };
+    var batch = new Batch
+    {
+        ProjectId = project.Id,
+        Name = "FIXEDFRAMES",
+        BatchCode = "FIXEDFRAMES",
+        UseFixedFrames = true,
+        FixedFrames = ImageProcessor.FormatFixedFrames(frames),
+        FixedFrameImageWidth = calibW,
+        FixedFrameImageHeight = calibH
+    };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    var originalPath = WriteSolidImage(Path.Combine(workDir, "capture.png"), calibW, calibH);
+    var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, 1);
+
+    // Mirrors BackgroundProcessingWorker.ProcessLoop's branch for a batch with UseFixedFrames set.
+    var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
+    var processResult = new ImageProcessor().ProcessFixedFrames(job.OriginalFilePath, outputDir, batch.FixedFrames!);
+    Check("Worker-equivalent fixed-frame processing succeeds", processResult.Success);
+    Check("Worker-equivalent processing writes exactly one file per frame", processResult.OutputFilePaths.Count == frames.Length);
+    await queue.UpdateJobStatusAsync(job.Id, "processing", processResult.Success ? "Completed" : "Failed");
+
+    using var exportDb = new AppDbContext(dbPath);
+    var exporter = new BatchExportService(exportDb);
+    var exportDir = Path.Combine(workDir, "Export");
+    var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
+    var exportedFiles = Directory.GetFiles(resultDir, "*.png").OrderBy(f => f).ToArray();
+
+    Check("Export produces one page per calibrated frame for the one capture — no BatchExportService changes needed",
+        exportedFiles.Length == frames.Length);
 }
 
 void TestTiffDisplayDecodeRoundTrip()

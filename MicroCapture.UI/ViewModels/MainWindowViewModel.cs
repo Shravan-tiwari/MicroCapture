@@ -41,6 +41,36 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private bool _splitBookPages = false;
     [ObservableProperty] private string _exportFormat = "PDF";
 
+    // Fixed-frame capture: UseFixedFrames is the pre-batch checkbox intent (what the *next*
+    // Start Batch will do); IsFixedFrameBatch reflects whether the currently *active* batch
+    // actually has calibrated frames — they're deliberately separate so toggling the checkbox
+    // mid-batch can never retroactively change how the active batch behaves.
+    [ObservableProperty] private bool _useFixedFrames = false;
+    [ObservableProperty] private bool _isFixedFrameBatch = false;
+    [ObservableProperty] private string _defaultExportFormat = "PDF";
+    public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
+
+    public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
+    // Visible once the operator has expressed intent (checked the box for the next batch) OR
+    // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
+    public bool ShowCalibrateButton => IsFixedFrameBatch || UseFixedFrames;
+    public string CalibrateButtonLabel => IsFixedFrameBatch ? "Recalibrate Frames" : "Calibrate Frames";
+
+    partial void OnUseFixedFramesChanged(bool value)
+    {
+        if (value) SplitBookPages = false;
+        OnPropertyChanged(nameof(ShowCalibrateButton));
+        OnPropertyChanged(nameof(CalibrateButtonLabel));
+    }
+    partial void OnSplitBookPagesChanged(bool value) { if (value) UseFixedFrames = false; }
+    partial void OnIsFixedFrameBatchChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsAutoCaptureAvailable));
+        OnPropertyChanged(nameof(ShowCalibrateButton));
+        OnPropertyChanged(nameof(CalibrateButtonLabel));
+        if (value) { IsAutoCapture = false; }
+    }
+
     private string? _currentProjectId;
     private string? _currentBatchId;
     // Snapshotted at StartBatchAsync, sanitized so operator-entered text can never
@@ -103,8 +133,12 @@ public partial class MainWindowViewModel : ViewModelBase
         _worker.JobCompleted += (s, result) => {
             Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
-                var thumbnail = RecentCaptures.FirstOrDefault(t => t.FilePath == result.OriginalFilePath);
-                if (thumbnail != null)
+                // For an ordinary (non-fixed-frame) job this matches exactly one thumbnail at
+                // FrameIndex 0 — identical to the old single-thumbnail behavior. For a
+                // fixed-frame job, AddThumbnail already inserted one placeholder per calibrated
+                // frame, sharing this same FilePath; each gets its own slice of OutputFilePaths.
+                var thumbnails = RecentCaptures.Where(t => t.FilePath == result.OriginalFilePath);
+                foreach (var thumbnail in thumbnails)
                 {
                     thumbnail.Status = !result.Success ? "Processing failed"
                         : result.OcrStatus == "Failed" ? "Processed — OCR failed"
@@ -112,7 +146,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         : result.QcVerdict == "WARNING" ? "Processed — needs review"
                         : "Processed";
 
-                    if (result.Success && result.OutputFilePaths.Count > 0)
+                    if (result.Success && thumbnail.FrameIndex >= 0 && thumbnail.FrameIndex < result.OutputFilePaths.Count)
                     {
                         try
                         {
@@ -120,7 +154,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             // Bitmap decoder can't read directly — bridge through the same
                             // OpenCV-based decode path batch export uses, or the thumbnail
                             // silently never updates past the raw just-captured preview.
-                            var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(result.OutputFilePaths[0]);
+                            var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(result.OutputFilePaths[thumbnail.FrameIndex]);
                             if (bytes != null)
                             {
                                 using var stream = new MemoryStream(bytes);
@@ -132,7 +166,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         }
                         catch (Exception ex)
                         {
-                            Console.Error.WriteLine($"Thumbnail refresh failed for '{result.OutputFilePaths[0]}': {ex}");
+                            Console.Error.WriteLine($"Thumbnail refresh failed for '{result.OutputFilePaths[thumbnail.FrameIndex]}': {ex}");
                         }
                     }
                 }
@@ -166,9 +200,16 @@ public partial class MainWindowViewModel : ViewModelBase
                     var old = LiveViewImage;
                     LiveViewImage = bitmap;
                     old?.Dispose();
+                    // Fixed-frame batches don't need (or want) contour detection — the crop
+                    // geometry is already calibrated, and running detection here would just
+                    // burn CPU and show meaningless boundary/stability messaging.
+                    if (IsFixedFrameBatch)
+                    {
+                        DocumentStatus = "✓ Fixed frames — position paper, press CAPTURE";
+                    }
                     // Boundary detection is throttled to keep the live-view path
                     // responsive while still providing a meaningful capture-readiness gate.
-                    if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
+                    else if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
                     {
                         _lastDocumentCheckUtc = DateTime.UtcNow;
                         var check = MicroCapture.Processing.ImageProcessor.CheckLiveFrame(frameBytes);
@@ -380,6 +421,9 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 _currentBatchId = batch.Id;
                 PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
+                IsFixedFrameBatch = batch.UseFixedFrames;
+                RefreshFixedFrameCache(batch);
+                ExportFormat = batch.PreferredExportFormat;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -391,7 +435,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     Name = batchCode,
                     BatchCode = batchCode,
                     Operator = Environment.UserName,
-                    SplitBookPages = SplitBookPages
+                    SplitBookPages = SplitBookPages && !UseFixedFrames,
+                    PreferredExportFormat = DefaultExportFormat
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();
@@ -399,7 +444,22 @@ public partial class MainWindowViewModel : ViewModelBase
                 _currentBatchId = batch.Id;
                 PageCount = 0;
                 RecentCaptures.Clear();
+                IsFixedFrameBatch = false;
+                RefreshFixedFrameCache(null);
+                ExportFormat = DefaultExportFormat;
                 StatusText = $"Batch '{batchCode}' started for project '{projectCode}'";
+
+                if (UseFixedFrames)
+                {
+                    if (IsConnected)
+                    {
+                        await CalibrateFramesAsync();
+                    }
+                    else
+                    {
+                        StatusText = $"Batch '{batchCode}' started — connect the camera and use \"Calibrate Frames\" to set up fixed frames.";
+                    }
+                }
             }
 
             UpdateCaptureReadiness();
@@ -410,10 +470,74 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Opens the fixed-frame calibration screen for the active batch — used both for
+    /// first-time calibration (right after Start Batch, if "Use Fixed Frames" was checked) and
+    /// for recalibrating an already-fixed-frame batch later (e.g. the rig shifted). Takes one
+    /// throwaway full-res shot as the calibration image (never enqueued as a real capture), then
+    /// blocks on the modal calibration window before returning.</summary>
+    [RelayCommand]
+    private async Task CalibrateFramesAsync()
+    {
+        if (_currentBatchId == null) { StatusText = "Start a batch first."; return; }
+        if (!IsConnected) { StatusText = "Connect the camera before calibrating fixed frames."; return; }
+
+        // A job still mid-flight when frames change could otherwise get cropped with the new
+        // geometry instead of the one that was active when it was captured — block rather than
+        // risk that race. Nothing heavier (e.g. a per-job geometry snapshot) is needed: once
+        // this check passes, every already-Completed job is an immutable historical artifact
+        // that nothing reprocesses automatically.
+        var pendingCount = await _dbContext.CaptureJobs.CountAsync(j =>
+            j.BatchId == _currentBatchId && (j.ProcessingStatus == "Pending" || j.ProcessingStatus == "InProgress"));
+        if (pendingCount > 0)
+        {
+            StatusText = $"{pendingCount} page(s) still processing under the current frames — wait for them to finish before recalibrating.";
+            return;
+        }
+
+        var batch = await _dbContext.Batches.FindAsync(_currentBatchId);
+        if (batch == null) return;
+
+        try
+        {
+            var calibrationDir = Path.Combine(_outputDirectory, "Calibration");
+            Directory.CreateDirectory(calibrationDir);
+            StatusText = "Capturing calibration frame...";
+            var calibrationPath = await _cameraService.CaptureAsync(calibrationDir, $"calibration_{DateTime.Now:yyyyMMdd_HHmmss}");
+
+            var calibrationViewModel = new FrameCalibrationViewModel(batch, _dbContext, calibrationPath);
+            var window = new FrameCalibrationWindow { DataContext = calibrationViewModel };
+
+            var saved = false;
+            calibrationViewModel.Saved += (_, _) => saved = true;
+
+            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop
+                && desktop.MainWindow != null)
+            {
+                await window.ShowDialog(desktop.MainWindow);
+            }
+            else
+            {
+                window.Show();
+            }
+
+            IsFixedFrameBatch = batch.UseFixedFrames;
+            RefreshFixedFrameCache(batch);
+            StatusText = saved ? "Fixed frames calibrated." : "Calibration cancelled.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Calibration failed: {ex.Message}";
+        }
+    }
+
     /// <summary>Rebuilds the thumbnail strip from a resumed batch's most recent, non-superseded capture per page.</summary>
     private async Task LoadRecentCapturesFromBatchAsync(Batch batch)
     {
         RecentCaptures.Clear();
+        var frameCount = batch.UseFixedFrames && !string.IsNullOrWhiteSpace(batch.FixedFrames)
+            ? Math.Max(1, MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames).Length)
+            : 1;
+
         var latestPerPage = batch.Captures
             .Where(job => job.ProcessingStatus != "Superseded")
             .GroupBy(job => job.PageNumber)
@@ -426,18 +550,29 @@ public partial class MainWindowViewModel : ViewModelBase
             if (!File.Exists(job.OriginalFilePath)) continue;
             try
             {
-                using var stream = File.OpenRead(job.OriginalFilePath);
-                var thumb = await Task.Run(() => Bitmap.DecodeToWidth(stream, 120));
-                RecentCaptures.Add(new ThumbnailItem
+                // This reloads the raw capture, not each frame's actual processed crop — an
+                // existing limitation shared with ordinary batches (resume never re-fetches
+                // per-frame derivatives), not something new here.
+                var bytes = await Task.Run(() => File.ReadAllBytes(job.OriginalFilePath));
+                var status = job.ProcessingStatus == "Completed" ? "Processed"
+                    : job.ProcessingStatus == "Failed" ? "Processing failed"
+                    : "Processing";
+
+                for (var i = 0; i < frameCount; i++)
                 {
-                    JobId = job.Id,
-                    PageNumber = job.PageNumber,
-                    Thumbnail = thumb,
-                    Status = job.ProcessingStatus == "Completed" ? "Processed"
-                        : job.ProcessingStatus == "Failed" ? "Processing failed"
-                        : "Processing",
-                    FilePath = job.OriginalFilePath
-                });
+                    using var stream = new MemoryStream(bytes);
+                    var thumb = await Task.Run(() => Bitmap.DecodeToWidth(stream, 120));
+                    RecentCaptures.Add(new ThumbnailItem
+                    {
+                        JobId = job.Id,
+                        PageNumber = job.PageNumber,
+                        FrameIndex = i,
+                        Thumbnail = thumb,
+                        BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
+                        Status = status,
+                        FilePath = job.OriginalFilePath
+                    });
+                }
             }
             catch (Exception ex)
             {
@@ -559,6 +694,39 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Manual focus nudge, bound to the Focus panel's Near/Far buttons.
+    /// <paramref name="step"/> is a MicroCapture.Core.Interfaces.FocusStep name
+    /// (e.g. "NearSmall", "FarLarge") passed as the button's CommandParameter.</summary>
+    [RelayCommand]
+    private async Task NudgeFocusAsync(string step)
+    {
+        if (!IsConnected) { StatusText = "Connect the camera before adjusting focus."; return; }
+        try
+        {
+            var parsed = Enum.Parse<MicroCapture.Core.Interfaces.FocusStep>(step);
+            await _cameraService.NudgeFocusAsync(parsed);
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Focus adjustment failed: {ex.Message}";
+        }
+    }
+
+    [RelayCommand]
+    private async Task TriggerAutoFocusAsync()
+    {
+        if (!IsConnected) { StatusText = "Connect the camera before triggering autofocus."; return; }
+        try
+        {
+            await _cameraService.TriggerAutoFocusAsync();
+            StatusText = "Autofocus triggered.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Autofocus failed: {ex.Message}";
+        }
+    }
+
     [RelayCommand]
     private async Task ExportBatchAsync()
     {
@@ -631,22 +799,68 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Number of fixed frames the active batch is currently calibrated with, or 1 for
+    /// an ordinary (non-fixed-frame) batch — used to decide how many placeholder thumbnails one
+    /// capture should produce.</summary>
+    private int GetCurrentFixedFrameCount()
+    {
+        if (!IsFixedFrameBatch || _currentBatchId == null) return 1;
+        var batch = _dbContext.Batches.Find(_currentBatchId);
+        if (batch?.UseFixedFrames != true || string.IsNullOrWhiteSpace(batch.FixedFrames)) return 1;
+        var count = MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames).Length;
+        return count > 0 ? count : 1;
+    }
+
+    // Parsed fixed-frame geometry for the active batch, read by MainWindow.axaml.cs to draw a
+    // read-only outline over the live view. Kept as a small cache (refreshed only when the
+    // active batch's frames actually change) rather than re-parsing FixedFrames on every ~30fps
+    // live-view frame.
+    public MicroCapture.Processing.FixedFrameRect[] CurrentFixedFrames { get; private set; } = Array.Empty<MicroCapture.Processing.FixedFrameRect>();
+    public int CurrentFixedFrameImageWidth { get; private set; }
+    public int CurrentFixedFrameImageHeight { get; private set; }
+
+    private void RefreshFixedFrameCache(Batch? batch)
+    {
+        if (batch != null && batch.UseFixedFrames && !string.IsNullOrWhiteSpace(batch.FixedFrames))
+        {
+            CurrentFixedFrames = MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames);
+            CurrentFixedFrameImageWidth = batch.FixedFrameImageWidth;
+            CurrentFixedFrameImageHeight = batch.FixedFrameImageHeight;
+        }
+        else
+        {
+            CurrentFixedFrames = Array.Empty<MicroCapture.Processing.FixedFrameRect>();
+            CurrentFixedFrameImageWidth = 0;
+            CurrentFixedFrameImageHeight = 0;
+        }
+        OnPropertyChanged(nameof(CurrentFixedFrames));
+    }
+
     private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false)
     {
+        var frameCount = GetCurrentFixedFrameCount();
         Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
             try
             {
-                using var stream = File.OpenRead(filePath);
-                var thumb = Bitmap.DecodeToWidth(stream, 120);
-                RecentCaptures.Insert(0, new ThumbnailItem
+                var bytes = File.ReadAllBytes(filePath);
+
+                // Inserted in reverse so frame 0 ends up first/leftmost in the strip.
+                for (var i = frameCount - 1; i >= 0; i--)
                 {
-                    JobId = jobId,
-                    PageNumber = pageNumber,
-                    Thumbnail = thumb,
-                    Status = isRecapture ? "Recapturing" : "Processing",
-                    FilePath = filePath
-                });
+                    using var stream = new MemoryStream(bytes);
+                    var thumb = Bitmap.DecodeToWidth(stream, 120);
+                    RecentCaptures.Insert(0, new ThumbnailItem
+                    {
+                        JobId = jobId,
+                        PageNumber = pageNumber,
+                        FrameIndex = i,
+                        Thumbnail = thumb,
+                        BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
+                        Status = isRecapture ? "Recapturing" : "Processing",
+                        FilePath = filePath
+                    });
+                }
 
                 // Keep last 20 thumbnails to avoid memory buildup
                 while (RecentCaptures.Count > 20)
@@ -701,8 +915,13 @@ public partial class MainWindowViewModel : ViewModelBase
             Console.Error.WriteLine($"Processed-derivative cleanup failed for '{item.FilePath}': {ex}");
         }
 
-        item.Thumbnail?.Dispose();
-        RecentCaptures.Remove(item);
+        // A fixed-frame capture has one thumbnail per frame sharing this JobId — deleting the
+        // underlying job (above) affects all of them together, so the thumbnail strip must too.
+        foreach (var sibling in RecentCaptures.Where(t => t.JobId == item.JobId).ToList())
+        {
+            sibling.Thumbnail?.Dispose();
+            RecentCaptures.Remove(sibling);
+        }
         StatusText = $"Page {item.PageNumber:D6} removed.";
     }
 
@@ -755,6 +974,13 @@ public partial class ThumbnailItem : ObservableObject
     [ObservableProperty] private Bitmap? _thumbnail;
     [ObservableProperty] private string _status = "Captured";
     [ObservableProperty] private string _filePath = "";
+
+    // Which fixed frame this thumbnail represents within its capture (0 for an ordinary,
+    // non-fixed-frame capture — always exactly one thumbnail per job in that case).
+    [ObservableProperty] private int _frameIndex;
+    // Non-null only for fixed-frame captures — colors the thumbnail's border to match its
+    // on-canvas frame. Null for ordinary captures, which keep the default neutral border.
+    [ObservableProperty] private Avalonia.Media.IBrush? _borderColor;
 }
 
 public partial class CameraControlItem : ObservableObject

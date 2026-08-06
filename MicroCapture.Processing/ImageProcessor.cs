@@ -10,6 +10,12 @@ namespace MicroCapture.Processing;
 /// <see cref="DocumentBoundary"/> and <see cref="LiveFrameCheck"/>).</summary>
 public readonly record struct CropPoint(double X, double Y);
 
+/// <summary>One operator-calibrated fixed-frame rectangle, in the pixel space of the image it
+/// was calibrated against (see Batch.FixedFrameImageWidth/Height). Unlike <see cref="CropPoint"/>
+/// quads, fixed frames are always axis-aligned — no perspective correction, since they exist
+/// for a stationary, straight-down copy-stand shot.</summary>
+public readonly record struct FixedFrameRect(double X, double Y, double Width, double Height);
+
 /// <summary>Document boundary detected in a still image, in that image's own pixel coordinates.
 /// <see cref="Quad"/> is populated when the detected contour approximated a clean
 /// quadrilateral (ordered top-left, top-right, bottom-right, bottom-left) — the UI should
@@ -244,12 +250,107 @@ public class ImageProcessor
         return result;
     }
 
+    /// <summary>Crops one captured frame into N independent output files using a batch's
+    /// pre-calibrated fixed rectangles, instead of per-shot contour detection. No confidence
+    /// gating and no perspective warp — every defined rectangle is always cropped and saved
+    /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
+    /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec)
+    {
+        var result = new ProcessingResult { OriginalFilePath = inputPath };
+
+        if (!File.Exists(inputPath))
+        {
+            result.Success = false;
+            result.Errors.Add($"Input file not found: {inputPath}");
+            return result;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(outputDirectory);
+            using var src = Cv2.ImRead(inputPath, ImreadModes.Color);
+            if (src.Empty())
+            {
+                result.Success = false;
+                result.Errors.Add("Failed to decode image.");
+                return result;
+            }
+
+            var frames = ParseFixedFrames(fixedFramesSpec);
+            if (frames.Length == 0)
+            {
+                result.Success = false;
+                result.Errors.Add("Batch has no calibrated fixed frames.");
+                return result;
+            }
+
+            var padWidth = Math.Max(2, frames.Length.ToString(CultureInfo.InvariantCulture).Length);
+            for (var i = 0; i < frames.Length; i++)
+            {
+                var rect = ClampRectToBounds(new Rect(
+                    (int)Math.Round(frames[i].X), (int)Math.Round(frames[i].Y),
+                    (int)Math.Round(frames[i].Width), (int)Math.Round(frames[i].Height)), src.Cols, src.Rows);
+
+                using var cropped = src[rect].Clone();
+                var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
+                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true);
+
+                var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
+                var outPath = Path.Combine(outputDirectory, outName);
+                Cv2.ImWrite(outPath, processed);
+                result.OutputFilePaths.Add(outPath);
+
+                result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
+                result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
+                result.BlurScore = frameResult.BlurScore;
+                result.ExposureScore = frameResult.ExposureScore;
+            }
+
+            result.Success = true;
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Warnings.Add($"Fixed-frame processing failed: {ex.Message}");
+            result.Errors.Add(ex.Message);
+        }
+
+        return result;
+    }
+
     /// <summary>UI-facing, OpenCvSharp-free equivalent of <see cref="ParseCropCorners"/> — same
     /// parsing rules (legacy rect or new quad format, full-frame fallback), used by Crop Review
     /// to restore a previously saved crop shape so there's exactly one implementation of what a
     /// saved crop string means.</summary>
     public static CropPoint[] ParseCropShape(string cropStr, int maxW, int maxH) =>
         ParseCropCorners(cropStr, maxW, maxH).Select(p => new CropPoint(p.X, p.Y)).ToArray();
+
+    /// <summary>Parses a batch's saved fixed-frame spec — "X,Y,W,H" rectangles joined by ';'
+    /// (see <see cref="FormatFixedFrames"/>) — back into individual rects. Malformed entries are
+    /// skipped rather than aborting the whole batch's frames.</summary>
+    public static FixedFrameRect[] ParseFixedFrames(string spec)
+    {
+        var frames = new List<FixedFrameRect>();
+        foreach (var part in spec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                var n = part.Split(',').Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+                if (n.Length == 4)
+                    frames.Add(new FixedFrameRect(n[0], n[1], n[2], n[3]));
+            }
+            catch { /* skip malformed entry */ }
+        }
+        return frames.ToArray();
+    }
+
+    /// <summary>Inverse of <see cref="ParseFixedFrames"/> — the format <see cref="FrameCalibrationViewModel"/>
+    /// (MicroCapture.UI) saves onto Batch.FixedFrames.</summary>
+    public static string FormatFixedFrames(IEnumerable<FixedFrameRect> frames) =>
+        string.Join(";", frames.Select(f => string.Join(",",
+            f.X.ToString("F1", CultureInfo.InvariantCulture), f.Y.ToString("F1", CultureInfo.InvariantCulture),
+            f.Width.ToString("F1", CultureInfo.InvariantCulture), f.Height.ToString("F1", CultureInfo.InvariantCulture))));
 
     /// <summary>Parses a saved crop shape into its 4 corners (top-left, top-right,
     /// bottom-right, bottom-left). Accepts either the legacy 4-number "x,y,w,h" rect format

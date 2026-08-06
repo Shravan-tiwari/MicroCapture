@@ -32,6 +32,10 @@ public sealed class CameraSettingOption
     public string DisplayName { get; init; } = string.Empty;
 }
 
+/// <summary>Manual focus-drive step size, mirroring EDSDK's EvfDriveLens near/far increments
+/// (used during live view, the same mechanism EOS Utility's remote-focus arrows use).</summary>
+public enum FocusStep { NearSmall, NearMedium, NearLarge, FarSmall, FarMedium, FarLarge }
+
 public interface ICameraService : IDisposable
 {
     // Connection
@@ -52,6 +56,12 @@ public interface ICameraService : IDisposable
     // connected body/lens; callers must not assume a fixed set of values.
     Task<IReadOnlyList<CameraSetting>> GetCameraSettingsAsync();
     Task SetCameraSettingAsync(string settingKey, uint value);
+
+    // Manual focus control during live view — operator-driven, since AF mode alone (One-Shot/
+    // AI Servo) gives no way to nudge or force a refocus on demand. Implementations that can't
+    // support this (e.g. a body-less test double) should treat these as safe no-ops.
+    Task NudgeFocusAsync(FocusStep step);
+    Task TriggerAutoFocusAsync();
 
     // Capture
     Task<string> CaptureAsync(string outputDirectory, string fileNamePrefix);

@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:conv="using:MicroCapture.UI.Converters"
+        xmlns:core="using:MicroCapture.Core.Interfaces"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="1400" d:DesignHeight="800"
@@ -34,8 +35,16 @@
                              BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
                     <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages"
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <CheckBox IsChecked="{Binding UseFixedFrames}" Content="Use Fixed Frames"
+                              ToolTip.Tip="Crop every capture in this batch to operator-calibrated fixed rectangles instead of per-shot auto-detection"
+                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
+                              Width="90" ToolTip.Tip="Default export format for the next batch"/>
                     <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
                             Margin="6,0,0,0"/>
+                    <Button Classes="secondary" Command="{Binding CalibrateFramesCommand}"
+                            Content="{Binding CalibrateButtonLabel}"
+                            IsVisible="{Binding ShowCalibrateButton}"/>
                     <Button Classes="secondary" Width="96" Margin="10,0,0,0" Click="OnExportFormatButtonClick"
                             ToolTip.Tip="Export format">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
@@ -57,6 +66,7 @@
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
                     <Button Classes="toggle" Classes.active="{Binding IsAutoCapture}"
                             Command="{Binding ToggleAutoCaptureCommand}"
+                            IsVisible="{Binding IsAutoCaptureAvailable}"
                             Content="AUTO" FontWeight="SemiBold"
                             ToolTip.Tip="Automatically capture once a page is stable, in focus, and different from the last capture"/>
                     <TextBlock Text="{Binding CameraModel}" Foreground="{StaticResource InkSubtleBrush}"
@@ -71,8 +81,11 @@
             <!-- Live View Area -->
             <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
                     BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
-                <Grid>
-                    <Image Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
+                <Grid Name="LiveViewContainer">
+                    <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
+                    <!-- Overlay: active fixed-frame outlines, drawn read-only while shooting so
+                         the operator can position paper before pressing capture. -->
+                    <Canvas Name="FixedFrameOverlayCanvas" Background="Transparent" IsHitTestVisible="False"/>
                     <!-- Overlay: readiness badge -->
                     <Border Background="#cc0f1011" HorizontalAlignment="Left" VerticalAlignment="Top"
                             Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"
@@ -115,17 +128,37 @@
                                     <Grid ColumnDefinitions="*, 120" Margin="0,3">
                                         <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkSubtleBrush}"
                                                    VerticalAlignment="Center" FontSize="13"/>
-                                        <Button Grid.Column="1" Classes="secondary" Click="OnCameraControlButtonClick"
-                                                HorizontalAlignment="Stretch" Padding="10,7">
-                                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
-                                                <TextBlock Text="{Binding SelectedOption.DisplayName}" FontSize="13"/>
-                                                <TextBlock Text="▾" FontSize="11" Opacity="0.7" Foreground="{StaticResource InkSubtleBrush}"/>
-                                            </StackPanel>
-                                        </Button>
+                                        <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
+                                                  IsEnabled="{Binding !IsBusy}" HorizontalAlignment="Stretch">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate x:DataType="core:CameraSettingOption">
+                                                    <TextBlock Text="{Binding DisplayName}" FontSize="13"/>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
                                     </Grid>
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
+
+                        <TextBlock Text="FOCUS" Classes="sectionLabel" Margin="0,4,0,0"/>
+                        <StackPanel Orientation="Horizontal" Spacing="4" HorizontalAlignment="Stretch">
+                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="FarLarge"
+                                    ToolTip.Tip="Focus farther — large step" Content="◀◀"/>
+                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="FarSmall"
+                                    ToolTip.Tip="Focus farther — small step" Content="◀"/>
+                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    Command="{Binding TriggerAutoFocusCommand}"
+                                    ToolTip.Tip="Trigger one autofocus attempt now" Content="AF"/>
+                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="NearSmall"
+                                    ToolTip.Tip="Focus nearer — small step" Content="▶"/>
+                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="NearLarge"
+                                    ToolTip.Tip="Focus nearer — large step" Content="▶▶"/>
+                        </StackPanel>
 
                         <!-- Capture Button -->
                         <Button Classes="primary" Command="{Binding CaptureCommand}"
@@ -178,8 +211,9 @@
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
                             <Grid Classes="thumb" Width="100">
-                                <Button Background="{StaticResource Surface2Brush}" BorderBrush="{StaticResource HairlineBrush}"
-                                        BorderThickness="1" CornerRadius="8" Padding="6"
+                                <Button Background="{StaticResource Surface2Brush}"
+                                        BorderBrush="{Binding BorderColor, TargetNullValue={StaticResource HairlineBrush}}"
+                                        BorderThickness="2" CornerRadius="8" Padding="6"
                                         ToolTip.Tip="Open crop review"
                                         Click="OnThumbnailClick"
                                         Tag="{Binding JobId}">

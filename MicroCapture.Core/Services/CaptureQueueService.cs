@@ -48,6 +48,11 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "ManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "LeftCropBox", "TEXT NULL");
         EnsureColumn("CaptureJobs", "RightCropBox", "TEXT NULL");
+        EnsureColumn("Batches", "UseFixedFrames", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("Batches", "FixedFrames", "TEXT NULL");
+        EnsureColumn("Batches", "FixedFrameImageWidth", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("Batches", "FixedFrameImageHeight", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("Batches", "PreferredExportFormat", "TEXT NOT NULL DEFAULT 'PDF'");
     }
 
     private void EnsureColumn(string table, string column, string definition)

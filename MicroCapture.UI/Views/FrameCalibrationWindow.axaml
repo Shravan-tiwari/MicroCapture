@@ -1,0 +1,64 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.FrameCalibrationWindow"
+        x:DataType="vm:FrameCalibrationViewModel"
+        Title="Calibrate Fixed Frames"
+        Width="1280" Height="760"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource CanvasBrush}">
+    <Grid RowDefinitions="*, Auto">
+        <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
+            <!-- Interactive calibration canvas -->
+            <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="1" Margin="14" CornerRadius="10" ClipToBounds="True">
+                <Grid Name="ContainerGrid">
+                    <Image Name="TargetImage"
+                           Source="{Binding Image}"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
+                    <Canvas Name="OverlayCanvas"
+                            Background="Transparent"
+                            HorizontalAlignment="Stretch"
+                            VerticalAlignment="Stretch"/>
+                </Grid>
+            </Border>
+
+            <!-- Frame list / instructions -->
+            <Border Grid.Column="1" Classes="panel" Margin="0,14,14,14" Padding="14">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="FIXED FRAMES" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
+                    <TextBlock TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}"
+                               Text="Drag a corner or edge to resize a frame, drag inside it to move. Click a frame to select it, then use Remove to delete it."/>
+                    <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="Frames defined" Foreground="{StaticResource InkTertiaryBrush}" FontSize="13"/>
+                            <TextBlock Text="{Binding Frames.Count}" Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" FontSize="13"/>
+                        </StackPanel>
+                    </Border>
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Button Content="Add Frame" Command="{Binding AddFrameCommand}" Classes="secondary"/>
+                        <Button Content="Remove Selected" Command="{Binding RemoveFrameCommand}" Classes="secondary"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- Bottom action bar -->
+        <Border Grid.Row="1" Classes="panel" Margin="14,0,14,14" Padding="16,12">
+            <Grid ColumnDefinitions="*, Auto">
+                <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="13"
+                           Foreground="{StaticResource InkMutedBrush}"
+                           Text="Every capture in this batch will be cropped to exactly these regions — no per-shot detection."/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    <Button Content="Reset" Command="{Binding ResetCommand}" Classes="secondary"/>
+                    <Button Content="Cancel" Command="{Binding CancelCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Classes="secondary"/>
+                    <Button Content="Save" Command="{Binding SaveCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Classes="primary"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using System.Windows.Input;
 using MicroCapture.UI.ViewModels;
 
@@ -20,37 +23,93 @@ public partial class MainWindow : Window
         // was last clicked instead of firing Capture. Intercepting during the tunnel phase
         // (root to focused control, before the focused control's own handling runs) fixes it.
         AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDown, RoutingStrategies.Tunnel);
+        DataContextChanged += OnDataContextChanged;
     }
 
-    private void OnCameraControlButtonClick(object? sender, RoutedEventArgs e)
+    private void OnDataContextChanged(object? sender, EventArgs e)
     {
-        try
+        if (DataContext is MainWindowViewModel vm)
         {
-            if (sender is Button btn && btn.DataContext is CameraControlItem item)
+            // Redrawn alongside every new live-view frame (~30fps while connected) — cheap
+            // (a handful of shapes) and means the overlay is never more than one frame stale
+            // after a (re)calibration, without needing a second change-tracking path.
+            vm.PropertyChanged += (_, ev) =>
             {
-                // Fast, reliable behavior: cycle to the next option on each click.
-                var opts = item.Options;
-                if (opts == null || opts.Count == 0) return;
-                var current = item.SelectedOption;
-                int idx = -1;
-                if (current != null)
-                {
-                    for (int i = 0; i < opts.Count; i++)
-                    {
-                        if (opts[i].Value == current.Value)
-                        {
-                            idx = i; break;
-                        }
-                    }
-                }
-                var next = opts[(idx + 1) % opts.Count];
-                item.SelectedOption = next;
-                Console.WriteLine($"Cycled {item.DisplayName} -> {next.DisplayName}");
-            }
+                if (ev.PropertyName is nameof(vm.LiveViewImage) or nameof(vm.CurrentFixedFrames))
+                    RenderFixedFrameOverlay();
+            };
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>Draws a read-only outline of the active batch's calibrated fixed frames over
+    /// the live view, so the operator can position paper before pressing capture. The
+    /// calibration image and the live-view stream are commonly different resolutions (e.g.
+    /// MockCameraService's 3840x2160 capture vs. its 640x480 live feed), so frame rects are
+    /// projected in two steps: calibration pixels -&gt; fraction of that image, then fraction -&gt;
+    /// the live image's own displayed rect (accounting for Stretch="Uniform" letterboxing).</summary>
+    private void RenderFixedFrameOverlay()
+    {
+        var canvas = this.FindControl<Canvas>("FixedFrameOverlayCanvas");
+        var container = this.FindControl<Grid>("LiveViewContainer");
+        if (canvas == null || container == null) return;
+
+        canvas.Children.Clear();
+        if (DataContext is not MainWindowViewModel vm) return;
+
+        var frames = vm.CurrentFixedFrames;
+        var liveImage = vm.LiveViewImage;
+        if (frames.Length == 0 || vm.CurrentFixedFrameImageWidth <= 0 || vm.CurrentFixedFrameImageHeight <= 0 || liveImage == null)
+            return;
+
+        var containerW = container.Bounds.Width;
+        var containerH = container.Bounds.Height;
+        var imgW = liveImage.Size.Width;
+        var imgH = liveImage.Size.Height;
+        if (containerW <= 0 || containerH <= 0 || imgW <= 0 || imgH <= 0) return;
+
+        var scale = Math.Min(containerW / imgW, containerH / imgH);
+        var dispW = imgW * scale;
+        var dispH = imgH * scale;
+        var offsetX = (containerW - dispW) / 2.0;
+        var offsetY = (containerH - dispH) / 2.0;
+
+        for (var i = 0; i < frames.Length; i++)
         {
-            Console.Error.WriteLine($"CameraControl button click failed: {ex}");
+            var f = frames[i];
+            var fx = f.X / vm.CurrentFixedFrameImageWidth;
+            var fy = f.Y / vm.CurrentFixedFrameImageHeight;
+            var fw = f.Width / vm.CurrentFixedFrameImageWidth;
+            var fh = f.Height / vm.CurrentFixedFrameImageHeight;
+
+            var left = offsetX + fx * dispW;
+            var top = offsetY + fy * dispH;
+            var width = Math.Max(0, fw * dispW);
+            var height = Math.Max(0, fh * dispH);
+            var color = FixedFrameColorPalette.GetColor(i);
+
+            var outline = new Rectangle
+            {
+                Width = width,
+                Height = height,
+                Stroke = new SolidColorBrush(color),
+                StrokeThickness = 2
+            };
+            Canvas.SetLeft(outline, left);
+            Canvas.SetTop(outline, top);
+            canvas.Children.Add(outline);
+
+            var label = new TextBlock
+            {
+                Text = (i + 1).ToString(),
+                Foreground = Brushes.White,
+                Background = new SolidColorBrush(color),
+                Padding = new Thickness(4, 1),
+                FontSize = 11,
+                FontWeight = FontWeight.SemiBold
+            };
+            Canvas.SetLeft(label, left + 3);
+            Canvas.SetTop(label, top + 3);
+            canvas.Children.Add(label);
         }
     }
 
