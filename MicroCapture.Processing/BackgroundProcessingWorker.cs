@@ -81,10 +81,10 @@ public class BackgroundProcessingWorker
 
                     bool splitPages = job.Batch?.SplitBookPages ?? false;
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
-                    int dpi = job.Batch?.Dpi ?? 300;
+                    var metadata = new TiffMetadata(job.Batch?.Dpi ?? 300, job.Batch?.Operator, job.Timestamp);
                     var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, dpi)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, dpi);
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {

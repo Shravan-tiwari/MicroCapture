@@ -1,9 +1,18 @@
 using System;
 using System.Globalization;
 using System.IO;
+using BitMiracle.LibTiff.Classic;
 using OpenCvSharp;
 
 namespace MicroCapture.Processing;
+
+/// <summary>Per-page metadata written into every processed TIFF's own tags — DPI (resolution),
+/// Author (the batch's operator), and the actual capture timestamp — so the file's Properties
+/// aren't blank or defaulted to a meaningless 96 DPI.</summary>
+public readonly record struct TiffMetadata(int Dpi, string? Author, DateTime TimestampUtc)
+{
+    public static TiffMetadata Default => new(300, null, DateTime.UtcNow);
+}
 
 /// <summary>A single crop-shape corner, in an image's own pixel coordinates. OpenCvSharp-free
 /// so it can safely cross into the UI project (mirrors the existing DTO pattern used by
@@ -123,9 +132,10 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, int dpi = 300)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
+        var meta = metadata ?? TiffMetadata.Default;
 
         if (!File.Exists(inputPath))
         {
@@ -174,7 +184,7 @@ public class ImageProcessor
                 using var leftMat = WarpQuad(src, leftCorners);
                 var leftResult = ProcessSinglePage(leftMat, result, manualOverride);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                WriteTiff(outLeft, leftResult, dpi);
+                WriteTiff(outLeft, leftResult, meta);
                 result.OutputFilePaths.Add(outLeft);
                 leftResult.Dispose();
 
@@ -182,7 +192,7 @@ public class ImageProcessor
                 using var rightMat = WarpQuad(src, rightCorners);
                 var rightResult = ProcessSinglePage(rightMat, result, manualOverride);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                WriteTiff(outRight, rightResult, dpi);
+                WriteTiff(outRight, rightResult, meta);
                 result.OutputFilePaths.Add(outRight);
                 rightResult.Dispose();
 
@@ -203,7 +213,7 @@ public class ImageProcessor
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, dpi);
+                WriteTiff(outPath, processed, meta);
                 result.OutputFilePaths.Add(outPath);
                 result.Success = true;
                 processed.Dispose();
@@ -260,9 +270,10 @@ public class ImageProcessor
     /// gating and no perspective warp — every defined rectangle is always cropped and saved
     /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
     /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, int dpi = 300)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
+        var meta = metadata ?? TiffMetadata.Default;
 
         if (!File.Exists(inputPath))
         {
@@ -303,7 +314,7 @@ public class ImageProcessor
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, dpi);
+                WriteTiff(outPath, processed, meta);
                 result.OutputFilePaths.Add(outPath);
 
                 result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
@@ -328,11 +339,32 @@ public class ImageProcessor
     /// file's own resolution metadata is correct instead of absent (Explorer/Photoshop default
     /// an untagged TIFF to 96 DPI, which has nothing to do with what was actually captured).
     /// This only changes the resolution tag — it does not resample or add pixel detail.</summary>
-    private static void WriteTiff(string path, Mat mat, int dpi) =>
+    private static void WriteTiff(string path, Mat mat, TiffMetadata metadata)
+    {
         Cv2.ImWrite(path, mat,
             new ImageEncodingParam(ImwriteFlags.TiffResUnit, 2), // 2 = RESUNIT_INCH (libtiff)
-            new ImageEncodingParam(ImwriteFlags.TiffXDpi, dpi),
-            new ImageEncodingParam(ImwriteFlags.TiffYDpi, dpi));
+            new ImageEncodingParam(ImwriteFlags.TiffXDpi, metadata.Dpi),
+            new ImageEncodingParam(ImwriteFlags.TiffYDpi, metadata.Dpi));
+
+        // OpenCV's own TIFF writer has no support for Artist/Software/DateTime tags — reopen
+        // the file it just wrote (pixel data untouched) purely to add them, the same operation
+        // libtiff's own "tiffset" CLI tool performs. Best-effort: a tag-write failure must
+        // never invalidate an image that was already written successfully.
+        try
+        {
+            using var tiff = Tiff.Open(path, "r+");
+            if (tiff == null) return;
+            tiff.SetField(TiffTag.SOFTWARE, "MicroCapture");
+            tiff.SetField(TiffTag.DATETIME, metadata.TimestampUtc.ToString("yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture));
+            if (!string.IsNullOrWhiteSpace(metadata.Author))
+                tiff.SetField(TiffTag.ARTIST, metadata.Author);
+            tiff.RewriteDirectory();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WriteTiff] Could not write metadata tags for '{path}': {ex}");
+        }
+    }
 
     /// <summary>UI-facing, OpenCvSharp-free equivalent of <see cref="ParseCropCorners"/> — same
     /// parsing rules (legacy rect or new quad format, full-frame fallback), used by Crop Review
