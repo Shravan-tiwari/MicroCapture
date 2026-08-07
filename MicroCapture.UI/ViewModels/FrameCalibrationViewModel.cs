@@ -3,7 +3,6 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using Avalonia.Controls;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -31,8 +30,11 @@ public partial class FrameCalibrationViewModel : ViewModelBase
     private readonly Batch _batch;
     private readonly AppDbContext _dbContext;
 
-    /// <summary>Raised after a successful Save, before the window closes.</summary>
+    /// <summary>Raised after a successful Save.</summary>
     public event EventHandler? Saved;
+
+    /// <summary>Raised when the operator cancels, or Save is invoked with nothing to save.</summary>
+    public event EventHandler? Cancelled;
 
     [ObservableProperty] private Bitmap? _image;
     [ObservableProperty] private int _selectedFrameIndex = -1;
@@ -137,10 +139,10 @@ public partial class FrameCalibrationViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void Cancel(Window window) => window?.Close();
+    private void Cancel() => Cancelled?.Invoke(this, EventArgs.Empty);
 
     [RelayCommand]
-    private async Task Save(Window window)
+    private async Task Save()
     {
         if (Frames.Count > 0 && ImageWidth > 0 && ImageHeight > 0)
         {
@@ -151,8 +153,10 @@ public partial class FrameCalibrationViewModel : ViewModelBase
             await _dbContext.SaveChangesAsync();
             Saved?.Invoke(this, EventArgs.Empty);
         }
-
-        window?.Close();
+        else
+        {
+            Cancelled?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     /// <summary>Resizes <paramref name="current"/> from the given handle to the current pointer

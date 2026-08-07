@@ -11,7 +11,7 @@ using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
 
-public partial class FrameCalibrationWindow : Window
+public partial class FrameCalibrationPanel : UserControl
 {
     private const double HandleHitRadius = 10.0;
     private const double HandleSize = 9.0;
@@ -22,7 +22,7 @@ public partial class FrameCalibrationWindow : Window
     private (int FrameIndex, FrameHandleKind Handle)? _activeDrag;
     private Point _lastImagePointer;
 
-    public FrameCalibrationWindow()
+    public FrameCalibrationPanel()
     {
         InitializeComponent();
         DataContextChanged += OnDataContextChanged;

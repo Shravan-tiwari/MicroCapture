@@ -11,6 +11,15 @@ public class OcrProcessor
 {
     private readonly string _tessDataPath;
 
+    // The CLI's availability/path and the --list-langs preflight result don't change between
+    // calls within a single run of the app, but ProcessImage used to re-check both on every
+    // single invocation (a `which`/`where` spawn plus a --list-langs spawn, ~7s combined) —
+    // cache both process-wide instead of paying that cost per page.
+    private static readonly object PreflightSync = new();
+    private static bool? _cliAvailableCache;
+    private static string? _cliPathCache;
+    private static bool? _listLangsOkCache;
+
     public bool CliAvailable { get; }
 
     public OcrProcessor(string? tessDataPath = null)
@@ -73,73 +82,88 @@ public class OcrProcessor
         {
             if (IsTesseractCliAvailable(out var tesseractPath))
             {
-                // Preflight: ensure the 'eng' language data is available via --list-langs
-                try
+                // Preflight: ensure the 'eng' language data is available via --list-langs.
+                // The CLI/tessdata don't change mid-run, so this only actually spawns the
+                // subprocess once per app session — later calls reuse the cached verdict.
+                lock (PreflightSync)
                 {
-                    var listInfo = new ProcessStartInfo
+                    if (_listLangsOkCache == null)
                     {
-                        FileName = tesseractPath,
-                        Arguments = "--list-langs",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true,
-                    };
+                        try
+                        {
+                            var listInfo = new ProcessStartInfo
+                            {
+                                FileName = tesseractPath,
+                                Arguments = "--list-langs",
+                                UseShellExecute = false,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true,
+                                CreateNoWindow = true,
+                            };
 
-                    if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
-                    {
-                        // Prefer pointing TESSDATA_PREFIX at the actual tessdata directory itself.
-                        string prefix;
-                        if (_tessDataPath.EndsWith("tessdata", StringComparison.OrdinalIgnoreCase))
-                        {
-                            prefix = _tessDataPath;
-                        }
-                        else if (Directory.Exists(Path.Combine(_tessDataPath, "tessdata")))
-                        {
-                            prefix = Path.Combine(_tessDataPath, "tessdata");
-                        }
-                        else if (Directory.Exists(Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata")))
-                        {
-                            prefix = Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata");
-                        }
-                        else
-                        {
-                            prefix = _tessDataPath;
-                        }
+                            if (!string.IsNullOrWhiteSpace(_tessDataPath) && Directory.Exists(_tessDataPath))
+                            {
+                                // Prefer pointing TESSDATA_PREFIX at the actual tessdata directory itself.
+                                string prefix;
+                                if (_tessDataPath.EndsWith("tessdata", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    prefix = _tessDataPath;
+                                }
+                                else if (Directory.Exists(Path.Combine(_tessDataPath, "tessdata")))
+                                {
+                                    prefix = Path.Combine(_tessDataPath, "tessdata");
+                                }
+                                else if (Directory.Exists(Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata")))
+                                {
+                                    prefix = Path.Combine(Path.GetDirectoryName(_tessDataPath) ?? string.Empty, "tessdata");
+                                }
+                                else
+                                {
+                                    prefix = _tessDataPath;
+                                }
 
-                        listInfo.Environment["TESSDATA_PREFIX"] = prefix;
-                    }
+                                listInfo.Environment["TESSDATA_PREFIX"] = prefix;
+                            }
 
-                    using var listProc = Process.Start(listInfo)!;
-                    var listOut = listProc.StandardOutput.ReadToEnd();
-                    var listErr = listProc.StandardError.ReadToEnd();
-                    if (!listProc.WaitForExit(5_000))
-                    {
-                        try { listProc.Kill(); } catch { }
-                    }
+                            using var listProc = Process.Start(listInfo)!;
+                            var listOut = listProc.StandardOutput.ReadToEnd();
+                            var listErr = listProc.StandardError.ReadToEnd();
+                            if (!listProc.WaitForExit(5_000))
+                            {
+                                try { listProc.Kill(); } catch { }
+                            }
 
-                    if (listProc.ExitCode != 0)
-                    {
-                        Console.Error.WriteLine($"Tesseract --list-langs failed: exit {listProc.ExitCode}, out={listOut}, err={listErr}");
-                        if (!allowManaged)
-                            throw new InvalidOperationException($"Tesseract --list-langs failed: {listErr}");
-                        // else we'll fall back to managed wrapper later
-                    }
-                    else
-                    {
-                        var combined = string.Join("\n", new[] { listOut, listErr });
-                        if (!combined.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Any(s => s.Trim() == "eng"))
+                            if (listProc.ExitCode != 0)
+                            {
+                                Console.Error.WriteLine($"Tesseract --list-langs failed: exit {listProc.ExitCode}, out={listOut}, err={listErr}");
+                                _listLangsOkCache = false;
+                                if (!allowManaged)
+                                    throw new InvalidOperationException($"Tesseract --list-langs failed: {listErr}");
+                                // else we'll fall back to managed wrapper later
+                            }
+                            else
+                            {
+                                _listLangsOkCache = true;
+                                var combined = string.Join("\n", new[] { listOut, listErr });
+                                if (!combined.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Any(s => s.Trim() == "eng"))
+                                {
+                                    Console.Error.WriteLine($"Tesseract --list-langs output did not include 'eng': out={listOut}, err={listErr}");
+                                    // Do not fail here: the CLI may still work. Only warn and continue.
+                                }
+                            }
+                        }
+                        catch (Exception preEx)
                         {
-                            Console.Error.WriteLine($"Tesseract --list-langs output did not include 'eng': out={listOut}, err={listErr}");
-                            // Do not fail here: the CLI may still work. Only warn and continue.
+                            Console.Error.WriteLine($"Tesseract preflight check failed: {preEx}");
+                            _listLangsOkCache = false;
+                            if (!allowManaged)
+                                throw;
                         }
                     }
-                }
-                catch (Exception preEx)
-                {
-                    Console.Error.WriteLine($"Tesseract preflight check failed: {preEx}");
-                    if (!allowManaged)
-                        throw;
+                    else if (_listLangsOkCache == false && !allowManaged)
+                    {
+                        throw new InvalidOperationException("Tesseract --list-langs failed on a previous check (cached).");
+                    }
                 }
 
                 // Run tesseract writing output to a temp base name to avoid write-permission issues
@@ -277,6 +301,24 @@ public class OcrProcessor
     }
 
     private static bool IsTesseractCliAvailable(out string path)
+    {
+        lock (PreflightSync)
+        {
+            if (_cliAvailableCache.HasValue)
+            {
+                path = _cliPathCache ?? "tesseract";
+                return _cliAvailableCache.Value;
+            }
+
+            var result = ResolveTesseractCli(out var resolvedPath);
+            _cliAvailableCache = result;
+            _cliPathCache = resolvedPath;
+            path = resolvedPath;
+            return result;
+        }
+    }
+
+    private static bool ResolveTesseractCli(out string path)
     {
         path = "tesseract"; // rely on PATH by default
         var isWindows = OperatingSystem.IsWindows();

@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
+using MicroCapture.Core.Services;
 using OpenCvSharp;
 using SkiaSharp;
 
@@ -43,12 +44,7 @@ public class BatchExportService
         // A recapture landing while the prior attempt is still InProgress can otherwise
         // leave both attempts "Completed" for the same page — exclude anything marked
         // Superseded and keep only the latest attempt per page as a second safety net.
-        var jobsToExport = batch.Captures
-            .Where(j => j.ProcessingStatus == "Completed" && j.ExportStatus != "Superseded")
-            .GroupBy(j => j.PageNumber)
-            .Select(group => group.OrderByDescending(j => j.Timestamp).First())
-            .OrderBy(j => j.PageNumber)
-            .ToList();
+        var jobsToExport = CaptureQueueService.GetCompletedJobsForBatch(batch.Captures);
 
         if (batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
             throw new InvalidOperationException("Images are still being processed.");
@@ -173,7 +169,10 @@ public class BatchExportService
         }
     }
 
-    private List<string> GetProcessedFilesForJob(CaptureJob job)
+    /// <summary>Deterministically resolves a job's processed output file(s) on disk from its
+    /// original capture path — shared with <see cref="BatchOcrService"/> so both locate exactly
+    /// the same files without duplicating the glob logic.</summary>
+    internal static List<string> GetProcessedFilesForJob(CaptureJob job)
     {
         var dir = Path.GetDirectoryName(job.OriginalFilePath) ?? ".";
         var processedDir = Path.Combine(dir, "Processed");

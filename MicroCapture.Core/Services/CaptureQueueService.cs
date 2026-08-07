@@ -114,6 +114,27 @@ public class CaptureQueueService
             .ToListAsync();
     }
 
+    /// <summary>The batch's final page set: latest non-superseded, successfully processed
+    /// capture per page number — i.e. exactly what export will ship. Shared by export and
+    /// on-demand OCR so both always operate on the same set.</summary>
+    public static List<CaptureJob> GetCompletedJobsForBatch(IEnumerable<CaptureJob> captures) =>
+        captures
+            .Where(j => j.ProcessingStatus == "Completed" && j.ExportStatus != "Superseded")
+            .GroupBy(j => j.PageNumber)
+            .Select(group => group.OrderByDescending(j => j.Timestamp).First())
+            .OrderBy(j => j.PageNumber)
+            .ToList();
+
+    /// <summary>Queries and returns the batch's final page set. See <see cref="GetCompletedJobsForBatch"/>.</summary>
+    public async Task<List<CaptureJob>> GetCompletedJobsForBatchAsync(string batchId)
+    {
+        var captures = await _dbContext.CaptureJobs
+            .AsNoTracking()
+            .Where(j => j.BatchId == batchId)
+            .ToListAsync();
+        return GetCompletedJobsForBatch(captures);
+    }
+
     /// <summary>Recovers work interrupted by an application or power failure.</summary>
     public async Task<int> RecoverInterruptedJobsAsync()
     {

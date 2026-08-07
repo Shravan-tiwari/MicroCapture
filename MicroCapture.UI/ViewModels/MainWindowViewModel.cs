@@ -47,6 +47,18 @@ public partial class MainWindowViewModel : ViewModelBase
     // mid-batch can never retroactively change how the active batch behaves.
     [ObservableProperty] private bool _useFixedFrames = false;
     [ObservableProperty] private bool _isFixedFrameBatch = false;
+    [ObservableProperty] private bool _isCalibrating;
+    [ObservableProperty] private FrameCalibrationViewModel? _calibrationViewModel;
+    // Run OCR and Export Batch must never overlap — both touch the same jobs' OCR/export
+    // status, and a PDF export runs OCR itself first if it isn't already done.
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(RunOcrCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ExportBatchCommand))]
+    private bool _isOcrRunning;
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(RunOcrCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ExportBatchCommand))]
+    private bool _isExporting;
     [ObservableProperty] private string _defaultExportFormat = "PDF";
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
 
@@ -470,64 +482,115 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Opens the fixed-frame calibration screen for the active batch — used both for
+    /// <summary>Opens the fixed-frame calibration panel for the active batch — used both for
     /// first-time calibration (right after Start Batch, if "Use Fixed Frames" was checked) and
     /// for recalibrating an already-fixed-frame batch later (e.g. the rig shifted). Takes one
     /// throwaway full-res shot as the calibration image (never enqueued as a real capture), then
-    /// blocks on the modal calibration window before returning.</summary>
+    /// shows the calibration panel inline in place of live view until it's saved or cancelled.</summary>
     [RelayCommand]
     private async Task CalibrateFramesAsync()
     {
         if (_currentBatchId == null) { StatusText = "Start a batch first."; return; }
         if (!IsConnected) { StatusText = "Connect the camera before calibrating fixed frames."; return; }
-
-        // A job still mid-flight when frames change could otherwise get cropped with the new
-        // geometry instead of the one that was active when it was captured — block rather than
-        // risk that race. Nothing heavier (e.g. a per-job geometry snapshot) is needed: once
-        // this check passes, every already-Completed job is an immutable historical artifact
-        // that nothing reprocesses automatically.
-        var pendingCount = await _dbContext.CaptureJobs.CountAsync(j =>
-            j.BatchId == _currentBatchId && (j.ProcessingStatus == "Pending" || j.ProcessingStatus == "InProgress"));
-        if (pendingCount > 0)
+        // Shares the same re-entrancy guard as Capture/Recapture: without this, an ordinary
+        // Capture click while the calibration shot is in flight would silently queue behind
+        // the camera service's own capture lock for up to that shot's full timeout window.
+        if (Interlocked.Exchange(ref _captureInProgress, 1) != 0)
         {
-            StatusText = $"{pendingCount} page(s) still processing under the current frames — wait for them to finish before recalibrating.";
+            StatusText = "A capture is already in progress.";
             return;
         }
 
-        var batch = await _dbContext.Batches.FindAsync(_currentBatchId);
-        if (batch == null) return;
-
         try
         {
-            var calibrationDir = Path.Combine(_outputDirectory, "Calibration");
-            Directory.CreateDirectory(calibrationDir);
-            StatusText = "Capturing calibration frame...";
-            var calibrationPath = await _cameraService.CaptureAsync(calibrationDir, $"calibration_{DateTime.Now:yyyyMMdd_HHmmss}");
-
-            var calibrationViewModel = new FrameCalibrationViewModel(batch, _dbContext, calibrationPath);
-            var window = new FrameCalibrationWindow { DataContext = calibrationViewModel };
-
-            var saved = false;
-            calibrationViewModel.Saved += (_, _) => saved = true;
-
-            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop
-                && desktop.MainWindow != null)
+            // A job still mid-flight when frames change could otherwise get cropped with the new
+            // geometry instead of the one that was active when it was captured — block rather than
+            // risk that race. Nothing heavier (e.g. a per-job geometry snapshot) is needed: once
+            // this check passes, every already-Completed job is an immutable historical artifact
+            // that nothing reprocesses automatically.
+            var pendingCount = await _dbContext.CaptureJobs.CountAsync(j =>
+                j.BatchId == _currentBatchId && (j.ProcessingStatus == "Pending" || j.ProcessingStatus == "InProgress"));
+            if (pendingCount > 0)
             {
-                await window.ShowDialog(desktop.MainWindow);
-            }
-            else
-            {
-                window.Show();
+                StatusText = $"{pendingCount} page(s) still processing under the current frames — wait for them to finish before recalibrating.";
+                return;
             }
 
-            IsFixedFrameBatch = batch.UseFixedFrames;
-            RefreshFixedFrameCache(batch);
-            StatusText = saved ? "Fixed frames calibrated." : "Calibration cancelled.";
+            var batch = await _dbContext.Batches.FindAsync(_currentBatchId);
+            if (batch == null) return;
+
+            uint? originalQuality = null;
+            var qualityChanged = false;
+
+            try
+            {
+                // The calibration shot always uses plain JPEG, regardless of whatever quality
+                // the operator has selected for real page captures — it's the only format the
+                // calibration panel can load as a Bitmap, and keeps calibration fast even when
+                // the batch itself is shooting RAW.
+                try
+                {
+                    var settings = await _cameraService.GetCameraSettingsAsync();
+                    var qualitySetting = settings.FirstOrDefault(s => s.Key == "ImageQuality");
+                    if (qualitySetting != null)
+                    {
+                        originalQuality = qualitySetting.Value;
+                        var jpegOption = qualitySetting.Options.FirstOrDefault(o => o.DisplayName == "Jpeg Large Fine")
+                            ?? qualitySetting.Options.FirstOrDefault(o => o.DisplayName.StartsWith("Jpeg ") && !o.DisplayName.Contains('+'));
+                        if (jpegOption != null && jpegOption.Value != originalQuality.Value)
+                        {
+                            await _cameraService.SetCameraSettingAsync("ImageQuality", jpegOption.Value);
+                            qualityChanged = true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[CalibrateFramesAsync] Could not force JPEG quality for calibration shot: {ex}");
+                }
+
+                var calibrationDir = Path.Combine(_outputDirectory, "Calibration");
+                Directory.CreateDirectory(calibrationDir);
+                StatusText = "Capturing calibration frame...";
+                var calibrationPath = await _cameraService.CaptureAsync(calibrationDir, $"calibration_{DateTime.Now:yyyyMMdd_HHmmss}");
+
+                var calibrationViewModel = new FrameCalibrationViewModel(batch, _dbContext, calibrationPath);
+                var tcs = new TaskCompletionSource<bool>();
+                calibrationViewModel.Saved += (_, _) => tcs.TrySetResult(true);
+                calibrationViewModel.Cancelled += (_, _) => tcs.TrySetResult(false);
+
+                CalibrationViewModel = calibrationViewModel;
+                IsCalibrating = true;
+
+                var saved = await tcs.Task;
+
+                IsCalibrating = false;
+                CalibrationViewModel = null;
+
+                IsFixedFrameBatch = batch.UseFixedFrames;
+                RefreshFixedFrameCache(batch);
+                StatusText = saved ? "Fixed frames calibrated." : "Calibration cancelled.";
+            }
+            catch (Exception ex)
+            {
+                IsCalibrating = false;
+                CalibrationViewModel = null;
+                StatusText = $"Calibration failed: {ex.Message}";
+            }
+            finally
+            {
+                if (qualityChanged && originalQuality.HasValue)
+                {
+                    try { await _cameraService.SetCameraSettingAsync("ImageQuality", originalQuality.Value); }
+                    catch (Exception restoreEx)
+                    {
+                        Console.Error.WriteLine($"[CalibrateFramesAsync] Could not restore original image quality: {restoreEx}");
+                        StatusText += " (warning: could not restore original image quality — check camera settings)";
+                    }
+                }
+            }
         }
-        catch (Exception ex)
-        {
-            StatusText = $"Calibration failed: {ex.Message}";
-        }
+        finally { Volatile.Write(ref _captureInProgress, 0); }
     }
 
     /// <summary>Rebuilds the thumbnail strip from a resumed batch's most recent, non-superseded capture per page.</summary>
@@ -587,6 +650,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (Interlocked.Exchange(ref _captureInProgress, 1) != 0) return;
         try
         {
+        if (IsCalibrating) { StatusText = "Finish or cancel calibration before capturing."; return; }
         if (!IsConnected) { StatusText = "Camera not connected"; return; }
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
@@ -628,6 +692,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (Interlocked.Exchange(ref _captureInProgress, 1) != 0) return;
         try
         {
+        if (IsCalibrating) { StatusText = "Finish or cancel calibration before capturing."; return; }
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
         var pageStr = PageCount.ToString("D6");
@@ -727,7 +792,56 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    [RelayCommand]
+    private bool CanRunOcrOrExport() => !IsOcrRunning && !IsExporting;
+
+    [RelayCommand(CanExecute = nameof(CanRunOcrOrExport))]
+    private async Task RunOcrAsync()
+    {
+        if (_currentBatchId == null) { StatusText = "Start a batch first."; return; }
+
+        IsOcrRunning = true;
+        try
+        {
+            await RunOcrForCurrentBatchAsync();
+        }
+        finally
+        {
+            IsOcrRunning = false;
+        }
+    }
+
+    /// <summary>Runs OCR for the active batch's finalized page set. Shared by the explicit
+    /// "Run OCR" button and by PDF export (which needs the text before it can embed it) —
+    /// idempotent, since BatchOcrService only touches jobs not already OcrStatus "Completed".</summary>
+    private async Task RunOcrForCurrentBatchAsync()
+    {
+        var ocrService = new MicroCapture.Processing.BatchOcrService(_dbContext);
+        var progress = new Progress<(int Done, int Total)>(p =>
+        {
+            StatusText = p.Total == 0 ? "OCR: nothing to do." : $"OCR: {p.Done}/{p.Total} pages...";
+        });
+        try
+        {
+            await ocrService.RunOcrForBatchAsync(_currentBatchId!, progress);
+            StatusText = "OCR complete.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"OCR failed: {ex.Message}";
+        }
+
+        // Refresh OcrStatus on whatever thumbnails are currently visible for this batch.
+        var refreshed = await _dbContext.CaptureJobs.AsNoTracking()
+            .Where(j => j.BatchId == _currentBatchId)
+            .ToDictionaryAsync(j => j.Id, j => j.OcrStatus);
+        foreach (var thumbnail in RecentCaptures)
+        {
+            if (refreshed.TryGetValue(thumbnail.JobId, out var ocrStatus))
+                thumbnail.OcrStatus = ocrStatus;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunOcrOrExport))]
     private async Task ExportBatchAsync()
     {
         if (_currentBatchId == null)
@@ -736,9 +850,18 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
+        IsExporting = true;
         try
         {
+            // Only PDF export ever reads OCR text (a near-invisible searchable text layer) —
+            // TIFF/JPG/PNG export never touches it, so skip straight to export for those.
+            if (string.Equals(ExportFormat, "PDF", StringComparison.OrdinalIgnoreCase))
+            {
+                StatusText = "Preparing searchable text...";
+                await RunOcrForCurrentBatchAsync();
+            }
+
+            StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
             var exportService = new MicroCapture.Processing.BatchExportService(_dbContext);
             var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
             StatusText = $"Exported successfully: {Path.GetFileName(exportPath)}";
@@ -750,6 +873,10 @@ public partial class MainWindowViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Export failed: {ex.Message}";
+        }
+        finally
+        {
+            IsExporting = false;
         }
     }
 
@@ -973,6 +1100,9 @@ public partial class ThumbnailItem : ObservableObject
     [ObservableProperty] private string _jobId = "";
     [ObservableProperty] private Bitmap? _thumbnail;
     [ObservableProperty] private string _status = "Captured";
+    // OCR is on-demand (Run OCR / before a PDF export), not automatic on capture, so this is
+    // tracked independently of Status rather than folded into it.
+    [ObservableProperty] private string _ocrStatus = "Pending";
     [ObservableProperty] private string _filePath = "";
 
     // Which fixed frame this thumbnail represents within its capture (0 for an ordinary,

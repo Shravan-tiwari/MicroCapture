@@ -1,6 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
+        xmlns:views="using:MicroCapture.UI.Views"
         xmlns:conv="using:MicroCapture.UI.Converters"
         xmlns:core="using:MicroCapture.Core.Interfaces"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -52,6 +53,8 @@
                             <TextBlock Text="▾" FontSize="11" Opacity="0.7" Foreground="{StaticResource InkSubtleBrush}"/>
                         </StackPanel>
                     </Button>
+                    <Button Classes="secondary" Command="{Binding RunOcrCommand}" Content="Run OCR"
+                            ToolTip.Tip="Run OCR now on this batch's finished pages, so searchable text is ready ahead of a PDF export"/>
                     <Button Classes="secondary" Command="{Binding ExportBatchCommand}" Content="Export Batch"/>
                 </StackPanel>
 
@@ -80,7 +83,8 @@
 
             <!-- Live View Area -->
             <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
-                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+                    IsVisible="{Binding !IsCalibrating}">
                 <Grid Name="LiveViewContainer">
                     <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
                     <!-- Overlay: active fixed-frame outlines, drawn read-only while shooting so
@@ -95,6 +99,13 @@
                                    FontWeight="SemiBold" FontSize="13" />
                     </Border>
                 </Grid>
+            </Border>
+
+            <!-- Inline calibration panel — replaces live view during calibration -->
+            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+                    IsVisible="{Binding IsCalibrating}">
+                <views:FrameCalibrationPanel DataContext="{Binding CalibrationViewModel}"/>
             </Border>
 
             <!-- Right Panel: Status & Settings -->
@@ -161,12 +172,12 @@
                         </StackPanel>
 
                         <!-- Capture Button -->
-                        <Button Classes="primary" Command="{Binding CaptureCommand}"
+                        <Button Classes="primary" Command="{Binding CaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
                                 HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                 Padding="0,15" FontSize="16" Margin="0,6,0,0">
                             CAPTURE
                         </Button>
-                        <Button Classes="secondary" Command="{Binding RecaptureCommand}"
+                        <Button Classes="secondary" Command="{Binding RecaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
                                 HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                 Padding="0,11">
                             RECAPTURE

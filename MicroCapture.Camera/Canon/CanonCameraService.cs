@@ -38,6 +38,13 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
     private readonly object _sync = new();
     private readonly SemaphoreSlim _captureLock = new(1, 1);
+    // Serializes the Connect/Disconnect/Dispose lifecycle as a whole. _sync (a plain Monitor)
+    // can't be held across an await, so without this, EdsTerminateSDK()/EdsCloseSession() in
+    // Dispose()/DisconnectAsync() could run concurrently with an in-flight ConnectAsync's own
+    // native calls — the SDK gets torn down mid-use, which is an unrecoverable native crash no
+    // managed try/catch can stop. SemaphoreSlim has no thread affinity, so it's safe to hold
+    // across the ConfigureAwait(false) continuations this lifecycle code already relies on.
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
     private IntPtr _camera;
     private bool _isConnected;
     private bool _sdkInitialized;
@@ -46,6 +53,7 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private CancellationTokenSource? _liveViewCts;
     private Task? _liveViewTask;
     private TaskCompletionSource<string>? _captureTcs;
+    private bool _captureExpectsRawOnly;
     private string _currentSaveDirectory = string.Empty;
     private string _currentFilePrefix = string.Empty;
     private uint _previousEvfOutputDevice;
@@ -172,8 +180,17 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     public async Task<bool> ConnectAsync(string cameraId)
     {
         if (!_sdkInitialized) return false;
-        await DisconnectAsync().ConfigureAwait(false);
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await DisconnectCoreAsync().ConfigureAwait(false);
+            return ConnectCore(cameraId);
+        }
+        finally { _lifecycleLock.Release(); }
+    }
 
+    private bool ConnectCore(string cameraId)
+    {
         IntPtr list = IntPtr.Zero;
         IntPtr selected = IntPtr.Zero;
         try
@@ -226,6 +243,13 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     }
 
     public async Task DisconnectAsync()
+    {
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+        try { await DisconnectCoreAsync().ConfigureAwait(false); }
+        finally { _lifecycleLock.Release(); }
+    }
+
+    private async Task DisconnectCoreAsync()
     {
         Console.WriteLine("[Disconnect] Started");
 
@@ -300,7 +324,18 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         Task? task;
         lock (_sync) { cts = _liveViewCts; task = _liveViewTask; _liveViewCts = null; _liveViewTask = null; }
         if (cts != null) cts.Cancel();
-        if (task != null) { try { await task.ConfigureAwait(false); } catch (OperationCanceledException) { } catch (Exception ex) { Log("StopLiveViewAsync", ex.ToString()); } }
+        if (task != null)
+        {
+            // Cancellation only takes effect between the loop's native-call blocks, which are
+            // not themselves cancellable — a stalled camera could otherwise block this (and
+            // whatever's waiting on it, e.g. CaptureAsync's pre-shutter sequence) indefinitely.
+            // Time-box it: cancellation was already requested, so the loop will still exit on
+            // its own once that in-flight native call returns, this just stops us waiting on it.
+            try { await task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (TimeoutException) { Log("StopLiveViewAsync", "Timed out waiting for the live-view loop to exit; proceeding anyway."); }
+            catch (Exception ex) { Log("StopLiveViewAsync", ex.ToString()); }
+        }
         cts?.Dispose();
         lock (_sync)
         {
@@ -375,6 +410,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 _isDownloading = true;
                 _currentSaveDirectory = outputDirectory;
                 _currentFilePrefix = filePrefix;
+                uint currentQuality = 0;
+                Call("EdsGetPropertyData(ImageQuality)", () => EDSDK.EdsGetPropertyData(_camera, EDSDK.PropID_ImageQuality, 0, out currentQuality));
+                _captureExpectsRawOnly = IsRawOnlyQuality(currentQuality);
                 tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
                 _captureTcs = tcs;
                 var result = Call("EdsSendCommand(CameraCommand_TakePicture)", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_TakePicture, 0));
@@ -386,7 +424,7 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         }
         finally
         {
-            lock (_sync) { _captureTcs = null; _isDownloading = false; }
+            lock (_sync) { _captureTcs = null; _isDownloading = false; _captureExpectsRawOnly = false; }
             _ = StartLiveViewAsync();
             _captureLock.Release();
         }
@@ -526,7 +564,11 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 }
                 finally { Release(stream, "capture file stream"); }
 
-                if (!isRawFile) tcs?.TrySetResult(path);
+                // A pure-RAW/CRAW/MRAW/SRAW quality setting (no JPEG/HEIF companion) never
+                // produces a non-RAW file to resolve on, so without this the capture would
+                // wait out the full 60s timeout in CaptureAsync. _captureExpectsRawOnly is
+                // computed once per capture from the camera's actual current quality setting.
+                if (!isRawFile || _captureExpectsRawOnly) tcs?.TrySetResult(path);
             }
         }
         catch (Exception ex) { Log("DownloadImageAsync", ex.ToString()); FailCapture(ex); }
@@ -1143,13 +1185,26 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         { 0x00630F83u, "CRAW + HEIF Small2 Fine" },
     };
 
+    /// <summary>True for a quality setting that produces no JPEG/HEIF companion file at all
+    /// (plain RAW/CRAW/MRAW/SRAW) — the only case where a capture must resolve on the RAW
+    /// file itself instead of waiting for a non-RAW file that will never arrive.</summary>
+    private static bool IsRawOnlyQuality(uint value) =>
+        ImageQualityNames.TryGetValue(value, out var name) &&
+        name is "RAW" or "CRAW" or "MRAW(SRAW1)" or "SRAW(SRAW2)";
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        try { DisconnectAsync().GetAwaiter().GetResult(); } catch (Exception ex) { Log("Dispose", ex.ToString()); }
-        if (_sdkInitialized) { try { Call("EdsTerminateSDK", EDSDK.EdsTerminateSDK); } catch (Exception ex) { Log("EdsTerminateSDK", ex.ToString()); } }
+        _lifecycleLock.Wait();
+        try
+        {
+            try { DisconnectCoreAsync().GetAwaiter().GetResult(); } catch (Exception ex) { Log("Dispose", ex.ToString()); }
+            if (_sdkInitialized) { try { Call("EdsTerminateSDK", EDSDK.EdsTerminateSDK); } catch (Exception ex) { Log("EdsTerminateSDK", ex.ToString()); } }
+        }
+        finally { _lifecycleLock.Release(); }
         _captureLock.Dispose();
+        _lifecycleLock.Dispose();
         GC.SuppressFinalize(this);
     }
 }
