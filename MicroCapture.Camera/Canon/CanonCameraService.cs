@@ -32,7 +32,8 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         new("WhiteBalance", "White balance", EDSDK.PropID_WhiteBalance),
         new("ImageQuality", "Image quality", EDSDK.PropID_ImageQuality),
         new("DriveMode", "Drive mode", EDSDK.PropID_DriveMode),
-        new("AFMode", "Focus mode", EDSDK.PropID_AFMode)
+        new("AFMode", "Focus mode", EDSDK.PropID_AFMode),
+        new("ColorSpace", "Color space", EDSDK.PropID_ColorSpace)
     };
     private static readonly object LogSync = new();
     private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
@@ -678,11 +679,19 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             "AFMode" => AfModeNames,
             "AEMode" => AeModeNames,
             "ImageQuality" => ImageQualityNames,
+            "ColorSpace" => ColorSpaceNames,
             _ => null
         };
         if (table != null && table.TryGetValue(value, out var name)) return name;
         return $"0x{value:X}";
     }
+
+    private static readonly Dictionary<uint, string> ColorSpaceNames = new()
+    {
+        { EDSDK.ColorSpace_sRGB, "sRGB" },
+        { EDSDK.ColorSpace_AdobeRGB, "Adobe RGB" },
+        { EDSDK.ColorSpace_Unknown, "Unknown" }
+    };
 
     private static readonly Dictionary<uint, string> TvNames = new()
     {
