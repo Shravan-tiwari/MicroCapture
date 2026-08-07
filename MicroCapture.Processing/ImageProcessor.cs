@@ -51,6 +51,11 @@ public class ImageProcessor
     public int CropPadding { get; set; } = 10;
     public double BlurThreshold { get; set; } = 100.0;
     public double GutterConfidenceThreshold { get; set; } = 0.08;
+    // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
+    // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
+    // read as crisper edges/text, low enough to avoid visible halos on a document scan.
+    public double SharpenAmount { get; set; } = 0.6;
+    public double SharpenSigma { get; set; } = 2.0;
 
     /// <summary>Fast, non-mutating boundary check for live-view auto-capture gating.</summary>
     public static bool IsDocumentDetected(byte[] encodedImage) => CheckLiveFrame(encodedImage).Detected;
@@ -407,6 +412,7 @@ public class ImageProcessor
 
         working = TryDeskew(working, result);
         working = ApplyEnhancement(working);
+        working = Sharpen(working);
         RunQualityChecks(working, result);
 
         return working;
@@ -809,7 +815,11 @@ public class ImageProcessor
         var destination = new[] { new Point2f(0, 0), new Point2f(width - 1, 0), new Point2f(width - 1, height - 1), new Point2f(0, height - 1) };
         using var transform = Cv2.GetPerspectiveTransform(corners, destination);
         var warped = new Mat();
-        Cv2.WarpPerspective(src, warped, transform, new Size(width, height), InterpolationFlags.Linear, BorderTypes.Replicate);
+        // Cubic over the previous Linear: this is the one resample every auto-cropped or
+        // split page goes through, so its softening shows up in every output — cubic keeps
+        // edges/text noticeably crisper at a cost that's negligible next to the rest of the
+        // pipeline (CLAHE, contour detection) on a single document-sized image.
+        Cv2.WarpPerspective(src, warped, transform, new Size(width, height), InterpolationFlags.Cubic, BorderTypes.Replicate);
         return warped;
     }
 
@@ -970,7 +980,7 @@ public class ImageProcessor
             var center = new Point2f(src.Cols / 2f, src.Rows / 2f);
             using var rotMat = Cv2.GetRotationMatrix2D(center, medianAngle, 1.0);
             var rotated = new Mat();
-            Cv2.WarpAffine(src, rotated, rotMat, src.Size(), InterpolationFlags.Linear,
+            Cv2.WarpAffine(src, rotated, rotMat, src.Size(), InterpolationFlags.Cubic,
                 BorderTypes.Constant, Scalar.White);
 
             result.WasDeskewed = true;
@@ -1003,6 +1013,18 @@ public class ImageProcessor
 
         foreach (var ch in channels) ch.Dispose();
         return enhanced;
+    }
+
+    /// <summary>Unsharp mask: blur a copy, then push the source away from that blur. Run last
+    /// in the pipeline (after crop/deskew/enhancement) since every prior resample step softens
+    /// edges a little, and CLAHE's contrast change is what sharpening should read against.</summary>
+    private Mat Sharpen(Mat src)
+    {
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(src, blurred, new Size(0, 0), SharpenSigma);
+        var sharpened = new Mat();
+        Cv2.AddWeighted(src, 1 + SharpenAmount, blurred, -SharpenAmount, 0, sharpened);
+        return sharpened;
     }
 
     // ───────────── QUALITY CONTROL ─────────────
