@@ -62,6 +62,12 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _defaultExportFormat = "PDF";
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
 
+    // DPI is fixed per batch (like fixed frames/split), not changeable per export — every page
+    // processed under this batch gets tagged with it. Metadata only: it documents intended
+    // print/archival resolution, it does not change the pixel dimensions actually captured.
+    [ObservableProperty] private int _selectedDpi = 300;
+    public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
+
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
     // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
@@ -436,6 +442,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 IsFixedFrameBatch = batch.UseFixedFrames;
                 RefreshFixedFrameCache(batch);
                 ExportFormat = batch.PreferredExportFormat;
+                SelectedDpi = batch.Dpi;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -448,7 +455,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     BatchCode = batchCode,
                     Operator = Environment.UserName,
                     SplitBookPages = SplitBookPages && !UseFixedFrames,
-                    PreferredExportFormat = DefaultExportFormat
+                    PreferredExportFormat = DefaultExportFormat,
+                    Dpi = SelectedDpi
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();

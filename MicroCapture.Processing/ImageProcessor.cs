@@ -123,7 +123,7 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, int dpi = 300)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
 
@@ -174,7 +174,7 @@ public class ImageProcessor
                 using var leftMat = WarpQuad(src, leftCorners);
                 var leftResult = ProcessSinglePage(leftMat, result, manualOverride);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                Cv2.ImWrite(outLeft, leftResult);
+                WriteTiff(outLeft, leftResult, dpi);
                 result.OutputFilePaths.Add(outLeft);
                 leftResult.Dispose();
 
@@ -182,7 +182,7 @@ public class ImageProcessor
                 using var rightMat = WarpQuad(src, rightCorners);
                 var rightResult = ProcessSinglePage(rightMat, result, manualOverride);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                Cv2.ImWrite(outRight, rightResult);
+                WriteTiff(outRight, rightResult, dpi);
                 result.OutputFilePaths.Add(outRight);
                 rightResult.Dispose();
 
@@ -203,7 +203,7 @@ public class ImageProcessor
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                Cv2.ImWrite(outPath, processed);
+                WriteTiff(outPath, processed, dpi);
                 result.OutputFilePaths.Add(outPath);
                 result.Success = true;
                 processed.Dispose();
@@ -260,7 +260,7 @@ public class ImageProcessor
     /// gating and no perspective warp — every defined rectangle is always cropped and saved
     /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
     /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, int dpi = 300)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
 
@@ -303,7 +303,7 @@ public class ImageProcessor
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                Cv2.ImWrite(outPath, processed);
+                WriteTiff(outPath, processed, dpi);
                 result.OutputFilePaths.Add(outPath);
 
                 result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
@@ -323,6 +323,16 @@ public class ImageProcessor
 
         return result;
     }
+
+    /// <summary>Writes a processed page as TIFF, tagging it with the batch's chosen DPI so the
+    /// file's own resolution metadata is correct instead of absent (Explorer/Photoshop default
+    /// an untagged TIFF to 96 DPI, which has nothing to do with what was actually captured).
+    /// This only changes the resolution tag — it does not resample or add pixel detail.</summary>
+    private static void WriteTiff(string path, Mat mat, int dpi) =>
+        Cv2.ImWrite(path, mat,
+            new ImageEncodingParam(ImwriteFlags.TiffResUnit, 2), // 2 = RESUNIT_INCH (libtiff)
+            new ImageEncodingParam(ImwriteFlags.TiffXDpi, dpi),
+            new ImageEncodingParam(ImwriteFlags.TiffYDpi, dpi));
 
     /// <summary>UI-facing, OpenCvSharp-free equivalent of <see cref="ParseCropCorners"/> — same
     /// parsing rules (legacy rect or new quad format, full-frame fallback), used by Crop Review

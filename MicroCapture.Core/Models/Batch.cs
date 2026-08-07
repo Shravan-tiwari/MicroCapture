@@ -27,6 +27,11 @@ public class Batch
 
     public string PreferredExportFormat { get; set; } = "PDF";
 
+    // Written into every processed TIFF's resolution tag (dots per inch) for this batch.
+    // This is metadata only — it documents intended print/archival resolution, it does not
+    // change the pixel dimensions the camera actually captured.
+    public int Dpi { get; set; } = 300;
+
     public Project? Project { get; set; }
     public ICollection<CaptureJob> Captures { get; set; } = new List<CaptureJob>();
 }

@@ -41,6 +41,14 @@
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
                               Width="90" ToolTip.Tip="Default export format for the next batch"/>
+                    <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
+                              Width="90" ToolTip.Tip="DPI tagged on every processed TIFF in this batch (resolution metadata only — does not change captured pixel detail)">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
                             Margin="6,0,0,0"/>
                     <Button Classes="secondary" Command="{Binding CalibrateFramesCommand}"

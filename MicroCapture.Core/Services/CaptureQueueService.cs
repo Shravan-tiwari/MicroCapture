@@ -53,6 +53,7 @@ public class CaptureQueueService
         EnsureColumn("Batches", "FixedFrameImageWidth", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "FixedFrameImageHeight", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "PreferredExportFormat", "TEXT NOT NULL DEFAULT 'PDF'");
+        EnsureColumn("Batches", "Dpi", "INTEGER NOT NULL DEFAULT 300");
     }
 
     private void EnsureColumn(string table, string column, string definition)
