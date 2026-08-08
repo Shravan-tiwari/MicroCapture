@@ -32,6 +32,11 @@ public class Batch
     // change the pixel dimensions the camera actually captured.
     public int Dpi { get; set; } = 300;
 
+    // Corrects spine-curvature distortion on bound-book captures (the page bulging away from
+    // flat near the gutter) — a per-column vertical remap, distinct from the perspective/quad
+    // crop every batch already gets. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
+    public bool DewarpEnabled { get; set; } = false;
+
     public Project? Project { get; set; }
     public ICollection<CaptureJob> Captures { get; set; } = new List<CaptureJob>();
 }

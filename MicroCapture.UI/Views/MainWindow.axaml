@@ -45,6 +45,9 @@
                     <CheckBox IsChecked="{Binding UseFixedFrames}" Content="Use Fixed Frames"
                               ToolTip.Tip="Crop every capture in this batch to operator-calibrated fixed rectangles instead of per-shot auto-detection"
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book Curve Correction"
+                              ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight. Runs in the background queue, so it never affects capture speed."
+                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
                               Width="90" ToolTip.Tip="Default export format for the next batch"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"

@@ -30,6 +30,12 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private CropPoint[]? _detectedLeftQuad;
     private CropPoint[]? _detectedRightQuad;
 
+    // A previously-saved manual dewarp curve, if any — seeded into DewarpTopPoints/BottomPoints
+    // the first time the operator opens the curve editor this session. _dewarpTouched tracks
+    // whether they actually did, so Save doesn't write dewarp data nobody looked at.
+    private DewarpModel? _savedDewarp;
+    private bool _dewarpTouched;
+
     // Cached once at load for fast, non-blocking corner-snapping and live preview during
     // interactive dragging — never re-computed per drag frame.
     private IReadOnlyList<CropPoint> _edgePoints = Array.Empty<CropPoint>();
@@ -65,9 +71,11 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private CropPoint[] _leftQuad = new CropPoint[4];
     [ObservableProperty] private CropPoint[] _rightQuad = new CropPoint[4];
 
-    // XAML-facing computed flags for which split sub-editor should be visible.
-    public bool IsLineSplitMode => IsSplitBookPages && !IsTwoQuadSplit;
-    public bool IsQuadSplitMode => IsSplitBookPages && IsTwoQuadSplit;
+    // XAML-facing computed flags for which split sub-editor should be visible. Dewarp mode
+    // takes over the whole overlay when active — the crop shape underneath isn't touched, just
+    // not rendered/draggable while the operator is adjusting curvature instead.
+    public bool IsLineSplitMode => IsSplitBookPages && !IsTwoQuadSplit && !IsDewarpMode;
+    public bool IsQuadSplitMode => IsSplitBookPages && IsTwoQuadSplit && !IsDewarpMode;
 
     partial void OnIsSplitBookPagesChanged(bool value)
     {
@@ -80,6 +88,34 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(IsLineSplitMode));
         OnPropertyChanged(nameof(IsQuadSplitMode));
     }
+
+    // Book-curve control points, in the *downscaled crop preview's* own pixel space (see
+    // CropPreviewRenderer.Scale) — not the original image's coordinates, since dewarp is
+    // defined relative to the already-cropped page. Always exactly DewarpModel.ControlPointCount
+    // long. X stays pinned to each point's slot; only Y is operator-adjustable (see
+    // ResolveDewarpPointDrag).
+    [ObservableProperty] private CropPoint[] _dewarpTopPoints = new CropPoint[DewarpModel.ControlPointCount];
+    [ObservableProperty] private CropPoint[] _dewarpBottomPoints = new CropPoint[DewarpModel.ControlPointCount];
+    [ObservableProperty] private bool _isDewarpMode;
+    [ObservableProperty] private int _dewarpSpaceWidth;
+    [ObservableProperty] private int _dewarpSpaceHeight;
+    // The undewarped crop the operator drags control points against — deliberately separate
+    // from PreviewImage (which shows the live *corrected* result) so the drag surface itself
+    // never moves under the cursor while it's being edited.
+    [ObservableProperty] private Bitmap? _dewarpBackdropImage;
+
+    public string DewarpEditButtonLabel => IsDewarpMode ? "Done Adjusting Curve" : "Adjust Curve";
+
+    partial void OnIsDewarpModeChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsLineSplitMode));
+        OnPropertyChanged(nameof(IsQuadSplitMode));
+        OnPropertyChanged(nameof(DewarpEditButtonLabel));
+        SchedulePreviewUpdate();
+    }
+
+    partial void OnDewarpTopPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
+    partial void OnDewarpBottomPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
 
     // Live preview of the corrected image as it's edited. Split mode uses both (left/right);
     // single-page mode uses only PreviewImage.
@@ -127,6 +163,9 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 var batch = _dbContext.Batches.Find(job.BatchId);
                 var isSplit = batch?.SplitBookPages == true;
                 var hasSavedCrop = job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox);
+                var savedDewarp = job.DewarpManualOverrideApplied && !string.IsNullOrWhiteSpace(job.DewarpCurve)
+                    ? ImageProcessor.ParseDewarpCurve(job.DewarpCurve!)
+                    : null;
                 var imageWidth = (int)bmp.Size.Width;
                 var imageHeight = (int)bmp.Size.Height;
 
@@ -197,6 +236,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                         _detectedSplitPercent = detectedSplit;
                         _detectedLeftQuad = detectedLeftQuad;
                         _detectedRightQuad = detectedRightQuad;
+                        _savedDewarp = savedDewarp;
 
                         if (hasSavedCrop && savedCorners != null)
                         {
@@ -326,6 +366,86 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         SchedulePreviewUpdate();
     }
 
+    /// <summary>The crop shape dewarp is edited and previewed against — the left/single page's
+    /// quad, since a saved manual curve currently applies to just that one shape (the pipeline
+    /// still auto-detects an independent curve for a split spread's right half).</summary>
+    private CropPoint[] CurrentPrimaryCorners() =>
+        IsSplitBookPages && IsTwoQuadSplit ? LeftQuad
+        : IsSplitBookPages ? RectCorners(0, 0, ImageWidth * (SplitPercent / 100.0), ImageHeight)
+        : new[] { TopLeft, TopRight, BottomRight, BottomLeft };
+
+    [RelayCommand]
+    private void ToggleDewarpEditMode()
+    {
+        if (Image == null) return;
+        if (!IsDewarpMode) SeedDewarpPoints();
+        IsDewarpMode = !IsDewarpMode;
+    }
+
+    /// <summary>Seeds the curve editor from (in priority order) a previously-saved manual
+    /// curve, an auto-detected one, or — when neither is available — a flat pair of lines the
+    /// operator can drag from scratch. Runs against a fresh crop-preview render so the control
+    /// points land in that render's own pixel space (see CropPreviewRenderer.Scale), which is
+    /// what Save later converts back to full-resolution coordinates.</summary>
+    private void SeedDewarpPoints()
+    {
+        var renderer = _previewRenderer;
+        if (renderer == null) return;
+
+        var bytes = renderer.RenderPreview(CurrentPrimaryCorners());
+        if (bytes == null) return;
+
+        try
+        {
+            using var ms = new MemoryStream(bytes);
+            var backdrop = new Bitmap(ms);
+            var old = DewarpBackdropImage;
+            DewarpBackdropImage = backdrop;
+            old?.Dispose();
+            DewarpSpaceWidth = (int)backdrop.Size.Width;
+            DewarpSpaceHeight = (int)backdrop.Size.Height;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[CropReviewViewModel] Dewarp preview backdrop failed: {ex}");
+            return;
+        }
+
+        _dewarpTouched = true;
+        var model = _savedDewarp ?? ImageProcessor.DetectDewarpCurveFromBytes(bytes);
+        if (model is { } m)
+        {
+            DewarpTopPoints = m.TopControlPoints;
+            DewarpBottomPoints = m.BottomControlPoints;
+        }
+        else
+        {
+            BoundaryHintText = "No confident curve detected — drag the lines to trace the page's actual bend.";
+            DewarpTopPoints = EvenlySpacedRow(DewarpSpaceWidth, DewarpSpaceHeight * 0.12);
+            DewarpBottomPoints = EvenlySpacedRow(DewarpSpaceWidth, DewarpSpaceHeight * 0.92);
+        }
+    }
+
+    private static CropPoint[] EvenlySpacedRow(int width, double y)
+    {
+        var points = new CropPoint[DewarpModel.ControlPointCount];
+        for (var i = 0; i < points.Length; i++)
+            points[i] = new CropPoint(width <= 1 ? 0 : (double)i / (points.Length - 1) * (width - 1), y);
+        return points;
+    }
+
+    /// <summary>Called by the window while a dewarp control point is being dragged: pins X to
+    /// the point's own slot (only curvature height is operator-adjustable) and clamps Y to the
+    /// preview's bounds.</summary>
+    public CropPoint ResolveDewarpPointDrag(bool isTop, int index, CropPoint rawPosition)
+    {
+        var points = isTop ? DewarpTopPoints : DewarpBottomPoints;
+        var pinnedX = index >= 0 && index < points.Length ? points[index].X : rawPosition.X;
+        var y = DewarpSpaceHeight > 0 ? Math.Clamp(rawPosition.Y, 0, DewarpSpaceHeight) : rawPosition.Y;
+        SchedulePreviewUpdate();
+        return new CropPoint(pinnedX, y);
+    }
+
     private CropPoint TrySnapToEdge(CropPoint dragged)
     {
         if (_edgePoints.Count == 0) return dragged;
@@ -353,6 +473,13 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     {
         if (_previewRenderer == null) return;
 
+        if (IsDewarpMode)
+        {
+            RenderPreviewInto(CurrentPrimaryCorners(), isPrimary: true);
+            SecondaryPreviewImage = null;
+            return;
+        }
+
         if (IsSplitBookPages && IsTwoQuadSplit)
         {
             RenderPreviewInto(LeftQuad, isPrimary: true);
@@ -376,9 +503,15 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         var renderer = _previewRenderer;
         if (renderer == null) return;
 
+        // Snapshot under IsDewarpMode's current value, not re-read inside the background task —
+        // the operator could toggle modes again before this frame finishes rendering.
+        DewarpModel? dewarpSnapshot = IsDewarpMode
+            ? new DewarpModel((CropPoint[])DewarpTopPoints.Clone(), (CropPoint[])DewarpBottomPoints.Clone())
+            : null;
+
         Task.Run(() =>
         {
-            var bytes = renderer.RenderPreview(corners);
+            var bytes = dewarpSnapshot is { } d ? renderer.RenderPreviewWithDewarp(corners, d) : renderer.RenderPreview(corners);
             if (bytes == null) return;
             Dispatcher.UIThread.Post(() =>
             {
@@ -467,6 +600,20 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             }
 
             job.ManualOverrideApplied = true;
+
+            // Dewarp control points live in the crop-preview renderer's downscaled pixel space
+            // (see SeedDewarpPoints) — convert back to full-resolution coordinates, matching
+            // what the pipeline applies against the actual cropped page.
+            if (_dewarpTouched && _previewRenderer != null)
+            {
+                var scale = _previewRenderer.Scale;
+                var fullResModel = new DewarpModel(
+                    ScalePoints(DewarpTopPoints, 1.0 / scale),
+                    ScalePoints(DewarpBottomPoints, 1.0 / scale));
+                job.DewarpCurve = ImageProcessor.FormatDewarpCurve(fullResModel);
+                job.DewarpManualOverrideApplied = true;
+            }
+
             job.ProcessingStatus = "Pending"; // Re-queue it
             job.QcStatus = "Pending";
             job.OcrStatus = "Pending";
@@ -497,6 +644,9 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     // silently corrupt every saved crop on those systems.
     private static string FormatCorners(params CropPoint[] corners) => string.Join(",", corners.SelectMany(c =>
         new[] { c.X.ToString("F1", CultureInfo.InvariantCulture), c.Y.ToString("F1", CultureInfo.InvariantCulture) }));
+
+    private static CropPoint[] ScalePoints(CropPoint[] points, double factor) =>
+        points.Select(p => new CropPoint(p.X * factor, p.Y * factor)).ToArray();
 
     public void Dispose()
     {

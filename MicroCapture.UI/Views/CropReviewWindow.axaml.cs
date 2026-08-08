@@ -6,6 +6,7 @@ using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media;
+using Avalonia.Media.Imaging;
 using MicroCapture.Processing;
 using MicroCapture.UI.ViewModels;
 
@@ -17,7 +18,9 @@ public partial class CropReviewWindow : Window
     {
         None, Corner0, Corner1, Corner2, Corner3, SplitLine,
         LeftCorner0, LeftCorner1, LeftCorner2, LeftCorner3,
-        RightCorner0, RightCorner1, RightCorner2, RightCorner3
+        RightCorner0, RightCorner1, RightCorner2, RightCorner3,
+        DewarpTop0, DewarpTop1, DewarpTop2, DewarpTop3, DewarpTop4,
+        DewarpBottom0, DewarpBottom1, DewarpBottom2, DewarpBottom3, DewarpBottom4
     }
 
     private const double HandleHitRadius = 16.0;
@@ -27,6 +30,8 @@ public partial class CropReviewWindow : Window
     private static readonly Color SingleQuadColor = Color.Parse("#5e6ad2");
     private static readonly Color LeftQuadColor = Color.Parse("#5e6ad2");
     private static readonly Color RightQuadColor = Color.Parse("#828fff");
+    private static readonly Color TopCurveColor = Color.Parse("#5e6ad2");
+    private static readonly Color BottomCurveColor = Color.Parse("#d99a3d");
 
     private DragTarget _activeDrag = DragTarget.None;
 
@@ -44,7 +49,9 @@ public partial class CropReviewWindow : Window
             {
                 if (ev.PropertyName is nameof(vm.TopLeft) or nameof(vm.TopRight) or nameof(vm.BottomRight) or nameof(vm.BottomLeft)
                     or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages)
-                    or nameof(vm.LeftQuad) or nameof(vm.RightQuad) or nameof(vm.IsTwoQuadSplit))
+                    or nameof(vm.LeftQuad) or nameof(vm.RightQuad) or nameof(vm.IsTwoQuadSplit)
+                    or nameof(vm.IsDewarpMode) or nameof(vm.DewarpTopPoints) or nameof(vm.DewarpBottomPoints)
+                    or nameof(vm.DewarpBackdropImage))
                 {
                     RenderOverlay();
                 }
@@ -63,6 +70,21 @@ public partial class CropReviewWindow : Window
         var pt = e.GetPosition(canvas);
         var (imgRect, scale) = GetDisplayedImageRect();
         if (imgRect.Width <= 0 || imgRect.Height <= 0) return;
+
+        if (vm.IsDewarpMode)
+        {
+            if (TryHitQuad(vm.DewarpTopPoints, imgRect, scale, pt, out var topIdx))
+            {
+                _activeDrag = DragTarget.DewarpTop0 + topIdx;
+                e.Pointer.Capture(canvas);
+            }
+            else if (TryHitQuad(vm.DewarpBottomPoints, imgRect, scale, pt, out var bottomIdx))
+            {
+                _activeDrag = DragTarget.DewarpBottom0 + bottomIdx;
+                e.Pointer.Capture(canvas);
+            }
+            return;
+        }
 
         if (vm.IsSplitBookPages)
         {
@@ -114,7 +136,7 @@ public partial class CropReviewWindow : Window
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         base.OnPointerMoved(e);
-        if (_activeDrag == DragTarget.None || DataContext is not CropReviewViewModel vm || vm.Image == null) return;
+        if (_activeDrag == DragTarget.None || DataContext is not CropReviewViewModel vm) return;
 
         var canvas = this.FindControl<Canvas>("OverlayCanvas");
         if (canvas == null) return;
@@ -122,6 +144,24 @@ public partial class CropReviewWindow : Window
         var pt = e.GetPosition(canvas);
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;
+
+        if (_activeDrag >= DragTarget.DewarpTop0 && _activeDrag <= DragTarget.DewarpBottom4)
+        {
+            var dewarpX = Math.Clamp((pt.X - imgRect.X) / scale, 0, vm.DewarpSpaceWidth);
+            var dewarpY = Math.Clamp((pt.Y - imgRect.Y) / scale, 0, vm.DewarpSpaceHeight);
+            var dewarpRawPoint = new CropPoint(dewarpX, dewarpY);
+
+            var isTop = _activeDrag <= DragTarget.DewarpTop4;
+            var baseTarget = isTop ? DragTarget.DewarpTop0 : DragTarget.DewarpBottom0;
+            var idx = _activeDrag - baseTarget;
+            var resolved = vm.ResolveDewarpPointDrag(isTop, idx, dewarpRawPoint);
+            var arr = (CropPoint[])(isTop ? vm.DewarpTopPoints : vm.DewarpBottomPoints).Clone();
+            arr[idx] = resolved;
+            if (isTop) vm.DewarpTopPoints = arr; else vm.DewarpBottomPoints = arr;
+            return;
+        }
+
+        if (vm.Image == null) return;
 
         if (_activeDrag == DragTarget.SplitLine)
         {
@@ -185,12 +225,19 @@ public partial class CropReviewWindow : Window
     private (Rect displayedRect, double scale) GetDisplayedImageRect()
     {
         var container = this.FindControl<Grid>("ContainerGrid");
-        if (container == null || DataContext is not CropReviewViewModel vm || vm.Image == null) return (default, 0);
+        if (container == null || DataContext is not CropReviewViewModel vm) return (default, 0);
+
+        // Dewarp mode displays/edits against DewarpBackdropImage (the undewarped crop, in the
+        // crop-preview renderer's own downscaled pixel space) instead of the raw source image —
+        // a different bitmap with different dimensions, so the displayed rect must be computed
+        // against whichever one is actually on screen.
+        Bitmap? active = vm.IsDewarpMode ? vm.DewarpBackdropImage : vm.Image;
+        if (active == null) return (default, 0);
 
         var containerW = container.Bounds.Width;
         var containerH = container.Bounds.Height;
-        var imgW = vm.Image.Size.Width;
-        var imgH = vm.Image.Size.Height;
+        var imgW = active.Size.Width;
+        var imgH = active.Size.Height;
 
         if (containerW <= 0 || containerH <= 0 || imgW <= 0 || imgH <= 0) return (default, 0);
 
@@ -206,14 +253,19 @@ public partial class CropReviewWindow : Window
     private void RenderOverlay()
     {
         var canvas = this.FindControl<Canvas>("OverlayCanvas");
-        if (canvas == null || DataContext is not CropReviewViewModel vm || vm.Image == null) return;
+        if (canvas == null || DataContext is not CropReviewViewModel vm) return;
 
         canvas.Children.Clear();
 
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;
 
-        if (vm.IsSplitBookPages && vm.IsTwoQuadSplit)
+        if (vm.IsDewarpMode)
+        {
+            RenderDewarpCurve(canvas, vm.DewarpTopPoints, imgRect, scale, TopCurveColor);
+            RenderDewarpCurve(canvas, vm.DewarpBottomPoints, imgRect, scale, BottomCurveColor);
+        }
+        else if (vm.IsSplitBookPages && vm.IsTwoQuadSplit)
         {
             RenderQuad(canvas, vm.LeftQuad, imgRect, scale, LeftQuadColor);
             RenderQuad(canvas, vm.RightQuad, imgRect, scale, RightQuadColor);
@@ -226,6 +278,39 @@ public partial class CropReviewWindow : Window
         {
             RenderQuad(canvas, new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft }, imgRect, scale, SingleQuadColor);
         }
+    }
+
+    /// <summary>Draws one curve (top or bottom edge) as a smooth spline through its control
+    /// points — same interpolation ImageProcessor.ApplyDewarp uses to densify them, so what the
+    /// operator sees traces the same curve that will actually be applied — plus a draggable
+    /// handle at each control point.</summary>
+    private void RenderDewarpCurve(Canvas canvas, CropPoint[] points, Rect imgRect, double scale, Color color)
+    {
+        if (points.Length < 2) return;
+
+        var xs = points.Select(p => p.X).ToArray();
+        var ys = points.Select(p => p.Y).ToArray();
+        var minX = xs.Min();
+        var maxX = xs.Max();
+
+        const int samples = 48;
+        var curvePoints = new System.Collections.Generic.List<Point>(samples + 1);
+        for (var i = 0; i <= samples; i++)
+        {
+            var x = minX + (maxX - minX) * i / (double)samples;
+            var y = ImageProcessor.InterpolateSpline(xs, ys, x);
+            curvePoints.Add(new Point(imgRect.X + x * scale, imgRect.Y + y * scale));
+        }
+
+        canvas.Children.Add(new Polyline
+        {
+            Points = curvePoints,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2.5
+        });
+
+        foreach (var p in points)
+            AddHandle(canvas, imgRect.X + p.X * scale, imgRect.Y + p.Y * scale, color);
     }
 
     private void RenderQuad(Canvas canvas, CropPoint[] corners, Rect imgRect, double scale, Color color)

@@ -16,6 +16,18 @@
                 <Grid Name="ContainerGrid">
                     <Image Name="TargetImage"
                            Source="{Binding Image}"
+                           IsVisible="{Binding !IsDewarpMode}"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
+                    <!-- Dewarp mode edits against the already-cropped (but not yet dewarped)
+                         page, so the operator can see and trace the page's actual curved text
+                         lines — the corrected result previews separately, in the LIVE PREVIEW
+                         panel, so the surface being dragged against never moves under the
+                         cursor while adjusting it. -->
+                    <Image Name="DewarpBackdropTargetImage"
+                           Source="{Binding DewarpBackdropImage}"
+                           IsVisible="{Binding IsDewarpMode}"
                            Stretch="Uniform"
                            HorizontalAlignment="Center"
                            VerticalAlignment="Center"/>
@@ -71,6 +83,9 @@
                             IsVisible="{Binding IsLineSplitMode}" Classes="accentGhost"/>
                     <Button Content="Switch to split line" Command="{Binding ToggleSplitEditModeCommand}"
                             IsVisible="{Binding IsQuadSplitMode}" Classes="accentGhost"/>
+                    <Button Content="{Binding DewarpEditButtonLabel}" Command="{Binding ToggleDewarpEditModeCommand}"
+                            ToolTip.Tip="Manually trace this page's actual top/bottom curve when auto-detection isn't confident enough"
+                            Classes="accentGhost"/>
                 </StackPanel>
 
                 <!-- Book Split Slider (Visible only in line-split mode) -->

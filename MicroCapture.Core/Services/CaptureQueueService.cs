@@ -54,6 +54,9 @@ public class CaptureQueueService
         EnsureColumn("Batches", "FixedFrameImageHeight", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "PreferredExportFormat", "TEXT NOT NULL DEFAULT 'PDF'");
         EnsureColumn("Batches", "Dpi", "INTEGER NOT NULL DEFAULT 300");
+        EnsureColumn("Batches", "DewarpEnabled", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "DewarpManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "DewarpCurve", "TEXT NULL");
     }
 
     private void EnsureColumn(string table, string column, string definition)

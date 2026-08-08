@@ -25,6 +25,19 @@ public readonly record struct CropPoint(double X, double Y);
 /// for a stationary, straight-down copy-stand shot.</summary>
 public readonly record struct FixedFrameRect(double X, double Y, double Width, double Height);
 
+/// <summary>Book-curvature correction model: 5 control points along a page's top content edge
+/// and 5 along its bottom edge, in that page's own (post-crop) pixel coordinates, evenly
+/// spaced by X. Auto-detection seeds these from the detected text-line envelope; the operator
+/// can drag each point's Y in Crop Review (X stays pinned to its slot). Both auto-detected and
+/// manually-adjusted curves round-trip through this same shape — see
+/// ImageProcessor.DetectDewarpCurve/ApplyDewarp/FormatDewarpCurve/ParseDewarpCurve.
+/// OpenCvSharp-free (mirrors <see cref="CropPoint"/>/<see cref="DocumentBoundary"/>) so it can
+/// safely cross into the UI project.</summary>
+public readonly record struct DewarpModel(CropPoint[] TopControlPoints, CropPoint[] BottomControlPoints)
+{
+    public const int ControlPointCount = 5;
+}
+
 /// <summary>Document boundary detected in a still image, in that image's own pixel coordinates.
 /// <see cref="Quad"/> is populated when the detected contour approximated a clean
 /// quadrilateral (ordered top-left, top-right, bottom-right, bottom-left) — the UI should
@@ -132,10 +145,14 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
+        // A saved manual curve currently applies uniformly to both halves of a split spread —
+        // each half still gets its own independently *auto-detected* curve when not manually
+        // overridden (DetectDewarpCurve runs fresh per Mat below), only a manual edit is shared.
+        var savedDewarp = !string.IsNullOrEmpty(dewarpCurve) ? ParseDewarpCurve(dewarpCurve) : null;
 
         if (!File.Exists(inputPath))
         {
@@ -180,17 +197,17 @@ public class ImageProcessor
                     rightCorners = RectCorners(splitX, 0, src.Width - splitX, src.Height);
                 }
 
-                // Process left
+                // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
                 WriteTiff(outLeft, leftResult, meta);
                 result.OutputFilePaths.Add(outLeft);
                 leftResult.Dispose();
 
-                // Process right
+                // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
                 WriteTiff(outRight, rightResult, meta);
                 result.OutputFilePaths.Add(outRight);
@@ -208,7 +225,7 @@ public class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride);
                 manualCrop?.Dispose();
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
@@ -270,10 +287,11 @@ public class ImageProcessor
     /// gating and no perspective warp — every defined rectangle is always cropped and saved
     /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
     /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
+        var savedDewarp = !string.IsNullOrEmpty(dewarpCurve) ? ParseDewarpCurve(dewarpCurve) : null;
 
         if (!File.Exists(inputPath))
         {
@@ -310,7 +328,7 @@ public class ImageProcessor
 
                 using var cropped = src[rect].Clone();
                 var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true);
+                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true, dewarpEnabled, savedDewarp, dewarpManualOverride);
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
@@ -433,6 +451,57 @@ public class ImageProcessor
     private static Point2f[] RectCorners(int x, int y, int w, int h) =>
         new[] { new Point2f(x, y), new Point2f(x + w, y), new Point2f(x + w, y + h), new Point2f(x, y + h) };
 
+    /// <summary>Inverse of <see cref="ParseDewarpCurve"/> — "top:x1,y1,...,x5,y5;bottom:x1,y1,...,x5,y5",
+    /// pixel coords in the page's own space. Same delimiter conventions as
+    /// <see cref="FormatFixedFrames"/>/<see cref="ParseCropCorners"/>.</summary>
+    public static string FormatDewarpCurve(DewarpModel model) =>
+        $"top:{FormatPoints(model.TopControlPoints)};bottom:{FormatPoints(model.BottomControlPoints)}";
+
+    private static string FormatPoints(CropPoint[] points) =>
+        string.Join(",", points.SelectMany(p => new[]
+        {
+            p.X.ToString("F1", CultureInfo.InvariantCulture),
+            p.Y.ToString("F1", CultureInfo.InvariantCulture)
+        }));
+
+    /// <summary>Parses a saved dewarp curve (see <see cref="FormatDewarpCurve"/>) back into its
+    /// top/bottom control points. Returns null on any malformed or incomplete spec — callers
+    /// should treat that the same as "no saved curve" rather than guess.</summary>
+    public static DewarpModel? ParseDewarpCurve(string spec)
+    {
+        try
+        {
+            CropPoint[]? top = null;
+            CropPoint[]? bottom = null;
+            foreach (var part in spec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var sep = part.IndexOf(':');
+                if (sep < 0) continue;
+                var label = part[..sep];
+                var points = ParsePoints(part[(sep + 1)..]);
+                if (points == null) continue;
+                if (label == "top") top = points;
+                else if (label == "bottom") bottom = points;
+            }
+            return top != null && bottom != null ? new DewarpModel(top, bottom) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static CropPoint[]? ParsePoints(string csv)
+    {
+        var n = csv.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+        if (n.Length == 0 || n.Length % 2 != 0) return null;
+        var points = new CropPoint[n.Length / 2];
+        for (var i = 0; i < points.Length; i++)
+            points[i] = new CropPoint(n[i * 2], n[i * 2 + 1]);
+        return points;
+    }
+
     /// <summary>Axis-aligned bounding rect of arbitrary corners, clamped to the image bounds.
     /// Used only by the emergency SkiaSharp fallback path (when OpenCV itself is unavailable),
     /// which can't perform a perspective warp and must degrade to a plain rectangular crop.</summary>
@@ -445,12 +514,14 @@ public class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null)
     {
         var working = input.Clone();
 
         if (!skipAutoCrop)
             working = TryAutoCrop(working, result);
+
+        working = TryApplyDewarp(working, result, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint);
 
         working = TryDeskew(working, result);
         working = ApplyEnhancement(working);
@@ -803,6 +874,23 @@ public class ImageProcessor
         }
     }
 
+    /// <summary>Byte-decoded counterpart to <see cref="DetectDewarpCurve"/> for Crop Review's
+    /// curve editor, which seeds itself from an in-memory cropped preview (see
+    /// <see cref="CropPreviewRenderer"/>) rather than a file on disk. Returns null on any
+    /// failure or low-confidence detection, same as the path-based detectors in this class.</summary>
+    public static DewarpModel? DetectDewarpCurveFromBytes(byte[] encodedImage)
+    {
+        try
+        {
+            using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+            return mat.Empty() ? null : DetectDewarpCurve(mat, null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>Extracts a thinned set of strong edge-pixel coordinates from a still image, for
     /// the UI to snap a dragged crop corner to a nearby real edge instead of leaving it exactly
     /// where the pointer happens to be. Meant to be computed once when Crop Review opens (not
@@ -971,6 +1059,317 @@ public class ImageProcessor
         {
             return 50.0;
         }
+    }
+
+    // ───────────── BOOK CURVE DEWARP ─────────────
+
+    /// <summary>Applies book-curve correction if enabled/overridden, and reports what happened
+    /// via <paramref name="result"/>'s warnings — same shape as <see cref="TryAutoCrop"/>:
+    /// never throws, degrades to returning <paramref name="src"/> unchanged on any failure or
+    /// low-confidence detection.</summary>
+    private Mat TryApplyDewarp(Mat src, ProcessingResult result, bool dewarpEnabled, DewarpModel? savedDewarp, bool dewarpManualOverride, double? spineXHint)
+    {
+        if (!dewarpEnabled && !dewarpManualOverride) return src;
+        try
+        {
+            var model = dewarpManualOverride && savedDewarp is { } saved ? saved : DetectDewarpCurve(src, spineXHint);
+            if (model is not { } m)
+            {
+                if (dewarpEnabled)
+                    result.Warnings.Add("No confident book curvature detected — skipping dewarp.");
+                return src;
+            }
+
+            result.Warnings.Add("Book curve correction applied.");
+            return ApplyDewarp(src, m);
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Book curve correction failed: {ex.Message}");
+            return src;
+        }
+    }
+
+    /// <summary>Detects book-spine curvature from the page's own text-line shapes and fits a
+    /// 5-point top/bottom curve to it — no hardware depth sensing, just the same "cubic sheet"
+    /// idea used by tools like page_dewarp: text lines are assumed straight in the undistorted
+    /// page, so their observed curvature reveals the page's own bend. Modeled as a per-column
+    /// vertical displacement (curvature runs parallel to the spine), which keeps this a 1D
+    /// curve fit instead of a full 2D mesh.
+    ///
+    /// <paramref name="spineXHint"/>, when known (the x-coordinate of this page's own spine
+    /// edge — 0 or the page width — passed by split-page callers), anchors the *opposite* edge
+    /// as flat even where text evidence is sparse there, so the fit doesn't extrapolate wildly
+    /// into a margin with few detected lines. Returns null when there isn't enough line
+    /// evidence to trust a curve — callers should skip correction rather than guess.</summary>
+    internal static DewarpModel? DetectDewarpCurve(Mat page, double? spineXHint)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(page, gray, ColorConversionCodes.BGR2GRAY);
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(gray, blurred, new Size(3, 3), 0);
+        using var binary = new Mat();
+        Cv2.Threshold(blurred, binary, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
+
+        // Horizontal-only closing merges glyphs into line-shaped blobs without touching their
+        // vertical extent, so each blob's own top/bottom pixels still trace that line's true
+        // curve rather than a morphology-smoothed approximation of it.
+        var kernelWidth = Math.Max(15, page.Cols / 40);
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(kernelWidth, 1));
+        using var closed = new Mat();
+        Cv2.MorphologyEx(binary, closed, MorphTypes.Close, kernel);
+
+        Cv2.FindContours(closed, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxNone);
+
+        var minWidth = page.Cols * 0.15;
+        var lines = contours
+            .Select(Cv2.BoundingRect)
+            .Where(r => r.Width >= minWidth && r.Width > r.Height * 3)
+            .OrderBy(r => r.Y)
+            .ToList();
+        // Need enough separate lines to trust a curve shape at all — one or two blobs could
+        // just as easily be a heading or noise, not evidence of the page's actual bend.
+        if (lines.Count < 3) return null;
+
+        var top = lines[0];
+        var bottom = lines[^1];
+        if (bottom.Y <= top.Y) return null;
+
+        var topSamples = SampleLineEdge(closed, top, topEdge: true);
+        var bottomSamples = SampleLineEdge(closed, bottom, topEdge: false);
+        var spanWidth = Math.Max(top.Width, bottom.Width);
+        // Require the detected lines to span a healthy fraction of the page width — a curve
+        // fit from a narrow sliver of text says little about the page's overall bend.
+        if (topSamples.Count < 8 || bottomSamples.Count < 8 || spanWidth < page.Cols * 0.35) return null;
+
+        const int degree = 3;
+        var topCoeffs = FitCurveWithSpineAnchor(topSamples, page.Cols, spineXHint, degree);
+        var bottomCoeffs = FitCurveWithSpineAnchor(bottomSamples, page.Cols, spineXHint, degree);
+        if (topCoeffs == null || bottomCoeffs == null) return null;
+
+        return new DewarpModel(
+            SampleControlPoints(topCoeffs, page.Cols),
+            SampleControlPoints(bottomCoeffs, page.Cols));
+    }
+
+    /// <summary>For each column spanned by <paramref name="rect"/>, the first foreground pixel
+    /// scanning from the top (the line's top edge) or from the bottom (its bottom edge),
+    /// restricted to the blob's own bounding rows — safe because FindContours already
+    /// separated adjacent lines into distinct blobs, so this can't pick up a neighboring
+    /// line's ink.</summary>
+    private static List<(double X, double Y)> SampleLineEdge(Mat binary, Rect rect, bool topEdge)
+    {
+        var samples = new List<(double, double)>();
+        var yStart = Math.Max(0, rect.Y);
+        var yEnd = Math.Min(binary.Rows - 1, rect.Y + rect.Height - 1);
+        var xEnd = Math.Min(binary.Cols, rect.X + rect.Width);
+        for (var x = Math.Max(0, rect.X); x < xEnd; x++)
+        {
+            if (topEdge)
+            {
+                for (var y = yStart; y <= yEnd; y++)
+                {
+                    if (binary.At<byte>(y, x) != 0) { samples.Add((x, y)); break; }
+                }
+            }
+            else
+            {
+                for (var y = yEnd; y >= yStart; y--)
+                {
+                    if (binary.At<byte>(y, x) != 0) { samples.Add((x, y)); break; }
+                }
+            }
+        }
+        return samples;
+    }
+
+    /// <summary>Weighted polynomial fit of the sampled edge, with an optional synthetic anchor
+    /// point pinning the page edge farthest from the known spine flat — its Y taken from the
+    /// nearest few real samples to that edge. Without this, sparse text near a margin lets the
+    /// low-degree polynomial extrapolate freely past the real data and can bend the wrong way;
+    /// the heavily-weighted anchor keeps that edge honest while leaving the spine-side shape
+    /// entirely driven by genuine detected line curvature.</summary>
+    private static double[]? FitCurveWithSpineAnchor(List<(double X, double Y)> samples, int pageWidth, double? spineXHint, int degree)
+    {
+        var points = new List<(double X, double Y, double W)>(samples.Select(s => (s.X, s.Y, 1.0)));
+        if (spineXHint is double spineX)
+        {
+            var farEdgeX = spineX < pageWidth / 2.0 ? (double)pageWidth : 0.0;
+            var nearFar = samples.OrderBy(s => Math.Abs(s.X - farEdgeX)).Take(Math.Min(5, samples.Count)).ToList();
+            if (nearFar.Count > 0)
+                points.Add((farEdgeX, nearFar.Average(s => s.Y), 8.0));
+        }
+        return WeightedPolyFit(points, degree);
+    }
+
+    /// <summary>Weighted least-squares polynomial fit via the normal equations. Degree is small
+    /// (cubic) and there are at most a few thousand points, so a hand-rolled Gauss-Jordan solve
+    /// is simpler than pulling in a linear-algebra dependency for this one call site.</summary>
+    private static double[]? WeightedPolyFit(List<(double X, double Y, double W)> points, int degree)
+    {
+        var n = degree + 1;
+        var a = new double[n, n];
+        var b = new double[n];
+        foreach (var (x, y, w) in points)
+        {
+            var powers = new double[2 * n - 1];
+            powers[0] = 1.0;
+            for (var i = 1; i < powers.Length; i++) powers[i] = powers[i - 1] * x;
+            for (var i = 0; i < n; i++)
+            {
+                b[i] += w * powers[i] * y;
+                for (var j = 0; j < n; j++)
+                    a[i, j] += w * powers[i + j];
+            }
+        }
+        return SolveLinearSystem(a, b, n);
+    }
+
+    private static double[]? SolveLinearSystem(double[,] a, double[] b, int n)
+    {
+        for (var col = 0; col < n; col++)
+        {
+            var pivot = col;
+            for (var row = col + 1; row < n; row++)
+                if (Math.Abs(a[row, col]) > Math.Abs(a[pivot, col])) pivot = row;
+            if (Math.Abs(a[pivot, col]) < 1e-9) return null; // singular — not enough distinct data
+
+            if (pivot != col)
+            {
+                for (var j = 0; j < n; j++) (a[col, j], a[pivot, j]) = (a[pivot, j], a[col, j]);
+                (b[col], b[pivot]) = (b[pivot], b[col]);
+            }
+
+            var diag = a[col, col];
+            for (var j = 0; j < n; j++) a[col, j] /= diag;
+            b[col] /= diag;
+
+            for (var row = 0; row < n; row++)
+            {
+                if (row == col) continue;
+                var factor = a[row, col];
+                if (factor == 0) continue;
+                for (var j = 0; j < n; j++) a[row, j] -= factor * a[col, j];
+                b[row] -= factor * b[col];
+            }
+        }
+        return b;
+    }
+
+    private static CropPoint[] SampleControlPoints(double[] coeffs, int pageWidth)
+    {
+        var points = new CropPoint[DewarpModel.ControlPointCount];
+        for (var i = 0; i < DewarpModel.ControlPointCount; i++)
+        {
+            var x = pageWidth <= 1 ? 0 : (double)i / (DewarpModel.ControlPointCount - 1) * (pageWidth - 1);
+            points[i] = new CropPoint(x, EvalPoly(coeffs, x));
+        }
+        return points;
+    }
+
+    private static double EvalPoly(double[] coeffs, double x)
+    {
+        var result = 0.0;
+        var power = 1.0;
+        foreach (var c in coeffs)
+        {
+            result += c * power;
+            power *= x;
+        }
+        return result;
+    }
+
+    /// <summary>Remaps <paramref name="page"/> so its curved top/bottom content edges (as
+    /// modeled by <paramref name="model"/>'s control points) become straight — for each column,
+    /// vertically rescales that column's local [top(x), bottom(x)] content band into the page's
+    /// overall flattest band (the min top / max bottom across all columns, so no content is cut
+    /// off), via a single <see cref="Cv2.Remap"/>. Same shape as <see cref="WarpQuad"/>: builds
+    /// a coordinate map once, then one native call.</summary>
+    internal static Mat ApplyDewarp(Mat page, DewarpModel model)
+    {
+        var width = page.Cols;
+        var height = page.Rows;
+        var topXs = model.TopControlPoints.Select(p => p.X).ToArray();
+        var topYs = model.TopControlPoints.Select(p => p.Y).ToArray();
+        var bottomXs = model.BottomControlPoints.Select(p => p.X).ToArray();
+        var bottomYs = model.BottomControlPoints.Select(p => p.Y).ToArray();
+
+        var topDense = new double[width];
+        var bottomDense = new double[width];
+        for (var x = 0; x < width; x++)
+        {
+            topDense[x] = InterpolateSpline(topXs, topYs, x);
+            bottomDense[x] = InterpolateSpline(bottomXs, bottomYs, x);
+        }
+
+        var flatTop = topDense.Min();
+        var flatBottom = bottomDense.Max();
+        if (flatBottom - flatTop < 2) return page; // degenerate model — nothing meaningful to correct
+
+        var colTop = new double[width];
+        var colScale = new double[width];
+        for (var x = 0; x < width; x++)
+        {
+            var localTop = topDense[x];
+            var localSpan = bottomDense[x] - localTop;
+            if (localSpan < 2) localSpan = flatBottom - flatTop;
+            colTop[x] = localTop;
+            colScale[x] = localSpan / (flatBottom - flatTop);
+        }
+
+        var mapXData = new float[height * width];
+        var mapYData = new float[height * width];
+        for (var y = 0; y < height; y++)
+        {
+            var row = y * width;
+            for (var x = 0; x < width; x++)
+            {
+                mapXData[row + x] = x;
+                mapYData[row + x] = (float)(colTop[x] + (y - flatTop) * colScale[x]);
+            }
+        }
+
+        using var mapX = new Mat(height, width, MatType.CV_32FC1);
+        using var mapY = new Mat(height, width, MatType.CV_32FC1);
+        mapX.SetArray(mapXData);
+        mapY.SetArray(mapYData);
+
+        var warped = new Mat();
+        Cv2.Remap(page, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Replicate);
+        return warped;
+    }
+
+    /// <summary>Catmull-Rom interpolation through the (X-sorted) control points, clamped flat
+    /// beyond the first/last point. Used both to densify the 5 control points into a per-column
+    /// curve for <see cref="ApplyDewarp"/>, and (by the UI) to preview the curve as the operator
+    /// drags a control point.</summary>
+    public static double InterpolateSpline(double[] xs, double[] ys, double x)
+    {
+        var n = xs.Length;
+        if (n == 0) return 0;
+        if (n == 1) return ys[0];
+        if (x <= xs[0]) return ys[0];
+        if (x >= xs[^1]) return ys[^1];
+
+        var i = 0;
+        while (i < n - 2 && x > xs[i + 1]) i++;
+
+        var p0 = ys[Math.Max(0, i - 1)];
+        var p1 = ys[i];
+        var p2 = ys[i + 1];
+        var p3 = ys[Math.Min(n - 1, i + 2)];
+
+        var x1 = xs[i];
+        var x2 = xs[i + 1];
+        var t = x2 > x1 ? (x - x1) / (x2 - x1) : 0;
+        var t2 = t * t;
+        var t3 = t2 * t;
+
+        return 0.5 * (
+            2 * p1 +
+            (-p0 + p2) * t +
+            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+            (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
     }
 
     // ───────────── DESKEW ─────────────

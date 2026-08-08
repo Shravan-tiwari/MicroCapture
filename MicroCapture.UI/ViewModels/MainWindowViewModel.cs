@@ -68,6 +68,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private int _selectedDpi = 300;
     public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
 
+    // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
+    // in the background queue, off the capture path, so toggling this never affects shutter
+    // responsiveness. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
+    [ObservableProperty] private bool _dewarpEnabled = false;
+
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
     // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
@@ -443,6 +448,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 RefreshFixedFrameCache(batch);
                 ExportFormat = batch.PreferredExportFormat;
                 SelectedDpi = batch.Dpi;
+                DewarpEnabled = batch.DewarpEnabled;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -456,7 +462,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     Operator = Environment.UserName,
                     SplitBookPages = SplitBookPages && !UseFixedFrames,
                     PreferredExportFormat = DefaultExportFormat,
-                    Dpi = SelectedDpi
+                    Dpi = SelectedDpi,
+                    DewarpEnabled = DewarpEnabled
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();

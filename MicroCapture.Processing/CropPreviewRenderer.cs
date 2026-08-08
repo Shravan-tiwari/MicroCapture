@@ -20,6 +20,12 @@ public sealed class CropPreviewRenderer : IDisposable
     public int SourceWidth { get; }
     public int SourceHeight { get; }
 
+    /// <summary>downscaled-space pixels = original-space pixels * Scale — the Crop Review
+    /// dewarp editor works in this renderer's downscaled pixel space (see
+    /// <see cref="RenderPreviewWithDewarp"/>) and needs this to convert control points back to
+    /// full-resolution coordinates before saving.</summary>
+    public double Scale => _scale;
+
     private CropPreviewRenderer(Mat downscaled, double scale, int sourceWidth, int sourceHeight)
     {
         _downscaled = downscaled;
@@ -73,6 +79,30 @@ public sealed class CropPreviewRenderer : IDisposable
 
             using var warped = ImageProcessor.WarpQuad(_downscaled, scaled);
             Cv2.ImEncode(".jpg", warped, out var bytes);
+            return bytes;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Same as <see cref="RenderPreview"/>, but also applies book-curve dewarp using
+    /// control points already in this renderer's own downscaled pixel space (see
+    /// <see cref="Scale"/>) — used by the Crop Review curve editor so its live preview reflects
+    /// both the crop and the in-progress curve edit.</summary>
+    public byte[]? RenderPreviewWithDewarp(CropPoint[] corners, DewarpModel dewarpModel)
+    {
+        if (corners.Length != 4) return null;
+        try
+        {
+            var scaled = new Point2f[4];
+            for (var i = 0; i < 4; i++)
+                scaled[i] = new Point2f((float)(corners[i].X * _scale), (float)(corners[i].Y * _scale));
+
+            using var warped = ImageProcessor.WarpQuad(_downscaled, scaled);
+            using var dewarped = ImageProcessor.ApplyDewarp(warped, dewarpModel);
+            Cv2.ImEncode(".jpg", dewarped, out var bytes);
             return bytes;
         }
         catch
