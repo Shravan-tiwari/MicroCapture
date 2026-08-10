@@ -898,21 +898,21 @@ public class ImageProcessor
             if (normalizedBest.Confidence > best.Confidence) best = normalizedBest;
         }
 
-        // Last resort: neither pass found anything ratio-qualifying at all (BuildDetection's
-        // own 0.1 gate). Confirmed against real post-split page halves that this is usually not
-        // a missing edge but a *fragmented* one — the real page boundary breaks into hundreds of
-        // small disconnected pieces (a textured/scratched desk background, a hand, a spine)
-        // instead of one closed loop, because dilate(5x5, x2) isn't enough to bridge the gaps.
-        // Retried with much heavier dilation, which trades boundary precision for closing those
-        // gaps. Only ever runs when both normal passes already came up empty, so it's strictly
-        // additive — it cannot make an already-working detection worse, only rescue one that was
-        // otherwise a total miss.
-        if (!best.Found)
-        {
-            var aggressive = FindContoursWithHeavyDilation(regionMat);
-            var aggressiveBest = BestDetectionFromContours(aggressive, imageArea, regionMat.Cols, regionMat.Rows);
-            if (aggressiveBest.Found) best = aggressiveBest;
-        }
+        // Tried and reverted: when neither pass found anything ratio-qualifying, retry with a
+        // much heavier dilation (FindContoursWithHeavyDilation, still below) to bridge a
+        // fragmented real-page edge into one closed loop. It did rescue genuine full-page
+        // detections on some real photos — but on others it latched onto a small, cleanly-
+        // rectangular *wrong* region instead (a paragraph of justified text, a printed table),
+        // which scores deceptively well on BuildDetection's rectangularity/corner-angle terms
+        // despite covering as little as 11% of the frame. Two of those false latches produced
+        // an output that was nearly pure black — worse than useless. "Only runs when the normal
+        // passes already found nothing" made this *additive to detection*, but not *additive to
+        // safety*: the honest fallback it replaced (keep the full frame, flag low confidence for
+        // manual review) was a safe failure; a confident-looking wrong or blank crop is not.
+        // Caught by the user visually spot-checking the published gallery, not by anything
+        // automated — see the memory note on this for the real per-image tally before reverting.
+        // A real fix needs a way to tell a genuine (but small/oddly-shaped) page from a small
+        // wrong object BEFORE trusting the aggressive pass, not merely a "found vs not" gate.
 
         return best;
     }
@@ -1413,6 +1413,19 @@ public class ImageProcessor
         else
         {
             sb.AppendLine("Normalized pass: not run (direct pass already found a large-enough contour)");
+        }
+
+        var directBest = BestDetectionFromContours(directPass.Contours, imageArea, mat.Cols, mat.Rows);
+        var normalizedBest = normalizedPass is { } np2 ? BestDetectionFromContours(np2.Contours, imageArea, mat.Cols, mat.Rows) : default;
+        if (!directBest.Found && !normalizedBest.Found)
+        {
+            var aggressive = FindContoursWithHeavyDilation(mat);
+            sb.AppendLine($"Aggressive (heavy-dilation) pass: {aggressive.Length} contour(s)");
+            foreach (var c in aggressive.OrderByDescending(c => Cv2.ContourArea(c)).Take(5))
+            {
+                var d = BuildDetection(c, imageArea, mat.Cols, mat.Rows);
+                sb.AppendLine($"  ratio={Cv2.ContourArea(c) / imageArea:F4} found={d.Found} confidence={d.Confidence:F4} rect={d.PaddedRect}");
+            }
         }
 
         var best = DetectBoundaryInMat(mat);
