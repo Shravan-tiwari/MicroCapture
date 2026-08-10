@@ -27,6 +27,8 @@ switch (args[0])
         return RunDewarpLines(args);
     case "dewarp-model":
         return RunDewarpModel(args);
+    case "spread":
+        return RunSpread(args);
     default:
         PrintUsage();
         return 1;
@@ -35,9 +37,10 @@ switch (args[0])
 static void PrintUsage()
 {
     Console.WriteLine("Usage:");
-    Console.WriteLine("  process <input-dir> <output-dir> [--binarize]");
+    Console.WriteLine("  process <input-dir> <output-dir> [--binarize] [--force-single]");
     Console.WriteLine("  calibrate <calibration-images-dir>");
     Console.WriteLine("  dewarp-lines <cropped-page-image>");
+    Console.WriteLine("  spread <image-or-dir>");
 }
 
 static int RunProcess(string[] args)
@@ -46,6 +49,11 @@ static int RunProcess(string[] args)
     var inputDir = args[1];
     var outputDir = args[2];
     var binarize = args.Contains("--binarize");
+    // Dev-only escape hatch for generating "what the old architecture produced" comparison
+    // baselines: disables the auto-split promotion entirely (see ImageProcessor.Process) so a
+    // real spread goes through the old single-whole-image path, without needing to hand-edit
+    // ImageProcessor to see the before/after difference.
+    var forceSingle = args.Contains("--force-single");
 
     if (!Directory.Exists(inputDir))
     {
@@ -67,6 +75,7 @@ static int RunProcess(string[] args)
     }
 
     var processor = new ImageProcessor();
+    if (forceSingle) processor.GutterConfidenceThreshold = double.MaxValue;
     Console.WriteLine($"Processing {images.Count} image(s) from {inputDir} (binarize={binarize})\n");
 
     foreach (var imagePath in images)
@@ -161,5 +170,30 @@ static int RunDewarpModel(string[] args)
     }
     var bytes = File.ReadAllBytes(path);
     Console.WriteLine(ImageProcessor.DebugDewarpModel(bytes));
+    return 0;
+}
+
+static int RunSpread(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly)
+            .Where(f => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        Console.WriteLine(ImageProcessor.DebugSpreadDetection(File.ReadAllBytes(path)));
+    }
     return 0;
 }

@@ -103,6 +103,16 @@ public class ImageProcessor
     public double FixedFrameSearchPadFraction { get; set; } = 0.15;
     public double BlurThreshold { get; set; } = 100.0;
     public double GutterConfidenceThreshold { get; set; } = 0.08;
+    // Validated against the operator's real photo fixtures (tools/SmokeTest/Fixtures/real-photos)
+    // plus the dev-mode mock camera frame: all 7 genuine spreads across book-curve and
+    // trapezoid sets show an absolute drop of 30-124 grayscale levels (their lit-paper
+    // backgrounds are bright enough for a real spine shadow to read as a sizeable drop), while
+    // the dev mock frame's near-black synthetic background hits GutterConfidenceThreshold's
+    // *relative* bar from pure compression/blur noise at a drop of only ~13 levels — see
+    // GutterDetection.AbsoluteDropLevels. 20 sits with margin on both sides of that gap. Only
+    // used to gate the automatic (non-manual) spread-vs-single-page promotion in Process(), not
+    // the already-in-split-mode split-point picker, which only needs "where," not "whether."
+    public double GutterAbsoluteDropThreshold { get; set; } = 20.0;
     // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
     // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
     // read as crisper edges/text, low enough to avoid visible halos on a document scan.
@@ -210,29 +220,68 @@ public class ImageProcessor
             using var undistorted = lensCalibration is { } calib ? SafeUndistort(rawSrc, calib, result) : null;
             var src = undistorted ?? rawSrc;
 
-            if (splitPages)
+            // Automatic (non-manual) captures never got a chance to route through the split
+            // path unless an operator remembered to check Batch.SplitBookPages up front — in
+            // practice most real spreads went through the single-whole-image quad path
+            // instead, which is a poor fit for book curvature (one cubic trying to model two
+            // independent per-page bowl shapes meeting at a spine trough).
+            //
+            // The spine-shadow gutter signal (DetectGutter), not the two-page contour detector
+            // below, is what actually distinguishes a real spread from a real single page on
+            // this app's own captures: validated against the operator's real photo fixtures
+            // (tools/SmokeTest/Fixtures/real-photos), all 4 genuine book-curve spreads scored
+            // gutter confidence 0.23-0.79 and the one genuine single trapezoid page scored
+            // 0.05 — cleanly on either side of GutterConfidenceThreshold (0.08). The contour
+            // detector (DetectTwoPageBoundaries), by contrast, found zero of those 5 photos:
+            // real spreads with pages pressed together at the spine (no visible physical gap,
+            // just a shadow) trace as one contour, exactly per its own doc comment. It's kept
+            // below purely as an opportunistic quality upgrade for the (rarer) spread that does
+            // have a visible gap, never as the trigger for whether to split at all.
+            // Skipped entirely under manualOverride: an operator who already reviewed the crop
+            // in Crop Review made an explicit choice that shouldn't be second-guessed.
+            var gutter = DetectGutter(src);
+            var autoSplitBySpine = !manualOverride
+                && gutter.Confidence >= GutterConfidenceThreshold
+                && gutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold;
+
+            if (splitPages || autoSplitBySpine)
             {
+                var autoTwoPage = !manualOverride ? DetectTwoPageBoundaries(src) : default;
+                var autoTwoPageConfident = autoTwoPage.Found
+                    && autoTwoPage.Left.Confidence >= MediumConfidenceThreshold
+                    && autoTwoPage.Right.Confidence >= MediumConfidenceThreshold;
+
                 // Split logic. Each side is parsed to its 4 corners; a plain saved strip
                 // (today's UI) is an axis-aligned quad and takes WarpQuad's cheap-crop path,
-                // while a future per-half quad edit would automatically get a real warp —
-                // one shared implementation, no special-casing here.
+                // while a per-half quad (manual edit, or an auto-detected page contour) gets a
+                // real warp — one shared implementation, no special-casing here.
                 Point2f[] leftCorners, rightCorners;
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop) && !string.IsNullOrEmpty(rightCrop))
                 {
                     leftCorners = ParseCropCorners(leftCrop, src.Width, src.Height);
                     rightCorners = ParseCropCorners(rightCrop, src.Width, src.Height);
                 }
+                else if (autoTwoPageConfident && autoTwoPage.Left.Quad != null && autoTwoPage.Right.Quad != null)
+                {
+                    // Each half already comes from its own independently-detected page
+                    // contour (real edges, not an axis-aligned guess at a shared split line) —
+                    // this is what makes a V-cradle spread's asymmetric, draping page shapes
+                    // work, where a single vertical split line would not.
+                    leftCorners = autoTwoPage.Left.Quad;
+                    rightCorners = autoTwoPage.Right.Quad;
+                    if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (page contours) — split into left/right pages automatically.");
+                }
                 else
                 {
                     // Best-effort automatic gutter detection; falls back to an even
                     // 50/50 split when no confident spine shadow is found.
-                    var gutter = DetectGutter(src);
                     var splitX = gutter.Confidence >= GutterConfidenceThreshold
                         ? (int)Math.Round(src.Width * gutter.Fraction)
                         : src.Width / 2;
                     splitX = Math.Clamp(splitX, 1, src.Width - 1);
                     leftCorners = RectCorners(0, 0, splitX, src.Height);
                     rightCorners = RectCorners(splitX, 0, src.Width - splitX, src.Height);
+                    if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (spine shadow) — split into left/right pages automatically.");
                 }
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
@@ -1264,6 +1313,23 @@ public class ImageProcessor
         return sb.ToString();
     }
 
+    /// <summary>Diagnostic-only entry point: reports the raw gutter-shadow and two-page-contour
+    /// detection signals for troubleshooting the auto-split promotion in <see cref="Process"/>
+    /// against a real photo, without needing a whole batch/queue round-trip.</summary>
+    public static string DebugSpreadDetection(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+        var gutter = DetectGutter(mat);
+        sb.AppendLine($"Gutter: fraction={gutter.Fraction:F4} confidence={gutter.Confidence:F4} absoluteDropLevels={gutter.AbsoluteDropLevels:F2}");
+        var instance = new ImageProcessor();
+        var twoPage = instance.DetectTwoPageBoundaries(mat);
+        sb.AppendLine($"TwoPage: found={twoPage.Found} leftConfidence={twoPage.Left.Confidence:F4} rightConfidence={twoPage.Right.Confidence:F4}");
+        return sb.ToString();
+    }
+
     private static string FormatCoeffs(double[]? coeffs) =>
         coeffs == null ? "null" : string.Join(",", coeffs.Select(c => c.ToString("F4", CultureInfo.InvariantCulture)));
 
@@ -1375,7 +1441,15 @@ public class ImageProcessor
 
     // ───────────── BOOK SPLIT (GUTTER DETECTION) ─────────────
 
-    private readonly record struct GutterDetection(double Fraction, double Confidence);
+    /// <param name="AbsoluteDropLevels">The raw brightness drop (0-255 grayscale) between the
+    /// search window's average and its darkest column. <see cref="Confidence"/> alone is a
+    /// *relative* drop (avg-min)/avg, which blows up from ordinary compression/blur noise when
+    /// the window's average brightness is itself near zero (a near-black background, not a lit
+    /// page) — a real spine shadow always darkens a real midtone-or-brighter page, so callers
+    /// deciding whether to trust this as "there really is a spine here" (as opposed to merely
+    /// "where would the split line go, given we already know it's a spread") should gate on
+    /// this too, not Confidence alone.</param>
+    private readonly record struct GutterDetection(double Fraction, double Confidence, double AbsoluteDropLevels);
 
     /// <summary>Detects a book's gutter (spine shadow) as a fraction of image width by
     /// finding the darkest vertical band within the central portion of a two-page spread.
@@ -1397,7 +1471,7 @@ public class ImageProcessor
         // for the gutter — a real spine sits between the two pages, not at the frame edges.
         int searchStart = (int)(width * 0.3);
         int searchEnd = (int)(width * 0.7);
-        if (searchEnd <= searchStart) return new GutterDetection(0.5, 0);
+        if (searchEnd <= searchStart) return new GutterDetection(0.5, 0, 0);
 
         int minIdx = searchStart;
         float minVal = float.MaxValue;
@@ -1413,7 +1487,7 @@ public class ImageProcessor
 
         float windowAvg = count > 0 ? sum / count : 0;
         double confidence = windowAvg > 0 ? Math.Max(0, (windowAvg - minVal) / windowAvg) : 0;
-        return new GutterDetection((double)minIdx / width, confidence);
+        return new GutterDetection((double)minIdx / width, confidence, Math.Max(0, windowAvg - minVal));
     }
 
     /// <summary>Best-effort automatic gutter detection for the UI's split-percent slider

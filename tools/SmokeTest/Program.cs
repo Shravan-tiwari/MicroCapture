@@ -42,6 +42,8 @@ await TestSupersedeRaceDoesNotDuplicateExport();
 await TestBatchResumeDoesNotDuplicateBatch();
 TestDocumentBoundaryDetection();
 TestGutterSplitDetection();
+TestAutoSplitTriggersOnConfidentSpineShadow();
+TestAutoSplitDoesNotTriggerOnPlainSinglePage();
 TestManualOverrideLegacyRectCrop();
 TestManualOverrideQuadCrop();
 TestConvexityClampRejectsSelfIntersection();
@@ -402,6 +404,44 @@ void TestGutterSplitDetection()
 
     Check("Detected split lands near the known gutter position (not a lazy 50/50)",
         Math.Abs(splitPercent - 43.0) <= 3.0);
+}
+
+void TestAutoSplitTriggersOnConfidentSpineShadow()
+{
+    Console.WriteLine("\n-- Process() auto-splits a spread it was never told about, off a confident spine shadow --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 1000, imageHeight = 400;
+    const int gutterCenterX = 430; // same fixture as TestGutterSplitDetection — known-confident gutter.
+    var sourcePath = WriteGutterTestImage(Path.Combine(workDir, "auto_spread.png"), imageWidth, imageHeight, gutterCenterX, gutterBandWidth: 30);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    // splitPages: false and manualOverride: false — nobody asked for a split; this is exactly
+    // the automatic-capture path an operator who forgot to check Batch.SplitBookPages hits.
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+
+    Check("Processing succeeds", result.Success);
+    Check("A confident spine shadow alone promotes to a two-file split", result.OutputFilePaths.Count == 2);
+    if (result.OutputFilePaths.Count == 2)
+    {
+        Check("First output is the left half", result.OutputFilePaths[0].Contains("_1_left"));
+        Check("Second output is the right half", result.OutputFilePaths[1].Contains("_2_right"));
+    }
+    Check("A warning explains the auto-detected split", result.Warnings.Any(w => w.Contains("auto-detected")));
+}
+
+void TestAutoSplitDoesNotTriggerOnPlainSinglePage()
+{
+    Console.WriteLine("\n-- Process() leaves a real single page alone (no spine shadow to promote on) --");
+    var workDir = TempWorkDir();
+    var sourcePath = WriteSolidImage(Path.Combine(workDir, "auto_single.png"), 1000, 400);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+
+    Check("Processing succeeds", result.Success);
+    Check("No gutter signal means exactly one output file, not a false-positive split", result.OutputFilePaths.Count == 1);
+    if (result.OutputFilePaths.Count == 1)
+        Check("The single output is the whole-page path", result.OutputFilePaths[0].Contains("_processed"));
 }
 
 void TestManualOverrideLegacyRectCrop()
