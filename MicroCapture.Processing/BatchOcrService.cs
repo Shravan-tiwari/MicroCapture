@@ -26,7 +26,7 @@ public class BatchOcrService
     /// already have OcrStatus "Completed". Reports (done, total) after each page. Never throws
     /// for an individual page's OCR failure — that page's OcrStatus is set to "Failed"/"Skipped"
     /// and the run continues; only a genuine batch-lookup failure throws.</summary>
-    public async Task RunOcrForBatchAsync(string batchId, IProgress<(int Done, int Total)>? progress = null, CancellationToken token = default)
+    public async Task<OcrRunSummary> RunOcrForBatchAsync(string batchId, IProgress<(int Done, int Total)>? progress = null, CancellationToken token = default)
     {
         var queueService = new CaptureQueueService(_dbContext);
         var jobs = (await queueService.GetCompletedJobsForBatchAsync(batchId))
@@ -36,7 +36,7 @@ public class BatchOcrService
         var total = jobs.Count;
         var done = 0;
         progress?.Report((done, total));
-        if (total == 0) return;
+        if (total == 0) return new OcrRunSummary(0, 0, 0, CliMissing: false);
 
         OcrProcessor? ocrProcessor;
         try
@@ -52,18 +52,23 @@ public class BatchOcrService
                 done++;
                 progress?.Report((done, total));
             }
-            return;
+            return new OcrRunSummary(0, 0, total, CliMissing: true);
         }
 
         var allowManaged = string.Equals(Environment.GetEnvironmentVariable("MICROCAPTURE_ALLOW_MANAGED_TESS"), "1");
+        var cliMissing = !ocrProcessor.CliAvailable && !allowManaged;
+        var completed = 0;
+        var failed = 0;
+        var skipped = 0;
 
         foreach (var job in jobs)
         {
             token.ThrowIfCancellationRequested();
-            if (!ocrProcessor.CliAvailable && !allowManaged)
+            if (cliMissing)
             {
                 Console.Error.WriteLine($"OCR skipped for job {job.Id}: tesseract CLI not available and managed wrapper disabled");
                 await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Skipped");
+                skipped++;
             }
             else
             {
@@ -73,16 +78,25 @@ public class BatchOcrService
                     foreach (var file in files)
                         ocrProcessor.ProcessImage(file);
                     await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Completed");
+                    completed++;
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"OCR exception for job {job.Id}: {ex}");
                     await queueService.UpdateJobStatusAsync(job.Id, "ocr", "Failed");
+                    failed++;
                 }
             }
 
             done++;
             progress?.Report((done, total));
         }
+
+        return new OcrRunSummary(completed, failed, skipped, cliMissing);
     }
 }
+
+/// <summary>Outcome of a batch OCR run — lets the caller tell "OCR actually ran" apart from
+/// "every page was silently skipped because Tesseract isn't installed," which used to both
+/// report as a bare "OCR complete." with no indication anything was wrong.</summary>
+public readonly record struct OcrRunSummary(int Completed, int Failed, int Skipped, bool CliMissing);

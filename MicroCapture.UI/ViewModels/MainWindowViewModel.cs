@@ -827,18 +827,28 @@ public partial class MainWindowViewModel : ViewModelBase
 
     /// <summary>Runs OCR for the active batch's finalized page set. Shared by the explicit
     /// "Run OCR" button and by PDF export (which needs the text before it can embed it) —
-    /// idempotent, since BatchOcrService only touches jobs not already OcrStatus "Completed".</summary>
-    private async Task RunOcrForCurrentBatchAsync()
+    /// idempotent, since BatchOcrService only touches jobs not already OcrStatus "Completed".
+    /// Returns the run summary (rather than just setting StatusText itself) so a PDF export
+    /// can tell the operator its searchable-text layer is missing instead of silently
+    /// reporting "Exported successfully" over an un-OCR'd PDF.</summary>
+    private async Task<MicroCapture.Processing.OcrRunSummary?> RunOcrForCurrentBatchAsync()
     {
         var ocrService = new MicroCapture.Processing.BatchOcrService(_dbContext);
         var progress = new Progress<(int Done, int Total)>(p =>
         {
             StatusText = p.Total == 0 ? "OCR: nothing to do." : $"OCR: {p.Done}/{p.Total} pages...";
         });
+        MicroCapture.Processing.OcrRunSummary? summary = null;
         try
         {
-            await ocrService.RunOcrForBatchAsync(_currentBatchId!, progress);
-            StatusText = "OCR complete.";
+            summary = await ocrService.RunOcrForBatchAsync(_currentBatchId!, progress);
+            StatusText = summary switch
+            {
+                { CliMissing: true } => "OCR skipped — Tesseract OCR is not installed (or not on PATH). Install it, then click Run OCR again.",
+                { Failed: > 0 } s => $"OCR complete: {s.Completed} succeeded, {s.Failed} failed.",
+                { Completed: 0, Failed: 0, Skipped: 0 } => "OCR: nothing to do — already up to date.",
+                { } s => $"OCR complete: {s.Completed} page(s)."
+            };
         }
         catch (Exception ex)
         {
@@ -854,6 +864,8 @@ public partial class MainWindowViewModel : ViewModelBase
             if (refreshed.TryGetValue(thumbnail.JobId, out var ocrStatus))
                 thumbnail.OcrStatus = ocrStatus;
         }
+
+        return summary;
     }
 
     [RelayCommand(CanExecute = nameof(CanRunOcrOrExport))]
@@ -870,16 +882,21 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             // Only PDF export ever reads OCR text (a near-invisible searchable text layer) —
             // TIFF/JPG/PNG export never touches it, so skip straight to export for those.
-            if (string.Equals(ExportFormat, "PDF", StringComparison.OrdinalIgnoreCase))
+            var isPdf = string.Equals(ExportFormat, "PDF", StringComparison.OrdinalIgnoreCase);
+            var missingOcrText = false;
+            if (isPdf)
             {
                 StatusText = "Preparing searchable text...";
-                await RunOcrForCurrentBatchAsync();
+                var summary = await RunOcrForCurrentBatchAsync();
+                missingOcrText = summary is { CliMissing: true } or { Failed: > 0 };
             }
 
             StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
             var exportService = new MicroCapture.Processing.BatchExportService(_dbContext);
             var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
-            StatusText = $"Exported successfully: {Path.GetFileName(exportPath)}";
+            StatusText = missingOcrText
+                ? $"Exported: {Path.GetFileName(exportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
+                : $"Exported successfully: {Path.GetFileName(exportPath)}";
         }
         catch (InvalidOperationException ex) when (ex.Message == "Images are still being processed.")
         {

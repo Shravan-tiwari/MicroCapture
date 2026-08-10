@@ -35,11 +35,12 @@ The application interface consists of the following sections:
    - Wait for the Live View overlay to display **READY TO CAPTURE** (a document boundary has been detected and the project/batch are set). Camera focus and exposure remain operator-controlled through the dashboard.
    - Press **SPACEBAR** or click the **CAPTURE** button to take a photo.
 5. **Review Thumbnails and Crop**
-   As you capture, thumbnails appear in the bottom strip. The background worker automatically processes the images (cropping, deskewing, OCR).
+   As you capture, thumbnails appear in the bottom strip. The background worker automatically processes the images (cropping, deskewing). OCR does *not* run automatically — see step 6.
    - If a page needs to be retaken, press **R**. The replacement supersedes the earlier image and only the replacement is exported.
    - Click a thumbnail for crop review. For a single page, enter the crop rectangle in source-image pixels. For a book, set the split percentage. Saving reprocesses the preserved original.
-6. **Export**
-   Once thumbnails show Processed, select PDF, TIFF, JPG, or PNG and click **Export Batch**. PDF includes a basic OCR search/copy layer. All output files are checked before export reports success.
+6. **OCR and Export**
+   OCR runs on demand, not automatically: click **Run OCR** once thumbnails show Processed, or export straight to PDF (which runs OCR first if it hasn't already). This requires a separate **Tesseract OCR** install on the workstation (the CLI binary, on PATH or in its default Program Files location) — the app bundles only the English language data, not the OCR engine itself. If Tesseract isn't found, OCR is skipped and the status bar says so; PDFs exported without it have no searchable text layer.
+   Once thumbnails show Processed, select PDF, TIFF, JPG, or PNG and click **Export Batch**. All output files are checked before export reports success.
 
 ## 4. Keyboard Shortcuts
 
