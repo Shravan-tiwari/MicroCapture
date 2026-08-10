@@ -37,6 +37,12 @@ public class Batch
     // crop every batch already gets. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
     public bool DewarpEnabled { get; set; } = false;
 
+    // Converts every processed page to pure black-and-white via Sauvola local-adaptive
+    // thresholding, written out as a genuine 1-bit/CCITT-Group-4 TIFF (not just an 8-bit image
+    // that happens to look bitonal) — smaller files and crisper OCR input, at the cost of
+    // losing color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
+    public bool BinarizeEnabled { get; set; } = false;
+
     public Project? Project { get; set; }
     public ICollection<CaptureJob> Captures { get; set; } = new List<CaptureJob>();
 }

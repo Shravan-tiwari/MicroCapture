@@ -57,6 +57,7 @@ public class CaptureQueueService
         EnsureColumn("Batches", "DewarpEnabled", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "DewarpManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "DewarpCurve", "TEXT NULL");
+        EnsureColumn("Batches", "BinarizeEnabled", "INTEGER NOT NULL DEFAULT 0");
     }
 
     private void EnsureColumn(string table, string column, string definition)

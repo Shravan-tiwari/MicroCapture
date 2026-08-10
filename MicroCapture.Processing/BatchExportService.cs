@@ -116,8 +116,19 @@ public class BatchExportService
                             data.SaveTo(outStream);
                         }
                     }
+                    else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff")
+                    {
+                        // The source is already a TIFF ImageProcessor wrote (with its own DPI/
+                        // Author/Software tags, and — when binarized — genuine 1-bit/CCITT-G4
+                        // encoding). Copy it byte-for-byte rather than decoding and
+                        // re-encoding through OpenCV, which would silently re-inflate a
+                        // binarized page back to an ordinary 8-bit grayscale TIFF and throw
+                        // away the compression/size win that was the point of binarizing.
+                        File.Copy(f, targetPath, overwrite: true);
+                    }
                     else
                     {
+                        // Non-TIFF processed source (e.g. the SkiaSharp fallback path's .jpg) —
                         // OpenCV writes a real TIFF rather than mislabelling a PNG.
                         using var image = Cv2.ImRead(f, ImreadModes.Unchanged);
                         if (image.Empty() || !Cv2.ImWrite(targetPath, image))

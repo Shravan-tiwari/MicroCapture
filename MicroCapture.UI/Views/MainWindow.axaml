@@ -48,6 +48,9 @@
                     <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book Curve Correction"
                               ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight. Runs in the background queue, so it never affects capture speed."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (B&amp;W)"
+                              ToolTip.Tip="Thresholds every processed page to pure black-and-white (Sauvola local threshold) and writes it as a true 1-bit CCITT G4 TIFF — much smaller files and crisper OCR input, but loses all color/grayscale content. Not reversible after export."
+                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
                               Width="90" ToolTip.Tip="Default export format for the next batch"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"

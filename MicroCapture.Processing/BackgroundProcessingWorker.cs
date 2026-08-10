@@ -82,10 +82,11 @@ public class BackgroundProcessingWorker
                     bool splitPages = job.Batch?.SplitBookPages ?? false;
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
+                    bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
                     var metadata = new TiffMetadata(job.Batch?.Dpi ?? 300, job.Batch?.Operator, job.Timestamp);
                     var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied);
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {

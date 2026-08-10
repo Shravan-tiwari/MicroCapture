@@ -21,6 +21,11 @@ public class ProcessingResult
     public double OriginalSkewDegrees { get; set; }
     public double AppliedCorrectionDegrees { get; set; }
 
+    // Binarization — true when this page was thresholded to pure black-and-white and written
+    // as a genuine 1-bit/CCITT-G4 TIFF (see ImageProcessor.WriteBitonalTiff), not the normal
+    // 8-bit color/grayscale TIFF. WriteTiff call sites read this to pick the right writer.
+    public bool WasBinarized { get; set; }
+
     // QC results
     public double BlurScore { get; set; }
     public double ExposureScore { get; set; }

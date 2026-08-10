@@ -145,7 +145,7 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -199,17 +199,17 @@ public class ImageProcessor
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                WriteTiff(outLeft, leftResult, meta);
+                WriteTiff(outLeft, leftResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outLeft);
                 leftResult.Dispose();
 
                 // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                WriteTiff(outRight, rightResult, meta);
+                WriteTiff(outRight, rightResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outRight);
                 rightResult.Dispose();
 
@@ -225,12 +225,12 @@ public class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled);
                 manualCrop?.Dispose();
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, meta);
+                WriteTiff(outPath, processed, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outPath);
                 result.Success = true;
                 processed.Dispose();
@@ -287,7 +287,7 @@ public class ImageProcessor
     /// gating and no perspective warp — every defined rectangle is always cropped and saved
     /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
     /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -328,11 +328,11 @@ public class ImageProcessor
 
                 using var cropped = src[rect].Clone();
                 var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true, dewarpEnabled, savedDewarp, dewarpManualOverride);
+                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled);
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, meta);
+                WriteTiff(outPath, processed, meta, frameResult.WasBinarized);
                 result.OutputFilePaths.Add(outPath);
 
                 result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
@@ -357,8 +357,14 @@ public class ImageProcessor
     /// file's own resolution metadata is correct instead of absent (Explorer/Photoshop default
     /// an untagged TIFF to 96 DPI, which has nothing to do with what was actually captured).
     /// This only changes the resolution tag — it does not resample or add pixel detail.</summary>
-    private static void WriteTiff(string path, Mat mat, TiffMetadata metadata)
+    private static void WriteTiff(string path, Mat mat, TiffMetadata metadata, bool binarized = false)
     {
+        if (binarized)
+        {
+            WriteBitonalTiff(path, mat, metadata);
+            return;
+        }
+
         Cv2.ImWrite(path, mat,
             new ImageEncodingParam(ImwriteFlags.TiffResUnit, 2), // 2 = RESUNIT_INCH (libtiff)
             new ImageEncodingParam(ImwriteFlags.TiffXDpi, metadata.Dpi),
@@ -382,6 +388,59 @@ public class ImageProcessor
         {
             Console.Error.WriteLine($"[WriteTiff] Could not write metadata tags for '{path}': {ex}");
         }
+    }
+
+    /// <summary>Writes <paramref name="mat"/> (expected 8-bit single-channel, values only 0 or
+    /// 255 — see <see cref="ApplySauvolaBinarization"/>) as a genuine 1-bit-per-pixel TIFF with
+    /// CCITT Group 4 fax compression: the archival-standard bitonal format, not merely an
+    /// 8-bit image that happens to look black-and-white — this is what actually makes the file
+    /// size win real. Tag set and bit-packing convention follow BitMiracle.LibTiff.NET's own
+    /// official ImageToBitonalTiff sample (Photometric.MINISBLACK: packed bit 1 = white, bit 0
+    /// = black). All structural tags must be set before the first scanline is written, so
+    /// (unlike <see cref="WriteTiff"/>'s color path) this writes everything — pixels and
+    /// metadata tags alike — in one "w"-mode pass rather than reopening the file afterward.</summary>
+    private static void WriteBitonalTiff(string path, Mat mat, TiffMetadata metadata)
+    {
+        var width = mat.Cols;
+        var height = mat.Rows;
+        mat.GetArray(out byte[] pixels);
+
+        var stride = (width + 7) / 8;
+        var packed = new byte[stride * height];
+        for (var y = 0; y < height; y++)
+        {
+            var rowIn = y * width;
+            var rowOut = y * stride;
+            for (var x = 0; x < width; x++)
+            {
+                if (pixels[rowIn + x] != 0) // MINISBLACK: bit 1 = white, bit 0 = black.
+                    packed[rowOut + (x >> 3)] |= (byte)(0x80 >> (x & 7));
+            }
+        }
+
+        using var tiff = Tiff.Open(path, "w");
+        if (tiff == null) throw new IOException($"Could not create TIFF: {path}");
+
+        tiff.SetField(TiffTag.IMAGEWIDTH, width);
+        tiff.SetField(TiffTag.IMAGELENGTH, height);
+        tiff.SetField(TiffTag.BITSPERSAMPLE, 1);
+        tiff.SetField(TiffTag.SAMPLESPERPIXEL, 1);
+        tiff.SetField(TiffTag.PHOTOMETRIC, Photometric.MINISBLACK);
+        tiff.SetField(TiffTag.COMPRESSION, Compression.CCITTFAX4);
+        tiff.SetField(TiffTag.FILLORDER, FillOrder.MSB2LSB);
+        tiff.SetField(TiffTag.ORIENTATION, Orientation.TOPLEFT);
+        tiff.SetField(TiffTag.PLANARCONFIG, PlanarConfig.CONTIG);
+        tiff.SetField(TiffTag.ROWSPERSTRIP, height);
+        tiff.SetField(TiffTag.RESOLUTIONUNIT, ResUnit.INCH);
+        tiff.SetField(TiffTag.XRESOLUTION, (float)metadata.Dpi);
+        tiff.SetField(TiffTag.YRESOLUTION, (float)metadata.Dpi);
+        tiff.SetField(TiffTag.SOFTWARE, "MicroCapture");
+        tiff.SetField(TiffTag.DATETIME, metadata.TimestampUtc.ToString("yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture));
+        if (!string.IsNullOrWhiteSpace(metadata.Author))
+            tiff.SetField(TiffTag.ARTIST, metadata.Author);
+
+        for (var y = 0; y < height; y++)
+            tiff.WriteScanline(packed, y * stride, y, 0);
     }
 
     /// <summary>UI-facing, OpenCvSharp-free equivalent of <see cref="ParseCropCorners"/> — same
@@ -514,7 +573,7 @@ public class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false)
     {
         var working = input.Clone();
 
@@ -526,7 +585,11 @@ public class ImageProcessor
         working = TryDeskew(working, result);
         working = ApplyEnhancement(working);
         working = Sharpen(working);
+        // Quality checks must see the real (color/grayscale) capture, not a bilevel result —
+        // blur/exposure scores are meaningless once thresholded to pure black-and-white, so
+        // binarization runs last, after QC rather than before it.
         RunQualityChecks(working, result);
+        working = TryApplyBinarization(working, result, binarizeEnabled);
 
         return working;
     }
@@ -1520,5 +1583,108 @@ public class ImageProcessor
     {
         static int Rank(string v) => v switch { "FAIL" => 2, "WARNING" => 1, "PASS" => 0, _ => -1 };
         return Rank(candidate) > Rank(current) ? candidate : current;
+    }
+
+    // ───────────── BINARIZATION ─────────────
+
+    /// <summary>Applies Sauvola binarization if enabled, and reports what happened via
+    /// <paramref name="result"/> — same never-throws, degrade-to-unchanged shape as
+    /// <see cref="TryApplyDewarp"/>. Runs last in the pipeline (after QC, see
+    /// <see cref="ProcessSinglePage"/>) since blur/exposure scores are meaningless once
+    /// thresholded to pure black-and-white.</summary>
+    private Mat TryApplyBinarization(Mat src, ProcessingResult result, bool binarizeEnabled)
+    {
+        if (!binarizeEnabled) return src;
+        try
+        {
+            var binarized = ApplySauvolaBinarization(src);
+            result.WasBinarized = true;
+            result.Warnings.Add("Binarized to black-and-white (Sauvola local threshold).");
+            return binarized;
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Binarization failed: {ex.Message}");
+            return src;
+        }
+    }
+
+    /// <summary>Sauvola local-adaptive thresholding — the same algorithm Tesseract/Leptonica
+    /// switched to for their own best-quality binarization mode, chosen over a plain global
+    /// Otsu threshold specifically because it survives uneven lighting/shadow across a page (a
+    /// global threshold picks one cutoff for the whole image and fails wherever local
+    /// brightness drifts from it — exactly the low-contrast/uneven-lit condition this rig's
+    /// live view tends to show). threshold(x,y) = mean(x,y) * (1 + k * (stddev(x,y)/R - 1)),
+    /// k=0.34 and R=128 being Sauvola's own recommended defaults (also Leptonica's). Local
+    /// mean/stddev are computed per-pixel over a window in O(1) via integral images
+    /// (summed-area tables for the image and its square) rather than a naive per-pixel window
+    /// scan, which would be far too slow at full capture resolution.</summary>
+    private static Mat ApplySauvolaBinarization(Mat src)
+    {
+        using var gray = new Mat();
+        if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+        else src.CopyTo(gray);
+
+        // Window scales with resolution rather than a fixed pixel count — captures range from
+        // a few hundred to several thousand pixels wide, and a fixed small window would be far
+        // too fine-grained (noisy per-pixel thresholds) on a large image.
+        var longEdge = Math.Max(gray.Cols, gray.Rows);
+        var windowRadius = Math.Clamp(longEdge / 160, 7, 35);
+
+        using var sum = new Mat();
+        using var sqSum = new Mat();
+        Cv2.Integral(gray, sum, sqSum, MatType.CV_64F);
+
+        gray.GetArray(out byte[] pixels);
+        sum.GetArray(out double[] sumData);
+        sqSum.GetArray(out double[] sqSumData);
+
+        var rows = gray.Rows;
+        var cols = gray.Cols;
+        var sumStride = cols + 1;
+        var output = new byte[rows * cols];
+
+        const double k = 0.34;
+        const double r = 128.0; // Expected dynamic range of local standard deviation.
+
+        for (var y = 0; y < rows; y++)
+        {
+            var y0 = Math.Max(0, y - windowRadius);
+            var y1 = Math.Min(rows - 1, y + windowRadius);
+            var rowOffset = y * cols;
+            for (var x = 0; x < cols; x++)
+            {
+                var x0 = Math.Max(0, x - windowRadius);
+                var x1 = Math.Min(cols - 1, x + windowRadius);
+
+                var area = (double)(x1 - x0 + 1) * (y1 - y0 + 1);
+                var s = IntegralBoxSum(sumData, sumStride, x0, y0, x1, y1);
+                var sq = IntegralBoxSum(sqSumData, sumStride, x0, y0, x1, y1);
+
+                var mean = s / area;
+                var variance = Math.Max(0, sq / area - mean * mean);
+                var stdDev = Math.Sqrt(variance);
+
+                var threshold = mean * (1 + k * (stdDev / r - 1));
+                output[rowOffset + x] = pixels[rowOffset + x] > threshold ? (byte)255 : (byte)0;
+            }
+        }
+
+        var result = new Mat(rows, cols, MatType.CV_8UC1);
+        result.SetArray(output);
+        return result;
+    }
+
+    /// <summary>Box sum over the inclusive pixel rect [x0,x1]x[y0,y1] from an OpenCV integral
+    /// image's flat row-major data (one row/column larger than the source on each side, per
+    /// <see cref="Cv2.Integral(InputArray, OutputArray, OutputArray, int, int)"/>'s
+    /// convention) — the standard four-corner summed-area-table lookup.</summary>
+    private static double IntegralBoxSum(double[] integral, int stride, int x0, int y0, int x1, int y1)
+    {
+        var a = integral[y0 * stride + x0];
+        var b = integral[y0 * stride + (x1 + 1)];
+        var c = integral[(y1 + 1) * stride + x0];
+        var d = integral[(y1 + 1) * stride + (x1 + 1)];
+        return d - b - c + a;
     }
 }

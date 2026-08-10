@@ -73,6 +73,11 @@ public partial class MainWindowViewModel : ViewModelBase
     // responsiveness. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
     [ObservableProperty] private bool _dewarpEnabled = false;
 
+    // Converts processed pages to pure black-and-white (Sauvola local threshold, written as a
+    // genuine 1-bit/CCITT-G4 TIFF) — smaller files and crisper OCR input, at the cost of any
+    // color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
+    [ObservableProperty] private bool _binarizeEnabled = false;
+
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
     // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
@@ -449,6 +454,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 ExportFormat = batch.PreferredExportFormat;
                 SelectedDpi = batch.Dpi;
                 DewarpEnabled = batch.DewarpEnabled;
+                BinarizeEnabled = batch.BinarizeEnabled;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -463,7 +469,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     SplitBookPages = SplitBookPages && !UseFixedFrames,
                     PreferredExportFormat = DefaultExportFormat,
                     Dpi = SelectedDpi,
-                    DewarpEnabled = DewarpEnabled
+                    DewarpEnabled = DewarpEnabled,
+                    BinarizeEnabled = BinarizeEnabled
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();
