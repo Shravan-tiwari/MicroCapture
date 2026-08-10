@@ -29,6 +29,8 @@ switch (args[0])
         return RunDewarpModel(args);
     case "spread":
         return RunSpread(args);
+    case "boundary":
+        return RunBoundary(args);
     default:
         PrintUsage();
         return 1;
@@ -41,6 +43,7 @@ static void PrintUsage()
     Console.WriteLine("  calibrate <calibration-images-dir>");
     Console.WriteLine("  dewarp-lines <cropped-page-image>");
     Console.WriteLine("  spread <image-or-dir>");
+    Console.WriteLine("  boundary <image-or-dir>");
 }
 
 static int RunProcess(string[] args)
@@ -194,6 +197,36 @@ static int RunSpread(string[] args)
     {
         Console.WriteLine($"=== {Path.GetFileName(path)} ===");
         Console.WriteLine(ImageProcessor.DebugSpreadDetection(File.ReadAllBytes(path)));
+    }
+    return 0;
+}
+
+static int RunBoundary(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        // Cv2.ImDecode (which DebugBoundaryDetection uses) doesn't handle TIFF — bridge
+        // through the same helper the UI uses to display a TIFF ImageProcessor itself wrote.
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugBoundaryDetection(bytes));
     }
     return 0;
 }

@@ -275,6 +275,22 @@ public class ImageProcessor
                 {
                     // Best-effort automatic gutter detection; falls back to an even
                     // 50/50 split when no confident spine shadow is found.
+                    //
+                    // Tried and reverted: cropping the whole spread's own boundary first (the
+                    // same detector TryAutoCrop already trusts for a single page, which does
+                    // crop the whole spread reliably) and splitting *that* instead of the raw
+                    // frame. It reliably removed the background/hand clutter that otherwise
+                    // defeats each half's own auto-crop — but a single straight vertical cut
+                    // through a rectified whole-spread crop doesn't track a real book's spine,
+                    // which isn't a straight vertical line once there's any page curvature or
+                    // camera tilt. Confirmed on a real photo: the "right" half's crop landed far
+                    // enough left of the true spine to include a legible, non-mirrored chunk of
+                    // the *left* page's own text — genuine cross-page content contamination,
+                    // not the faint mirrored show-through of real paper bleedthrough. That's a
+                    // worse failure than the background-inclusion problem it was meant to fix
+                    // (a background-inclusive crop only wastes space; this loses/duplicates real
+                    // page content), so it's reverted rather than shipped. The background-in-half
+                    // gap therefore remains open — see the validation report.
                     var splitX = gutter.Confidence >= GutterConfidenceThreshold
                         ? (int)Math.Round(src.Width * gutter.Fraction)
                         : src.Width / 2;
@@ -1327,6 +1343,44 @@ public class ImageProcessor
         var instance = new ImageProcessor();
         var twoPage = instance.DetectTwoPageBoundaries(mat);
         sb.AppendLine($"TwoPage: found={twoPage.Found} leftConfidence={twoPage.Left.Confidence:F4} rightConfidence={twoPage.Right.Confidence:F4}");
+        return sb.ToString();
+    }
+
+    /// <summary>Diagnostic-only entry point: reports both contour passes' best area ratio and
+    /// resulting confidence, for troubleshooting why TryAutoCrop declined to crop a specific
+    /// image (e.g. a post-split half that still includes background clutter).</summary>
+    public string DebugBoundaryDetection(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+        var (directPass, normalizedPass) = FindDocumentContourPasses(mat);
+        var imageArea = mat.Rows * (double)mat.Cols;
+
+        sb.AppendLine($"Direct pass: {directPass.Contours.Length} contour(s)");
+        foreach (var c in directPass.Contours.OrderByDescending(c => Cv2.ContourArea(c)).Take(3))
+        {
+            var d = BuildDetection(c, imageArea, mat.Cols, mat.Rows);
+            sb.AppendLine($"  ratio={Cv2.ContourArea(c) / imageArea:F4} found={d.Found} confidence={d.Confidence:F4} rect={d.PaddedRect}");
+        }
+
+        if (normalizedPass is { } np)
+        {
+            sb.AppendLine($"Normalized pass: {np.Contours.Length} contour(s)");
+            foreach (var c in np.Contours.OrderByDescending(c => Cv2.ContourArea(c)).Take(3))
+            {
+                var d = BuildDetection(c, imageArea, mat.Cols, mat.Rows);
+                sb.AppendLine($"  ratio={Cv2.ContourArea(c) / imageArea:F4} found={d.Found} confidence={d.Confidence:F4} rect={d.PaddedRect}");
+            }
+        }
+        else
+        {
+            sb.AppendLine("Normalized pass: not run (direct pass already found a large-enough contour)");
+        }
+
+        var best = DetectBoundaryInMat(mat);
+        sb.AppendLine($"Winner: found={best.Found} confidence={best.Confidence:F4} (MediumConfidenceThreshold={MediumConfidenceThreshold})");
         return sb.ToString();
     }
 
