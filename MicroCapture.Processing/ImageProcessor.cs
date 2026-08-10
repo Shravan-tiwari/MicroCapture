@@ -897,6 +897,23 @@ public class ImageProcessor
             var normalizedBest = BestDetectionFromContours(np.Contours, imageArea, regionMat.Cols, regionMat.Rows);
             if (normalizedBest.Confidence > best.Confidence) best = normalizedBest;
         }
+
+        // Last resort: neither pass found anything ratio-qualifying at all (BuildDetection's
+        // own 0.1 gate). Confirmed against real post-split page halves that this is usually not
+        // a missing edge but a *fragmented* one — the real page boundary breaks into hundreds of
+        // small disconnected pieces (a textured/scratched desk background, a hand, a spine)
+        // instead of one closed loop, because dilate(5x5, x2) isn't enough to bridge the gaps.
+        // Retried with much heavier dilation, which trades boundary precision for closing those
+        // gaps. Only ever runs when both normal passes already came up empty, so it's strictly
+        // additive — it cannot make an already-working detection worse, only rescue one that was
+        // otherwise a total miss.
+        if (!best.Found)
+        {
+            var aggressive = FindContoursWithHeavyDilation(regionMat);
+            var aggressiveBest = BestDetectionFromContours(aggressive, imageArea, regionMat.Cols, regionMat.Rows);
+            if (aggressiveBest.Found) best = aggressiveBest;
+        }
+
         return best;
     }
 
@@ -909,6 +926,25 @@ public class ImageProcessor
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
         using var dilated = new Mat();
         Cv2.Dilate(edged, dilated, kernel, iterations: 2);
+
+        Cv2.FindContours(dilated, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        return contours;
+    }
+
+    private static Point[][] FindContoursWithHeavyDilation(Mat src)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+
+        var (low, high) = AutoCannyThresholds(blurred);
+        using var edged = new Mat();
+        Cv2.Canny(blurred, edged, low, high);
+
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(15, 15));
+        using var dilated = new Mat();
+        Cv2.Dilate(edged, dilated, kernel, iterations: 4);
 
         Cv2.FindContours(dilated, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
         return contours;
