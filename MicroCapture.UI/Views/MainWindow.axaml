@@ -3,6 +3,7 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:views="using:MicroCapture.UI.Views"
         xmlns:conv="using:MicroCapture.UI.Converters"
+        xmlns:acv="using:Avalonia.Data.Converters"
         xmlns:core="using:MicroCapture.Core.Interfaces"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -66,6 +67,10 @@
                     <Button Classes="secondary" Command="{Binding CalibrateFramesCommand}"
                             Content="{Binding CalibrateButtonLabel}"
                             IsVisible="{Binding ShowCalibrateButton}"/>
+                    <Button Classes="secondary" Command="{Binding CalibrateLensCommand}"
+                            Content="Calibrate Lens"
+                            ToolTip.Tip="One-time camera lens distortion calibration against a printed ChArUco board — corrects barrel/pincushion distortion before any other geometric correction runs"
+                            IsVisible="{Binding IsConnected}"/>
                     <Button Classes="secondary" Width="96" Margin="10,0,0,0" Click="OnExportFormatButtonClick"
                             ToolTip.Tip="Export format">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
@@ -121,11 +126,18 @@
                 </Grid>
             </Border>
 
-            <!-- Inline calibration panel — replaces live view during calibration -->
+            <!-- Inline calibration panels — replace live view during calibration. Both share
+                 the same IsCalibrating gate (blocks Capture/Recapture), but each panel only
+                 shows for its own calibration type, distinguished by which ViewModel is set. -->
             <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
                     BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
-                    IsVisible="{Binding IsCalibrating}">
+                    IsVisible="{Binding CalibrationViewModel, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
                 <views:FrameCalibrationPanel DataContext="{Binding CalibrationViewModel}"/>
+            </Border>
+            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+                    IsVisible="{Binding LensCalibrationViewModel, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
+                <views:LensCalibrationPanel DataContext="{Binding LensCalibrationViewModel}"/>
             </Border>
 
             <!-- Right Panel: Status & Settings -->

@@ -1,0 +1,78 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.LensCalibrationPanel"
+        x:DataType="vm:LensCalibrationViewModel"
+        Background="{StaticResource CanvasBrush}">
+    <Grid RowDefinitions="*, Auto">
+        <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
+            <!-- Status + captured-shots log -->
+            <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="1" Margin="14" CornerRadius="10" Padding="20">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="LENS CALIBRATION" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
+                    <TextBlock TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}"
+                               Text="Hold the calibration board (checkerboard with ArUco markers) under the camera and click Capture repeatedly at varied tilts and positions across the frame — corners, edges, and a range of angles all help. Square size doesn't need to be measured precisely."/>
+                    <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="14" FontWeight="Medium"
+                               Foreground="{StaticResource InkBrush}"/>
+
+                    <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12" IsVisible="{Binding HasResult}">
+                        <StackPanel Spacing="6">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBlock Text="Reprojection error" Foreground="{StaticResource InkTertiaryBrush}" FontSize="13"/>
+                                <TextBlock Text="{Binding ReprojectionErrorPx, StringFormat='{}{0:F2} px'}" FontWeight="SemiBold" FontSize="13"
+                                           Foreground="{StaticResource InkBrush}"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBlock Text="Images used" Foreground="{StaticResource InkTertiaryBrush}" FontSize="13"/>
+                                <TextBlock Text="{Binding ImagesUsedInResult}" FontSize="13" Foreground="{StaticResource InkBrush}"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock Text="Log" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <ScrollViewer MaxHeight="220">
+                        <ItemsControl ItemsSource="{Binding Log}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="12"
+                                               Foreground="{StaticResource InkMutedBrush}" Margin="0,0,0,4"/>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </StackPanel>
+            </Border>
+
+            <!-- Capture count / progress -->
+            <Border Grid.Column="1" Classes="panel" Margin="0,14,14,14" Padding="14">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="PROGRESS" Classes="sectionLabel"/>
+                    <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="Good captures" Foreground="{StaticResource InkTertiaryBrush}" FontSize="13"/>
+                            <TextBlock Text="{Binding GoodCaptureCount}" Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" FontSize="18"/>
+                            <TextBlock Text="{Binding RecommendedCaptureCount, StringFormat='/ {0} recommended'}"
+                                       Foreground="{StaticResource InkTertiaryBrush}" FontSize="13" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
+                    <Button Content="Capture" Command="{Binding CaptureCommand}" Classes="primary" HorizontalAlignment="Stretch"/>
+                    <Button Content="Compute Calibration" Command="{Binding ComputeCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- Bottom action bar -->
+        <Border Grid.Row="1" Classes="panel" Margin="14,0,14,14" Padding="16,12">
+            <Grid ColumnDefinitions="*, Auto">
+                <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="13"
+                           Foreground="{StaticResource InkMutedBrush}"
+                           Text="Saving replaces the rig's active calibration — every batch started afterward snapshots it; already-started batches are unaffected."/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    <Button Content="Cancel" Command="{Binding CancelCommand}" Classes="secondary"/>
+                    <Button Content="Save" Command="{Binding SaveCommand}" Classes="primary"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>

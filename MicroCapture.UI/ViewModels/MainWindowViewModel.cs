@@ -49,6 +49,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private bool _isFixedFrameBatch = false;
     [ObservableProperty] private bool _isCalibrating;
     [ObservableProperty] private FrameCalibrationViewModel? _calibrationViewModel;
+    [ObservableProperty] private LensCalibrationViewModel? _lensCalibrationViewModel;
     // Run OCR and Export Batch must never overlap — both touch the same jobs' OCR/export
     // status, and a PDF export runs OCR itself first if it isn't already done.
     [ObservableProperty]
@@ -613,6 +614,40 @@ public partial class MainWindowViewModel : ViewModelBase
             }
         }
         finally { Volatile.Write(ref _captureInProgress, 0); }
+    }
+
+    /// <summary>Opens the one-time lens (camera intrinsics/distortion) calibration flow —
+    /// independent of any batch/project, since a lens calibration belongs to the physical rig,
+    /// not to any one capture session. Unlike <see cref="CalibrateFramesAsync"/>, this owns a
+    /// repeated-capture loop internally (see <see cref="LensCalibrationViewModel"/>) rather than
+    /// taking one throwaway shot up front.</summary>
+    [RelayCommand]
+    private async Task CalibrateLensAsync()
+    {
+        if (!IsConnected) { StatusText = "Connect the camera before calibrating the lens."; return; }
+        if (IsCalibrating) { StatusText = "Finish or cancel the current calibration first."; return; }
+
+        // A lens calibration isn't tied to any project, so it needs its own directory even
+        // when no batch has been started yet (_outputDirectory is only populated by
+        // StartBatchAsync) — falls back to a fixed app-data location in that case, reusing
+        // AppDbContext's own LocalApplicationData convention.
+        var calibrationDir = !string.IsNullOrEmpty(_outputDirectory)
+            ? Path.Combine(_outputDirectory, "LensCalibration")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MicroCapture", "LensCalibration");
+
+        var lensCalibrationViewModel = new LensCalibrationViewModel(_dbContext, _cameraService, calibrationDir, _connectedCameraModel);
+        var tcs = new TaskCompletionSource<bool>();
+        lensCalibrationViewModel.Saved += (_, _) => tcs.TrySetResult(true);
+        lensCalibrationViewModel.Cancelled += (_, _) => tcs.TrySetResult(false);
+
+        LensCalibrationViewModel = lensCalibrationViewModel;
+        IsCalibrating = true;
+
+        var saved = await tcs.Task;
+
+        IsCalibrating = false;
+        LensCalibrationViewModel = null;
+        StatusText = saved ? "Lens calibration saved — new batches will undistort using it." : "Lens calibration cancelled.";
     }
 
     /// <summary>Rebuilds the thumbnail strip from a resumed batch's most recent, non-superseded capture per page.</summary>

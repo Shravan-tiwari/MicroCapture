@@ -19,6 +19,18 @@ public readonly record struct TiffMetadata(int Dpi, string? Author, DateTime Tim
 /// <see cref="DocumentBoundary"/> and <see cref="LiveFrameCheck"/>).</summary>
 public readonly record struct CropPoint(double X, double Y);
 
+/// <summary>One-time camera lens intrinsics/distortion calibration, computed by
+/// <see cref="LensCalibrationService"/> from photos of a ChArUco calibration board and applied
+/// via <see cref="ImageProcessor.Undistort"/> at the very start of the pipeline (before
+/// cropping), since undistorting a full raw frame avoids principal-point bookkeeping a
+/// post-crop undistort would need. <see cref="CalibratedWidth"/>/<see cref="CalibratedHeight"/>
+/// record the pixel resolution the calibration itself was computed at, so <see cref="Undistort"/>
+/// can scale the focal length/principal point if a capture's resolution ever differs —
+/// distortion coefficients themselves are resolution-independent. OpenCvSharp-free (mirrors
+/// <see cref="CropPoint"/>/<see cref="TiffMetadata"/>) so it can safely cross into the UI
+/// project.</summary>
+public readonly record struct LensCalibration(double Fx, double Fy, double Cx, double Cy, double[] DistCoeffs, int CalibratedWidth, int CalibratedHeight);
+
 /// <summary>One operator-calibrated fixed-frame rectangle, in the pixel space of the image it
 /// was calibrated against (see Batch.FixedFrameImageWidth/Height). Unlike <see cref="CropPoint"/>
 /// quads, fixed frames are always axis-aligned — no perspective correction, since they exist
@@ -39,10 +51,13 @@ public readonly record struct DewarpModel(CropPoint[] TopControlPoints, CropPoin
 }
 
 /// <summary>Document boundary detected in a still image, in that image's own pixel coordinates.
-/// <see cref="Quad"/> is populated when the detected contour approximated a clean
-/// quadrilateral (ordered top-left, top-right, bottom-right, bottom-left) — the UI should
-/// prefer it over the axis-aligned <see cref="X"/>/<see cref="Y"/>/<see cref="Width"/>/
-/// <see cref="Height"/> rect when present, since it captures perspective skew the rect can't.</summary>
+/// <see cref="Quad"/> (ordered top-left, top-right, bottom-right, bottom-left) is populated
+/// whenever a boundary was found at all — <c>ImageProcessor.DeriveQuad</c> always derives 4
+/// corners from the detected contour (falling back to its convex hull's extreme corners when
+/// the contour doesn't cleanly approximate to 4 points), so it's null only in the vanishingly
+/// rare case of a fully degenerate contour. The UI should prefer it over the axis-aligned
+/// <see cref="X"/>/<see cref="Y"/>/<see cref="Width"/>/<see cref="Height"/> rect when present,
+/// since it captures perspective skew the rect can't.</summary>
 public readonly record struct DocumentBoundary(int X, int Y, int Width, int Height, double Confidence, CropPoint[]? Quad = null);
 
 /// <summary>Result of a single live-view frame check: whether a document-sized boundary is
@@ -69,8 +84,23 @@ public class ImageProcessor
     // CropConfidenceThreshold, a suggestion is still shown, but flagged as lower-confidence
     // rather than presented with the same certainty as a high-confidence detection.
     public double MediumConfidenceThreshold { get; set; } = 0.3;
-    public double MaxDeskewDegrees { get; set; } = 5.0;
+    // Raised from the old 5.0 now that the primary estimate comes from actual text-line
+    // baselines (TryDeskew) rather than raw whole-image Hough lines — far less prone to the
+    // false-positive risk (shadows/page borders/background objects) that motivated the
+    // original tight clamp. WarpAffine keeps the source canvas size unchanged, so very large
+    // angles start clipping corners; 15° is a reasoned starting point pending validation
+    // against real captures, not a hard physical limit.
+    public double MaxDeskewDegrees { get; set; } = 15.0;
+    // Text-line angle estimates whose interquartile range exceeds this are inconsistent enough
+    // that the median isn't trustworthy as a single global rotation — falls back to whole-image
+    // Hough detection instead of risking a wrong rotation from disagreeing evidence.
+    public double MaxDeskewAngleIqrDegrees { get; set; } = 3.0;
     public int CropPadding { get; set; } = 10;
+    // How far outward a fixed-frame's calibrated rectangle is padded before it's searched for
+    // the real page boundary (as a fraction of the rectangle's own width/height) — the real
+    // page edge may sit slightly outside what the operator drew. Starting point pending
+    // validation against real fixed-frame captures.
+    public double FixedFrameSearchPadFraction { get; set; } = 0.15;
     public double BlurThreshold { get; set; } = 100.0;
     public double GutterConfidenceThreshold { get; set; } = 0.08;
     // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
@@ -145,7 +175,7 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -164,13 +194,21 @@ public class ImageProcessor
         try
         {
             Directory.CreateDirectory(outputDirectory);
-            using var src = Cv2.ImRead(inputPath, ImreadModes.Color);
-            if (src.Empty())
+            using var rawSrc = Cv2.ImRead(inputPath, ImreadModes.Color);
+            if (rawSrc.Empty())
             {
                 result.Success = false;
                 result.Errors.Add("Failed to decode image.");
                 return result;
             }
+
+            // Lens undistortion runs before anything else — it corrects the camera's own
+            // optics, not how the page sits in frame, so every geometric correction after this
+            // point (boundary detection, trapezoid warp, curve dewarp, deskew) sees an already-
+            // rectilinear image instead of having to work around residual barrel/pincushion
+            // distortion baked into the raw capture.
+            using var undistorted = lensCalibration is { } calib ? SafeUndistort(rawSrc, calib, result) : null;
+            var src = undistorted ?? rawSrc;
 
             if (splitPages)
             {
@@ -199,7 +237,7 @@ public class ImageProcessor
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
                 WriteTiff(outLeft, leftResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outLeft);
@@ -207,7 +245,7 @@ public class ImageProcessor
 
                 // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
                 WriteTiff(outRight, rightResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outRight);
@@ -225,7 +263,7 @@ public class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi);
                 manualCrop?.Dispose();
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
@@ -283,11 +321,16 @@ public class ImageProcessor
     }
 
     /// <summary>Crops one captured frame into N independent output files using a batch's
-    /// pre-calibrated fixed rectangles, instead of per-shot contour detection. No confidence
-    /// gating and no perspective warp — every defined rectangle is always cropped and saved
-    /// as-is (aside from deskew/enhancement), since these exist only for a stationary,
-    /// straight-down copy-stand shot where the frame position never needs to be guessed.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false)
+    /// pre-calibrated fixed rectangles as search regions, not final crops: each rectangle is
+    /// padded and searched for the actual page boundary within it (see the
+    /// <c>searchRegion</c> overload of <see cref="DetectBoundary"/>), getting the same
+    /// perspective/curve/skew correction as a normal auto-cropped capture. A rectangle only
+    /// degrades to a plain crop-as-drawn when detection confidence within it is too low — never
+    /// worse than the previous unconditional-crop behavior, only better on a confident
+    /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
+    /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
+    /// baking in whatever keystone or page bow happens to be present that day.</summary>
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -303,13 +346,16 @@ public class ImageProcessor
         try
         {
             Directory.CreateDirectory(outputDirectory);
-            using var src = Cv2.ImRead(inputPath, ImreadModes.Color);
-            if (src.Empty())
+            using var rawSrc = Cv2.ImRead(inputPath, ImreadModes.Color);
+            if (rawSrc.Empty())
             {
                 result.Success = false;
                 result.Errors.Add("Failed to decode image.");
                 return result;
             }
+
+            using var undistorted = lensCalibration is { } calib ? SafeUndistort(rawSrc, calib, result) : null;
+            var src = undistorted ?? rawSrc;
 
             var frames = ParseFixedFrames(fixedFramesSpec);
             if (frames.Length == 0)
@@ -326,9 +372,8 @@ public class ImageProcessor
                     (int)Math.Round(frames[i].X), (int)Math.Round(frames[i].Y),
                     (int)Math.Round(frames[i].Width), (int)Math.Round(frames[i].Height)), src.Cols, src.Rows);
 
-                using var cropped = src[rect].Clone();
                 var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                using var processed = ProcessSinglePage(cropped, frameResult, skipAutoCrop: true, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled);
+                using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect);
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
@@ -353,10 +398,24 @@ public class ImageProcessor
         return result;
     }
 
-    /// <summary>Writes a processed page as TIFF, tagging it with the batch's chosen DPI so the
-    /// file's own resolution metadata is correct instead of absent (Explorer/Photoshop default
-    /// an untagged TIFF to 96 DPI, which has nothing to do with what was actually captured).
-    /// This only changes the resolution tag — it does not resample or add pixel detail.</summary>
+    /// <summary>Writes a processed page as TIFF, tagging it with the batch's chosen DPI and
+    /// Software/DateTime/Artist metadata so the file's own properties are correct instead of
+    /// absent (Explorer/Photoshop default an untagged TIFF to 96 DPI, which has nothing to do
+    /// with what was actually captured). This only sets metadata tags — it does not resample or
+    /// add pixel detail.
+    ///
+    /// Writes pixel data and every tag in one single-pass LibTiff.NET "w"-mode session — same
+    /// approach <see cref="WriteBitonalTiff"/> already used, now used here too. This method used
+    /// to write pixels via <c>Cv2.ImWrite</c> and then reopen the file in "r+" mode purely to
+    /// add the Artist/Software/DateTime tags LibTiff doesn't support, finishing with
+    /// <c>Tiff.RewriteDirectory()</c> to relocate the now-larger directory. That reopen-and-move
+    /// step is the confirmed root cause of a real corruption bug: on at least one real capture,
+    /// it silently scrambled the row/strip layout of the already-correctly-processed image,
+    /// producing a diagonally-sheared, garbled output with no exception or warning anywhere —
+    /// found by bisecting the pipeline stage-by-stage and confirming every processing step
+    /// (crop/deskew/dewarp/enhance/sharpen) produced a correct image right up until this write
+    /// step. Writing every tag before the first scanline, in one pass, never needs to relocate
+    /// anything and has no such failure mode.</summary>
     private static void WriteTiff(string path, Mat mat, TiffMetadata metadata, bool binarized = false)
     {
         if (binarized)
@@ -365,28 +424,61 @@ public class ImageProcessor
             return;
         }
 
-        Cv2.ImWrite(path, mat,
-            new ImageEncodingParam(ImwriteFlags.TiffResUnit, 2), // 2 = RESUNIT_INCH (libtiff)
-            new ImageEncodingParam(ImwriteFlags.TiffXDpi, metadata.Dpi),
-            new ImageEncodingParam(ImwriteFlags.TiffYDpi, metadata.Dpi));
+        var width = mat.Cols;
+        var height = mat.Rows;
+        var channels = mat.Channels();
+        // Mat.GetArray(out byte[]) only accepts single-channel Mats — reshape to a
+        // single-channel (height, width*channels) view first (a metadata-only reinterpretation
+        // of the same row-major buffer, not a copy — safe to dispose independently of the
+        // caller's own `mat`) so a 3-channel BGR Mat can be read the same way the bitonal
+        // (1-channel) path already does.
+        using var flatMat = mat.Reshape(1, height);
+        flatMat.GetArray(out byte[] pixels);
 
-        // OpenCV's own TIFF writer has no support for Artist/Software/DateTime tags — reopen
-        // the file it just wrote (pixel data untouched) purely to add them, the same operation
-        // libtiff's own "tiffset" CLI tool performs. Best-effort: a tag-write failure must
-        // never invalidate an image that was already written successfully.
-        try
+        using var tiff = Tiff.Open(path, "w");
+        if (tiff == null) throw new IOException($"Could not create TIFF: {path}");
+
+        tiff.SetField(TiffTag.IMAGEWIDTH, width);
+        tiff.SetField(TiffTag.IMAGELENGTH, height);
+        tiff.SetField(TiffTag.BITSPERSAMPLE, 8);
+        tiff.SetField(TiffTag.SAMPLESPERPIXEL, channels);
+        tiff.SetField(TiffTag.PHOTOMETRIC, channels >= 3 ? Photometric.RGB : Photometric.MINISBLACK);
+        tiff.SetField(TiffTag.COMPRESSION, Compression.LZW);
+        tiff.SetField(TiffTag.FILLORDER, FillOrder.MSB2LSB);
+        tiff.SetField(TiffTag.ORIENTATION, Orientation.TOPLEFT);
+        tiff.SetField(TiffTag.PLANARCONFIG, PlanarConfig.CONTIG);
+        tiff.SetField(TiffTag.ROWSPERSTRIP, height);
+        tiff.SetField(TiffTag.RESOLUTIONUNIT, ResUnit.INCH);
+        tiff.SetField(TiffTag.XRESOLUTION, (float)metadata.Dpi);
+        tiff.SetField(TiffTag.YRESOLUTION, (float)metadata.Dpi);
+        tiff.SetField(TiffTag.SOFTWARE, "MicroCapture");
+        tiff.SetField(TiffTag.DATETIME, metadata.TimestampUtc.ToString("yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture));
+        if (!string.IsNullOrWhiteSpace(metadata.Author))
+            tiff.SetField(TiffTag.ARTIST, metadata.Author);
+
+        var stride = width * channels;
+        var rowBuf = new byte[stride];
+        for (var y = 0; y < height; y++)
         {
-            using var tiff = Tiff.Open(path, "r+");
-            if (tiff == null) return;
-            tiff.SetField(TiffTag.SOFTWARE, "MicroCapture");
-            tiff.SetField(TiffTag.DATETIME, metadata.TimestampUtc.ToString("yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture));
-            if (!string.IsNullOrWhiteSpace(metadata.Author))
-                tiff.SetField(TiffTag.ARTIST, metadata.Author);
-            tiff.RewriteDirectory();
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[WriteTiff] Could not write metadata tags for '{path}': {ex}");
+            var rowOffset = y * stride;
+            if (channels == 3)
+            {
+                // OpenCvSharp Mats are BGR-ordered; TIFF's RGB photometric expects RGB per
+                // pixel, so swap R/B per pixel while copying into the scanline buffer.
+                for (var x = 0; x < width; x++)
+                {
+                    var i = rowOffset + x * 3;
+                    var o = x * 3;
+                    rowBuf[o] = pixels[i + 2];
+                    rowBuf[o + 1] = pixels[i + 1];
+                    rowBuf[o + 2] = pixels[i];
+                }
+            }
+            else
+            {
+                Array.Copy(pixels, rowOffset, rowBuf, 0, stride);
+            }
+            tiff.WriteScanline(rowBuf, y);
         }
     }
 
@@ -475,6 +567,80 @@ public class ImageProcessor
         string.Join(";", frames.Select(f => string.Join(",",
             f.X.ToString("F1", CultureInfo.InvariantCulture), f.Y.ToString("F1", CultureInfo.InvariantCulture),
             f.Width.ToString("F1", CultureInfo.InvariantCulture), f.Height.ToString("F1", CultureInfo.InvariantCulture))));
+
+    /// <summary>Parses a batch's saved lens-calibration spec —
+    /// "fx,fy,cx,cy;k1,k2,p1,p2,k3;calibratedWidth,calibratedHeight" (see
+    /// <see cref="FormatLensCalibration"/>) — back into a <see cref="LensCalibration"/>. Returns
+    /// null on any malformed spec, same "treat as no saved calibration" convention as
+    /// <see cref="ParseDewarpCurve"/>.</summary>
+    public static LensCalibration? ParseLensCalibration(string spec)
+    {
+        try
+        {
+            var parts = spec.Split(';');
+            if (parts.Length != 3) return null;
+            var intrinsics = parts[0].Split(',').Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+            var distCoeffs = parts[1].Split(',').Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+            var size = parts[2].Split(',').Select(v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+            if (intrinsics.Length != 4 || size.Length != 2) return null;
+            return new LensCalibration(intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3], distCoeffs, size[0], size[1]);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Inverse of <see cref="ParseLensCalibration"/>.</summary>
+    public static string FormatLensCalibration(LensCalibration calibration)
+    {
+        var intrinsics = string.Join(",", new[] { calibration.Fx, calibration.Fy, calibration.Cx, calibration.Cy }.Select(v => v.ToString("G17", CultureInfo.InvariantCulture)));
+        var distCoeffs = string.Join(",", calibration.DistCoeffs.Select(v => v.ToString("G17", CultureInfo.InvariantCulture)));
+        return $"{intrinsics};{distCoeffs};{calibration.CalibratedWidth},{calibration.CalibratedHeight}";
+    }
+
+    /// <summary>Undistorts a raw frame using a one-time lens calibration (see
+    /// <see cref="LensCalibration"/>) — the only geometric correction that runs before cropping,
+    /// since it corrects the camera's own optics rather than anything about how the page sits
+    /// in frame. Scales the focal length/principal point if <paramref name="src"/>'s resolution
+    /// differs from the resolution the calibration was computed at; distortion coefficients
+    /// themselves don't need scaling. Never throws — same degrade-on-failure shape as every
+    /// other pipeline step (see callers in <see cref="Process"/>/<see cref="ProcessFixedFrames"/>).</summary>
+    internal static Mat Undistort(Mat src, LensCalibration calib)
+    {
+        var sx = calib.CalibratedWidth > 0 ? src.Cols / (double)calib.CalibratedWidth : 1.0;
+        var sy = calib.CalibratedHeight > 0 ? src.Rows / (double)calib.CalibratedHeight : 1.0;
+        using var cameraMatrix = new Mat(3, 3, MatType.CV_64F);
+        cameraMatrix.SetArray(new double[]
+        {
+            calib.Fx * sx, 0, calib.Cx * sx,
+            0, calib.Fy * sy, calib.Cy * sy,
+            0, 0, 1
+        });
+        using var distCoeffs = new Mat(1, calib.DistCoeffs.Length, MatType.CV_64F);
+        distCoeffs.SetArray(calib.DistCoeffs);
+        var undistorted = new Mat();
+        Cv2.Undistort(src, undistorted, cameraMatrix, distCoeffs);
+        return undistorted;
+    }
+
+    /// <summary>Never-throws wrapper around <see cref="Undistort"/> — same degrade-to-unchanged
+    /// shape as every other pipeline step (<see cref="TryAutoCrop"/>, <see cref="TryApplyDewarp"/>,
+    /// etc.): a bad/mismatched calibration must never turn into a failed capture.</summary>
+    private static Mat? SafeUndistort(Mat src, LensCalibration calib, ProcessingResult result)
+    {
+        try
+        {
+            var undistorted = Undistort(src, calib);
+            result.Warnings.Add("Lens distortion correction applied.");
+            return undistorted;
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Lens undistortion failed: {ex.Message}");
+            return null;
+        }
+    }
 
     /// <summary>Parses a saved crop shape into its 4 corners (top-left, top-right,
     /// bottom-right, bottom-left). Accepts either the legacy 4-number "x,y,w,h" rect format
@@ -573,23 +739,27 @@ public class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null)
     {
         var working = input.Clone();
 
         if (!skipAutoCrop)
-            working = TryAutoCrop(working, result);
+            working = TryAutoCrop(working, result, searchRegion);
 
+        // Deskew before dewarp: the curve fit assumes text lines run horizontally, so any
+        // residual global tilt corrupts the per-column curve sampling if left uncorrected
+        // first (both now share the same text-line detection, so this is coarse-to-fine —
+        // global rotation resolved before the finer per-column curve).
+        working = TryDeskew(working, result);
         working = TryApplyDewarp(working, result, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint);
 
-        working = TryDeskew(working, result);
         working = ApplyEnhancement(working);
         working = Sharpen(working);
         // Quality checks must see the real (color/grayscale) capture, not a bilevel result —
         // blur/exposure scores are meaningless once thresholded to pure black-and-white, so
         // binarization runs last, after QC rather than before it.
         RunQualityChecks(working, result);
-        working = TryApplyBinarization(working, result, binarizeEnabled);
+        working = TryApplyBinarization(working, result, binarizeEnabled, dpi);
 
         return working;
     }
@@ -597,6 +767,8 @@ public class ImageProcessor
     // ───────────── AUTO-CROP ─────────────
 
     private readonly record struct BoundaryDetection(bool Found, double Confidence, Rect PaddedRect, Point2f[]? Quad);
+
+    private readonly record struct ContourPass(Point[][] Contours);
 
     /// <summary>Shared edge-detection step behind every contour-based detector in this class
     /// (single-document auto-crop, the UI's boundary lookup, and two-page split detection) —
@@ -607,11 +779,14 @@ public class ImageProcessor
     /// low-contrast page are in real tension — a page that fills most of the frame with only
     /// a subtle tone difference from its background looks, to a local blur, just like "gradual
     /// lighting variation to remove," so normalizing unconditionally can wash out exactly the
-    /// case adaptive thresholding was meant to help. Try the direct (adaptively-thresholded,
+    /// case adaptive thresholding was meant to help. Run the direct (adaptively-thresholded,
     /// no normalization) pass first — it's what correctly handles low-contrast pages — and
-    /// only fall back to illumination normalization if that finds nothing, which is when a
-    /// strong cast shadow is the more likely cause.</summary>
-    private static Point[][] FindDocumentContours(Mat src)
+    /// only compute the illumination-normalized pass if that finds nothing plausibly
+    /// page-sized, which is when a strong cast shadow is the more likely cause. Which pass's
+    /// result actually gets used is decided by the caller via <see cref="BuildDetection"/>'s
+    /// own confidence score, not by raw contour area here — area alone is too weak a proxy for
+    /// "found the right thing," which is exactly why that scoring function exists.</summary>
+    private static (ContourPass Direct, ContourPass? Normalized) FindDocumentContourPasses(Mat src)
     {
         using var gray = new Mat();
         Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
@@ -619,14 +794,9 @@ public class ImageProcessor
         Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
 
         var direct = FindContoursWithAdaptiveCanny(blurred);
-        // "Found something" isn't enough to skip the fallback — a stray noise fragment
-        // shouldn't count. Only accept the direct pass if it found something plausibly
-        // page-sized; otherwise a strong cast shadow (or other structured noise) may have
-        // fragmented the real boundary, which is exactly what the illumination-normalized
-        // fallback pass is for.
         var imageArea = src.Rows * (double)src.Cols;
         var bestDirectArea = direct.Length > 0 ? direct.Max(c => Cv2.ContourArea(c)) : 0;
-        if (bestDirectArea / imageArea >= 0.05) return direct;
+        if (bestDirectArea / imageArea >= 0.05) return (new ContourPass(direct), null);
 
         using var illumination = new Mat();
         Cv2.GaussianBlur(gray, illumination, new Size(0, 0), sigmaX: 25);
@@ -636,10 +806,33 @@ public class ImageProcessor
         Cv2.GaussianBlur(normalized, normalizedBlurred, new Size(5, 5), 0);
         var fallback = FindContoursWithAdaptiveCanny(normalizedBlurred);
 
-        // Prefer whichever pass actually found something bigger/more useful — the fallback
-        // isn't strictly better, it's just a different hypothesis (shadow vs. genuine edge).
-        var bestFallbackArea = fallback.Length > 0 ? fallback.Max(c => Cv2.ContourArea(c)) : 0;
-        return bestFallbackArea > bestDirectArea ? fallback : direct;
+        return (new ContourPass(direct), new ContourPass(fallback));
+    }
+
+    /// <summary>Best (largest-area) detection from one contour pass, or a not-found default
+    /// when the pass has no contours at all.</summary>
+    private BoundaryDetection BestDetectionFromContours(Point[][] contours, double imageArea, int cols, int rows)
+    {
+        if (contours.Length == 0) return default;
+        var best = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
+        return BuildDetection(best, imageArea, cols, rows);
+    }
+
+    /// <summary>Runs both contour passes against <paramref name="regionMat"/> and keeps
+    /// whichever produced the higher-confidence <see cref="BoundaryDetection"/> — the shared
+    /// core behind both whole-image and bounded-search-region detection (see
+    /// <see cref="DetectBoundary"/>).</summary>
+    private BoundaryDetection DetectBoundaryInMat(Mat regionMat)
+    {
+        var (directPass, normalizedPass) = FindDocumentContourPasses(regionMat);
+        var imageArea = regionMat.Rows * (double)regionMat.Cols;
+        var best = BestDetectionFromContours(directPass.Contours, imageArea, regionMat.Cols, regionMat.Rows);
+        if (normalizedPass is { } np)
+        {
+            var normalizedBest = BestDetectionFromContours(np.Contours, imageArea, regionMat.Cols, regionMat.Rows);
+            if (normalizedBest.Confidence > best.Confidence) best = normalizedBest;
+        }
+        return best;
     }
 
     private static Point[][] FindContoursWithAdaptiveCanny(Mat blurredGray)
@@ -716,10 +909,7 @@ public class ImageProcessor
         var rectangularity = minAreaRectArea > 0 ? Math.Min(1.0, contourArea / minAreaRectArea) : 0.0;
 
         var perimeter = Cv2.ArcLength(contour, true);
-        var polygon = Cv2.ApproxPolyDP(contour, perimeter * 0.02, true);
-        Point2f[]? quad = polygon.Length == 4
-            ? OrderCorners(polygon.Select(point => new Point2f(point.X, point.Y)).ToArray())
-            : null;
+        var quad = DeriveQuad(contour, perimeter);
 
         // Corner-angle regularity: how close each corner is to a true 90 degrees, when a
         // clean 4-point approximation exists. A page photographed square scores near 1.0; a
@@ -775,16 +965,69 @@ public class ImageProcessor
         return Math.Clamp(1.0 - totalDeviation / 4.0 / 45.0, 0.0, 1.0);
     }
 
+    /// <summary>Derives a 4-corner quad from a contour, trying <see cref="Cv2.ApproxPolyDP"/> at
+    /// increasing epsilon before falling back to the convex hull's 4 extreme corners. This
+    /// always returns a quad for any non-degenerate contour — never null — so callers
+    /// (specifically <see cref="TryAutoCrop"/>) never need to silently skip perspective
+    /// correction just because a real photo's page edge (soft lighting, slight curvature)
+    /// didn't collapse cleanly to 4 points at one fixed epsilon, which is exactly the bug that
+    /// let a large fraction of real captures bypass trapezoid correction entirely. A
+    /// poor-quality hull is naturally penalized by <see cref="BuildDetection"/>'s own
+    /// confidence terms (rectangularity, corner-angle score), not by silently degrading to an
+    /// uncorrected rectangular crop.</summary>
+    private static Point2f[]? DeriveQuad(Point[] contour, double perimeter)
+    {
+        foreach (var epsilonFactor in new[] { 0.02, 0.03, 0.045, 0.065, 0.08 })
+        {
+            var poly = Cv2.ApproxPolyDP(contour, perimeter * epsilonFactor, true);
+            if (poly.Length == 4)
+                return OrderCorners(poly.Select(p => new Point2f(p.X, p.Y)).ToArray());
+        }
+
+        var hull = Cv2.ConvexHull(contour);
+        if (hull.Length < 3) return null; // Truly degenerate — BuildDetection's own ratio<0.1 gate already excludes most of these.
+
+        return OrderCorners(hull.Select(p => new Point2f(p.X, p.Y)).ToArray());
+    }
+
     /// <summary>Single-document detection used by both the mutating auto-crop pass
     /// (<see cref="TryAutoCrop"/>) and the read-only boundary lookup exposed to the UI
-    /// (<see cref="DetectDocumentBoundary"/>): the largest sufficiently-large contour.</summary>
-    private BoundaryDetection DetectBoundary(Mat src)
+    /// (<see cref="DetectDocumentBoundary"/>): the largest sufficiently-large contour.
+    ///
+    /// When <paramref name="searchRegion"/> is given (fixed-frame captures — see
+    /// <see cref="ProcessFixedFrames"/>), the calibrated rectangle is treated as a search
+    /// region rather than a final crop: padded outward so the real page edge (which may sit
+    /// slightly outside the operator-drawn rectangle) stays fully visible, detection runs
+    /// against just that sub-region, and the result is translated back into the full image's
+    /// coordinate space. This is what lets fixed-frame captures get real perspective/curve
+    /// correction instead of an unconditional rectangle crop.</summary>
+    private BoundaryDetection DetectBoundary(Mat src, Rect? searchRegion = null)
     {
-        var contours = FindDocumentContours(src);
-        if (contours.Length == 0) return default;
+        if (searchRegion is not { } region) return DetectBoundaryInMat(src);
 
-        var best = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
-        return BuildDetection(best, src.Rows * (double)src.Cols, src.Cols, src.Rows);
+        // Starting point pending validation against real fixed-frame captures (none of the
+        // real-photo fixtures gathered so far are fixed-frame shots) — see FixedFrameSearchPadFraction.
+        var padded = PadAndClampRect(region, FixedFrameSearchPadFraction, src.Cols, src.Rows);
+        using var sub = new Mat(src, padded);
+        var detection = DetectBoundaryInMat(sub);
+        if (!detection.Found) return detection;
+
+        return detection with
+        {
+            PaddedRect = new Rect(detection.PaddedRect.X + padded.X, detection.PaddedRect.Y + padded.Y, detection.PaddedRect.Width, detection.PaddedRect.Height),
+            Quad = detection.Quad?.Select(p => new Point2f(p.X + padded.X, p.Y + padded.Y)).ToArray()
+        };
+    }
+
+    private static Rect PadAndClampRect(Rect rect, double padFraction, int maxW, int maxH)
+    {
+        var padX = (int)Math.Round(rect.Width * padFraction);
+        var padY = (int)Math.Round(rect.Height * padFraction);
+        var x = Math.Max(0, rect.X - padX);
+        var y = Math.Max(0, rect.Y - padY);
+        var right = Math.Min(maxW, rect.X + rect.Width + padX);
+        var bottom = Math.Min(maxH, rect.Y + rect.Height + padY);
+        return new Rect(x, y, Math.Max(1, right - x), Math.Max(1, bottom - y));
     }
 
     private readonly record struct TwoPageDetection(bool Found, BoundaryDetection Left, BoundaryDetection Right);
@@ -798,7 +1041,14 @@ public class ImageProcessor
     /// than guess.</summary>
     private TwoPageDetection DetectTwoPageBoundaries(Mat src)
     {
-        var contours = FindDocumentContours(src);
+        var (directPass, normalizedPass) = FindDocumentContourPasses(src);
+        var direct = TwoPageDetectionFromContours(directPass.Contours, src);
+        if (direct.Found) return direct;
+        return normalizedPass is { } np ? TwoPageDetectionFromContours(np.Contours, src) : default;
+    }
+
+    private TwoPageDetection TwoPageDetectionFromContours(Point[][] contours, Mat src)
+    {
         if (contours.Length < 2) return default;
 
         var imageArea = src.Rows * (double)src.Cols;
@@ -852,16 +1102,26 @@ public class ImageProcessor
         return new DocumentBoundary(rect.X, rect.Y, rect.Width, rect.Height, detection.Confidence, quad);
     }
 
-    private Mat TryAutoCrop(Mat src, ProcessingResult result)
+    /// <summary><paramref name="searchRegion"/>, when given, is a fixed-frame's calibrated
+    /// rectangle (see <see cref="ProcessFixedFrames"/>) — the fallback on low/no confidence
+    /// becomes that calibrated rectangle instead of the untouched full frame, since that's
+    /// what today's fixed-frame path always produces anyway. This makes the search-region path
+    /// strictly no-worse than before on a detection failure, and strictly better (real
+    /// perspective/curve correction) on success.</summary>
+    private Mat TryAutoCrop(Mat src, ProcessingResult result, Rect? searchRegion = null)
     {
+        Mat FallbackCrop() => searchRegion is { } r ? src[ClampRectToBounds(r, src.Cols, src.Rows)].Clone() : src;
+
         try
         {
-            var detection = DetectBoundary(src);
+            var detection = DetectBoundary(src, searchRegion);
             if (!detection.Found)
             {
-                result.Warnings.Add("No document contour detected — skipping auto-crop.");
+                result.Warnings.Add(searchRegion != null
+                    ? "No document contour detected within calibrated frame — used calibrated rectangle as-is."
+                    : "No document contour detected — skipping auto-crop.");
                 result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
-                return src;
+                return FallbackCrop();
             }
 
             result.CropConfidence = detection.Confidence;
@@ -876,9 +1136,11 @@ public class ImageProcessor
             // against), medium confidence is the common case, not the exception.
             if (detection.Confidence < MediumConfidenceThreshold)
             {
-                result.Warnings.Add($"Crop confidence low ({detection.Confidence:P1}). Keeping full image — needs manual crop review.");
+                result.Warnings.Add(searchRegion != null
+                    ? $"Search-region auto-crop confidence low ({detection.Confidence:P1}) — used calibrated rectangle as-is."
+                    : $"Crop confidence low ({detection.Confidence:P1}). Keeping full image — needs manual crop review.");
                 result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
-                return src;
+                return FallbackCrop();
             }
 
             // A four-corner contour represents a photographed page. Rectifying it
@@ -891,8 +1153,10 @@ public class ImageProcessor
             }
             else
             {
+                // DeriveQuad only returns null for a fully degenerate contour — vanishingly
+                // rare, but WarpQuad has nothing to work with there.
                 cropped = src[detection.PaddedRect].Clone();
-                result.Warnings.Add("Document boundary was not quadrilateral; applied rectangular auto-crop.");
+                result.Warnings.Add("Document boundary was degenerate; applied rectangular auto-crop.");
             }
 
             if (detection.Confidence < CropConfidenceThreshold)
@@ -908,7 +1172,7 @@ public class ImageProcessor
         {
             result.Warnings.Add($"Auto-crop failed: {ex.Message}");
             result.QcVerdict = CombineVerdict(result.QcVerdict, "WARNING");
-            return src;
+            return FallbackCrop();
         }
     }
 
@@ -953,6 +1217,55 @@ public class ImageProcessor
             return null;
         }
     }
+
+    /// <summary>Diagnostic-only entry point (not used by <see cref="DetectDewarpCurve"/> itself):
+    /// dumps every detected text-line blob and its individual top/bottom edge polynomial fit,
+    /// for troubleshooting a page whose dewarp result looks wrong — <see cref="FitAveragedCurve"/>
+    /// silently averages across whatever <see cref="DetectTextLineBlobs"/> found, so a single
+    /// rogue "line" (e.g. a table rule, not real text) can be invisible from the final
+    /// <see cref="DewarpModel"/> alone.</summary>
+    public static string DebugDewarpLines(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+
+        var (binary, lines) = DetectTextLineBlobs(mat);
+        using (binary)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+            sb.AppendLine($"Lines detected: {lines.Count}");
+            foreach (var line in lines)
+            {
+                var topSamples = SampleLineEdge(binary, line, topEdge: true);
+                var bottomSamples = SampleLineEdge(binary, line, topEdge: false);
+                var topFit = topSamples.Count >= 8 ? WeightedPolyFit(topSamples.Select(s => (s.X, s.Y, 1.0)).ToList(), 3) : null;
+                var bottomFit = bottomSamples.Count >= 8 ? WeightedPolyFit(bottomSamples.Select(s => (s.X, s.Y, 1.0)).ToList(), 3) : null;
+                sb.AppendLine($"  rect=({line.X},{line.Y},{line.Width}x{line.Height}) topSamples={topSamples.Count} topFit=[{FormatCoeffs(topFit)}] bottomSamples={bottomSamples.Count} bottomFit=[{FormatCoeffs(bottomFit)}]");
+            }
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Diagnostic-only entry point: runs the real <see cref="DetectDewarpCurve"/> and
+    /// dumps the resulting model's control points, for troubleshooting a wrong-looking dewarp
+    /// result at the level of "what curve did it actually compute" rather than per-line
+    /// intermediate fits (see <see cref="DebugDewarpLines"/>).</summary>
+    public static string DebugDewarpModel(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var model = DetectDewarpCurve(mat, null);
+        if (model is not { } m) return "No confident curve detected (null model).";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+        sb.AppendLine("Top:    " + string.Join("  ", m.TopControlPoints.Select(p => $"({p.X:F0},{p.Y:F1})")));
+        sb.AppendLine("Bottom: " + string.Join("  ", m.BottomControlPoints.Select(p => $"({p.X:F0},{p.Y:F1})")));
+        return sb.ToString();
+    }
+
+    private static string FormatCoeffs(double[]? coeffs) =>
+        coeffs == null ? "null" : string.Join(",", coeffs.Select(c => c.ToString("F4", CultureInfo.InvariantCulture)));
 
     /// <summary>Extracts a thinned set of strong edge-pixel coordinates from a still image, for
     /// the UI to snap a dragged crop corner to a nearby real edge instead of leaving it exactly
@@ -1153,6 +1466,41 @@ public class ImageProcessor
         }
     }
 
+    /// <summary>Detects text-line-shaped blobs in a page image: dark content merged
+    /// horizontally into line shapes via morphological closing (without touching vertical
+    /// extent, so each blob's own top/bottom pixels still trace that line's true shape rather
+    /// than a morphology-smoothed approximation of it), filtered to blobs wide and thin enough
+    /// to plausibly be a text line rather than noise or a heading. Shared by book-curve dewarp
+    /// (curvature evidence) and text-line-based deskew (rotation evidence) so both read the
+    /// same definition of "what is a text line," ordered top-to-bottom. Caller owns and must
+    /// dispose the returned <see cref="Mat"/> — the same binary, morphologically-closed image
+    /// <see cref="SampleLineEdge"/> expects.</summary>
+    private static (Mat Binary, List<Rect> Lines) DetectTextLineBlobs(Mat page)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(page, gray, ColorConversionCodes.BGR2GRAY);
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(gray, blurred, new Size(3, 3), 0);
+        using var binary = new Mat();
+        Cv2.Threshold(blurred, binary, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
+
+        var kernelWidth = Math.Max(15, page.Cols / 40);
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(kernelWidth, 1));
+        var closed = new Mat();
+        Cv2.MorphologyEx(binary, closed, MorphTypes.Close, kernel);
+
+        Cv2.FindContours(closed, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxNone);
+
+        var minWidth = page.Cols * 0.15;
+        var lines = contours
+            .Select(Cv2.BoundingRect)
+            .Where(r => r.Width >= minWidth && r.Width > r.Height * 3)
+            .OrderBy(r => r.Y)
+            .ToList();
+
+        return (closed, lines);
+    }
+
     /// <summary>Detects book-spine curvature from the page's own text-line shapes and fits a
     /// 5-point top/bottom curve to it — no hardware depth sensing, just the same "cubic sheet"
     /// idea used by tools like page_dewarp: text lines are assumed straight in the undistorted
@@ -1167,52 +1515,95 @@ public class ImageProcessor
     /// evidence to trust a curve — callers should skip correction rather than guess.</summary>
     internal static DewarpModel? DetectDewarpCurve(Mat page, double? spineXHint)
     {
-        using var gray = new Mat();
-        Cv2.CvtColor(page, gray, ColorConversionCodes.BGR2GRAY);
-        using var blurred = new Mat();
-        Cv2.GaussianBlur(gray, blurred, new Size(3, 3), 0);
-        using var binary = new Mat();
-        Cv2.Threshold(blurred, binary, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
+        var (binary, lines) = DetectTextLineBlobs(page);
+        using (binary)
+        {
+            // Need enough separate lines to trust a curve shape at all — one or two blobs
+            // could just as easily be a heading or noise, not evidence of the page's actual
+            // bend.
+            if (lines.Count < 3) return null;
 
-        // Horizontal-only closing merges glyphs into line-shaped blobs without touching their
-        // vertical extent, so each blob's own top/bottom pixels still trace that line's true
-        // curve rather than a morphology-smoothed approximation of it.
-        var kernelWidth = Math.Max(15, page.Cols / 40);
-        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(kernelWidth, 1));
-        using var closed = new Mat();
-        Cv2.MorphologyEx(binary, closed, MorphTypes.Close, kernel);
+            // Require the detected lines to span a healthy fraction of the page width — a
+            // curve fit from a narrow sliver of text says little about the page's overall bend.
+            var spanWidth = lines.Max(r => r.Width);
+            if (spanWidth < page.Cols * 0.35) return null;
 
-        Cv2.FindContours(closed, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxNone);
+            const int degree = 3;
+            var topCoeffs = FitAveragedCurve(binary, lines, topEdge: true, page.Cols, spineXHint, degree);
+            var bottomCoeffs = FitAveragedCurve(binary, lines, topEdge: false, page.Cols, spineXHint, degree);
+            if (topCoeffs == null || bottomCoeffs == null) return null;
 
-        var minWidth = page.Cols * 0.15;
-        var lines = contours
-            .Select(Cv2.BoundingRect)
-            .Where(r => r.Width >= minWidth && r.Width > r.Height * 3)
-            .OrderBy(r => r.Y)
-            .ToList();
-        // Need enough separate lines to trust a curve shape at all — one or two blobs could
-        // just as easily be a heading or noise, not evidence of the page's actual bend.
-        if (lines.Count < 3) return null;
+            return new DewarpModel(
+                SampleControlPoints(topCoeffs, page.Cols),
+                SampleControlPoints(bottomCoeffs, page.Cols));
+        }
+    }
 
-        var top = lines[0];
-        var bottom = lines[^1];
-        if (bottom.Y <= top.Y) return null;
+    /// <summary>Fits one edge's (top or bottom) page-curvature polynomial from *every* detected
+    /// text line's own samples, not just the extreme line at that edge — trusting a single line
+    /// (the old behavior) is a high-variance, easily-wrong estimate of what should be the
+    /// strongest available signal.
+    ///
+    /// Each line only spans a fraction of the page width, so fitting a separate cubic per line
+    /// and averaging the resulting *coefficients* is invalid — coefficients from cubics fit
+    /// over different, narrow X windows aren't directly comparable, and averaging them produced
+    /// exactly the kind of wildly-diverging curve this was meant to fix (confirmed against a
+    /// real photo while building this). Instead, every line's samples are pooled into one
+    /// dataset — after subtracting that line's own median Y first, so each line contributes
+    /// only its *shape* to the combined fit, not its absolute row position — and a single cubic
+    /// is fit to the pooled set. Pooled together, lines collectively span close to the full page
+    /// width even though each individually covers only part of it, so this one fit is both
+    /// numerically well-supported (see <see cref="WeightedPolyFit"/>'s own centering) and
+    /// informed by every line's evidence at once, rather than N separate poorly-constrained
+    /// per-line extrapolations.
+    ///
+    /// The vertical baseline is then anchored by shifting this shape curve so it passes through
+    /// the real extreme line's own actual (median X, median Y) point — topmost line for the top
+    /// edge, bottommost for the bottom edge — rather than evaluating any single line's own fit
+    /// at x=0 (the original design here, and the actual root cause of a confirmed real-photo
+    /// failure: the topmost detected "line" covered only the page's right ~28%, and a cubic fit
+    /// from only that narrow window, evaluated at x=0 — nowhere near its own data — extrapolated
+    /// to a Y value more than 6x the page's own height). Anchoring through a real, trusted data
+    /// point instead of an extrapolated one removes that failure mode entirely.</summary>
+    private static double[]? FitAveragedCurve(Mat binary, List<Rect> lines, bool topEdge, int pageWidth, double? spineXHint, int degree)
+    {
+        var pooled = new List<(double X, double Y, double W)>();
+        var lineMedians = new List<(double X, double Y)>();
+        foreach (var line in lines)
+        {
+            var samples = SampleLineEdge(binary, line, topEdge);
+            if (samples.Count < 8) continue;
+            var sortedY = samples.Select(s => s.Y).OrderBy(y => y).ToList();
+            var medianY = sortedY[sortedY.Count / 2];
+            foreach (var s in samples) pooled.Add((s.X, s.Y - medianY, 1.0));
+            lineMedians.Add((samples.Average(s => s.X), medianY));
+        }
+        if (lineMedians.Count < 3) return null;
 
-        var topSamples = SampleLineEdge(closed, top, topEdge: true);
-        var bottomSamples = SampleLineEdge(closed, bottom, topEdge: false);
-        var spanWidth = Math.Max(top.Width, bottom.Width);
-        // Require the detected lines to span a healthy fraction of the page width — a curve
-        // fit from a narrow sliver of text says little about the page's overall bend.
-        if (topSamples.Count < 8 || bottomSamples.Count < 8 || spanWidth < page.Cols * 0.35) return null;
+        // Spine anchor: pin the page edge farthest from the spine flat even where text evidence
+        // is sparse there, so the fit doesn't extrapolate wildly into a margin with few detected
+        // lines — same purpose the old per-line FitCurveWithSpineAnchor served, now folded
+        // directly into the pooled (row-normalized) dataset so it benefits from the same
+        // wide-domain numerical support as everything else fit here.
+        if (spineXHint is double spineX)
+        {
+            var farEdgeX = spineX < pageWidth / 2.0 ? (double)pageWidth : 0.0;
+            var nearFar = pooled.OrderBy(p => Math.Abs(p.X - farEdgeX)).Take(Math.Min(20, pooled.Count)).ToList();
+            if (nearFar.Count > 0)
+                pooled.Add((farEdgeX, nearFar.Average(p => p.Y), 8.0 * nearFar.Count));
+        }
 
-        const int degree = 3;
-        var topCoeffs = FitCurveWithSpineAnchor(topSamples, page.Cols, spineXHint, degree);
-        var bottomCoeffs = FitCurveWithSpineAnchor(bottomSamples, page.Cols, spineXHint, degree);
-        if (topCoeffs == null || bottomCoeffs == null) return null;
+        var shapeCoeffs = WeightedPolyFit(pooled, degree);
+        if (shapeCoeffs == null) return null;
 
-        return new DewarpModel(
-            SampleControlPoints(topCoeffs, page.Cols),
-            SampleControlPoints(bottomCoeffs, page.Cols));
+        // `lines` (and therefore lineMedians, built in the same order) is already ordered
+        // top-to-bottom by DetectTextLineBlobs.
+        var anchor = topEdge ? lineMedians[0] : lineMedians[^1];
+        var shapeValueAtAnchorXExcludingConstant = EvalPoly(shapeCoeffs, anchor.X) - shapeCoeffs[0];
+        var avgCoeffs = (double[])shapeCoeffs.Clone();
+        avgCoeffs[0] = anchor.Y - shapeValueAtAnchorXExcludingConstant;
+
+        return avgCoeffs;
     }
 
     /// <summary>For each column spanned by <paramref name="rect"/>, the first foreground pixel
@@ -1246,38 +1637,35 @@ public class ImageProcessor
         return samples;
     }
 
-    /// <summary>Weighted polynomial fit of the sampled edge, with an optional synthetic anchor
-    /// point pinning the page edge farthest from the known spine flat — its Y taken from the
-    /// nearest few real samples to that edge. Without this, sparse text near a margin lets the
-    /// low-degree polynomial extrapolate freely past the real data and can bend the wrong way;
-    /// the heavily-weighted anchor keeps that edge honest while leaving the spine-side shape
-    /// entirely driven by genuine detected line curvature.</summary>
-    private static double[]? FitCurveWithSpineAnchor(List<(double X, double Y)> samples, int pageWidth, double? spineXHint, int degree)
-    {
-        var points = new List<(double X, double Y, double W)>(samples.Select(s => (s.X, s.Y, 1.0)));
-        if (spineXHint is double spineX)
-        {
-            var farEdgeX = spineX < pageWidth / 2.0 ? (double)pageWidth : 0.0;
-            var nearFar = samples.OrderBy(s => Math.Abs(s.X - farEdgeX)).Take(Math.Min(5, samples.Count)).ToList();
-            if (nearFar.Count > 0)
-                points.Add((farEdgeX, nearFar.Average(s => s.Y), 8.0));
-        }
-        return WeightedPolyFit(points, degree);
-    }
-
     /// <summary>Weighted least-squares polynomial fit via the normal equations. Degree is small
     /// (cubic) and there are at most a few thousand points, so a hand-rolled Gauss-Jordan solve
-    /// is simpler than pulling in a linear-algebra dependency for this one call site.</summary>
+    /// is simpler than pulling in a linear-algebra dependency for this one call site.
+    ///
+    /// Fits internally in <paramref name="points"/>' own X coordinates *shifted to be centered
+    /// on zero* (or on the whole page's own center, when multiple fits later get their
+    /// coefficients combined — see <see cref="FitAveragedCurve"/>), then converts the result
+    /// back to the original raw-X basis before returning, via <see cref="ShiftPolynomialToOrigin"/>.
+    /// A raw pixel X coordinate on a several-thousand-pixel-wide photo raised to the 3rd power is
+    /// large enough (low-to-mid 10^10s) that the normal equations become severely
+    /// ill-conditioned without this — confirmed while building this feature: fitting directly
+    /// in raw pixel coordinates produced individually-plausible-looking per-sample residuals but
+    /// wildly diverging coefficients (a fitted curve evaluating to y-values many times the
+    /// image's own height just outside the fitted line's own narrow column range), corrupting
+    /// dewarp on a real photo. Centering first is the standard fix.</summary>
     private static double[]? WeightedPolyFit(List<(double X, double Y, double W)> points, int degree)
     {
+        if (points.Count == 0) return null;
+        var centerX = points.Average(p => p.X);
+
         var n = degree + 1;
         var a = new double[n, n];
         var b = new double[n];
         foreach (var (x, y, w) in points)
         {
+            var xc = x - centerX;
             var powers = new double[2 * n - 1];
             powers[0] = 1.0;
-            for (var i = 1; i < powers.Length; i++) powers[i] = powers[i - 1] * x;
+            for (var i = 1; i < powers.Length; i++) powers[i] = powers[i - 1] * xc;
             for (var i = 0; i < n; i++)
             {
                 b[i] += w * powers[i] * y;
@@ -1285,7 +1673,35 @@ public class ImageProcessor
                     a[i, j] += w * powers[i + j];
             }
         }
-        return SolveLinearSystem(a, b, n);
+
+        var centeredCoeffs = SolveLinearSystem(a, b, n);
+        return centeredCoeffs == null ? null : ShiftPolynomialToOrigin(centeredCoeffs, centerX);
+    }
+
+    /// <summary>Converts polynomial coefficients fit in (x - <paramref name="centerX"/>) powers
+    /// back into plain x powers, via binomial expansion of each (x - centerX)^k term — so every
+    /// caller of <see cref="WeightedPolyFit"/> (and anything that combines multiple fits'
+    /// coefficients, like <see cref="FitAveragedCurve"/>) can keep using <see cref="EvalPoly"/>
+    /// and friends with a raw x exactly as before, unaware that the fit itself was conditioned
+    /// on a centered x internally.</summary>
+    private static double[] ShiftPolynomialToOrigin(double[] centeredCoeffs, double centerX)
+    {
+        var n = centeredCoeffs.Length;
+        var result = new double[n];
+        for (var k = 0; k < n; k++)
+        {
+            if (centeredCoeffs[k] == 0) continue;
+            for (var i = 0; i <= k; i++)
+                result[i] += centeredCoeffs[k] * BinomialCoefficient(k, i) * Math.Pow(-centerX, k - i);
+        }
+        return result;
+    }
+
+    private static double BinomialCoefficient(int n, int k)
+    {
+        double result = 1;
+        for (var i = 0; i < k; i++) result = result * (n - i) / (i + 1);
+        return result;
     }
 
     private static double[]? SolveLinearSystem(double[,] a, double[] b, int n)
@@ -1437,65 +1853,120 @@ public class ImageProcessor
 
     // ───────────── DESKEW ─────────────
 
+    /// <summary>Estimates and corrects global page rotation, preferring the same text-line
+    /// evidence <see cref="DetectDewarpCurve"/> uses over raw whole-image line detection: each
+    /// detected line's own top-edge slope gives a local angle estimate, and the median across
+    /// all lines is far less prone to the false-positive risk (page borders, shadows,
+    /// background objects visible in a camera-captured photo, not a flatbed scan) that raw
+    /// <see cref="Cv2.HoughLinesP(InputArray, double, double, int, double, double)"/> on the
+    /// whole binarized image is exposed to. Falls back to that whole-image Hough method
+    /// (<see cref="TryDeskewViaHough"/>) when there isn't enough text-line evidence, or when the
+    /// per-line angles disagree too much to trust a single global rotation from them.</summary>
     private Mat TryDeskew(Mat src, ProcessingResult result)
     {
         try
         {
-            using var gray = new Mat();
-            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-            using var binary = new Mat();
-            Cv2.Threshold(gray, binary, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-            Cv2.BitwiseNot(binary, binary);
-
-            // Find lines via HoughLinesP
-            var lines = Cv2.HoughLinesP(binary, 1, Math.PI / 180, 100, minLineLength: 100, maxLineGap: 10);
-
-            if (lines.Length == 0)
+            var (binary, lines) = DetectTextLineBlobs(src);
+            using (binary)
             {
-                result.Warnings.Add("No lines detected for deskew.");
-                return src;
+                if (lines.Count >= 3)
+                {
+                    var angles = new List<double>();
+                    foreach (var line in lines)
+                    {
+                        var samples = SampleLineEdge(binary, line, topEdge: true);
+                        if (samples.Count < 8) continue;
+                        var fit = WeightedPolyFit(samples.Select(s => (s.X, s.Y, 1.0)).ToList(), degree: 1);
+                        if (fit == null) continue;
+                        angles.Add(Math.Atan2(fit[1], 1.0) * 180.0 / Math.PI); // fit[1] = dy/dx slope
+                    }
+
+                    if (angles.Count >= 3)
+                    {
+                        angles.Sort();
+                        var medianAngle = angles[angles.Count / 2];
+                        var iqr = angles[(int)(angles.Count * 0.75)] - angles[(int)(angles.Count * 0.25)];
+                        if (iqr <= MaxDeskewAngleIqrDegrees)
+                            return ApplyDeskewAngle(src, medianAngle, result, "text-line");
+
+                        result.Warnings.Add($"Text-line angles inconsistent (IQR {iqr:F1}°) — using whole-image line detection for deskew.");
+                    }
+                    else
+                    {
+                        result.Warnings.Add("Not enough reliable text-line angle fits — using whole-image line detection for deskew.");
+                    }
+                }
+                else
+                {
+                    result.Warnings.Add("Not enough text lines for line-based deskew — using whole-image line detection.");
+                }
             }
 
-            // Calculate median angle
-            var angles = new double[lines.Length];
-            for (int i = 0; i < lines.Length; i++)
-            {
-                var seg = lines[i];
-                var angle = Math.Atan2(seg.P2.Y - seg.P1.Y, seg.P2.X - seg.P1.X) * 180.0 / Math.PI;
-                angles[i] = angle;
-            }
-            Array.Sort(angles);
-            var medianAngle = angles[angles.Length / 2];
-
-            result.OriginalSkewDegrees = medianAngle;
-
-            if (Math.Abs(medianAngle) > MaxDeskewDegrees)
-            {
-                result.Warnings.Add($"Skew too large ({medianAngle:F2}°). Not auto-correcting.");
-                return src;
-            }
-
-            if (Math.Abs(medianAngle) < 0.1)
-            {
-                // No meaningful skew
-                return src;
-            }
-
-            var center = new Point2f(src.Cols / 2f, src.Rows / 2f);
-            using var rotMat = Cv2.GetRotationMatrix2D(center, medianAngle, 1.0);
-            var rotated = new Mat();
-            Cv2.WarpAffine(src, rotated, rotMat, src.Size(), InterpolationFlags.Cubic,
-                BorderTypes.Constant, Scalar.White);
-
-            result.WasDeskewed = true;
-            result.AppliedCorrectionDegrees = medianAngle;
-            return rotated;
+            return TryDeskewViaHough(src, result);
         }
         catch (Exception ex)
         {
             result.Warnings.Add($"Deskew failed: {ex.Message}");
             return src;
         }
+    }
+
+    /// <summary>Whole-image Hough-line deskew — the original (pre-text-line-based) method, kept
+    /// as <see cref="TryDeskew"/>'s fallback for pages with too little/inconsistent text-line
+    /// evidence rather than left as the primary method.</summary>
+    private Mat TryDeskewViaHough(Mat src, ProcessingResult result)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+        using var binary = new Mat();
+        Cv2.Threshold(gray, binary, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+        Cv2.BitwiseNot(binary, binary);
+
+        var lines = Cv2.HoughLinesP(binary, 1, Math.PI / 180, 100, minLineLength: 100, maxLineGap: 10);
+        if (lines.Length == 0)
+        {
+            result.Warnings.Add("No lines detected for deskew.");
+            return src;
+        }
+
+        var angles = new double[lines.Length];
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var seg = lines[i];
+            angles[i] = Math.Atan2(seg.P2.Y - seg.P1.Y, seg.P2.X - seg.P1.X) * 180.0 / Math.PI;
+        }
+        Array.Sort(angles);
+        var medianAngle = angles[angles.Length / 2];
+
+        return ApplyDeskewAngle(src, medianAngle, result, "whole-image Hough");
+    }
+
+    /// <summary>Shared rotate-and-report step behind both <see cref="TryDeskew"/>'s primary
+    /// text-line estimate and its <see cref="TryDeskewViaHough"/> fallback, so clamping/
+    /// reporting behavior is defined exactly once regardless of which estimate produced the
+    /// angle.</summary>
+    private Mat ApplyDeskewAngle(Mat src, double angle, ProcessingResult result, string source)
+    {
+        result.OriginalSkewDegrees = angle;
+
+        if (Math.Abs(angle) > MaxDeskewDegrees)
+        {
+            result.Warnings.Add($"Skew too large ({angle:F2}°, {source} estimate). Not auto-correcting.");
+            return src;
+        }
+
+        if (Math.Abs(angle) < 0.1)
+            return src; // No meaningful skew.
+
+        var center = new Point2f(src.Cols / 2f, src.Rows / 2f);
+        using var rotMat = Cv2.GetRotationMatrix2D(center, angle, 1.0);
+        var rotated = new Mat();
+        Cv2.WarpAffine(src, rotated, rotMat, src.Size(), InterpolationFlags.Cubic,
+            BorderTypes.Constant, Scalar.White);
+
+        result.WasDeskewed = true;
+        result.AppliedCorrectionDegrees = angle;
+        return rotated;
     }
 
     // ───────────── ENHANCEMENT ─────────────
@@ -1592,12 +2063,12 @@ public class ImageProcessor
     /// <see cref="TryApplyDewarp"/>. Runs last in the pipeline (after QC, see
     /// <see cref="ProcessSinglePage"/>) since blur/exposure scores are meaningless once
     /// thresholded to pure black-and-white.</summary>
-    private Mat TryApplyBinarization(Mat src, ProcessingResult result, bool binarizeEnabled)
+    private Mat TryApplyBinarization(Mat src, ProcessingResult result, bool binarizeEnabled, int dpi)
     {
         if (!binarizeEnabled) return src;
         try
         {
-            var binarized = ApplySauvolaBinarization(src);
+            var binarized = ApplySauvolaBinarization(src, dpi);
             result.WasBinarized = true;
             result.Warnings.Add("Binarized to black-and-white (Sauvola local threshold).");
             return binarized;
@@ -1618,34 +2089,57 @@ public class ImageProcessor
     /// k=0.34 and R=128 being Sauvola's own recommended defaults (also Leptonica's). Local
     /// mean/stddev are computed per-pixel over a window in O(1) via integral images
     /// (summed-area tables for the image and its square) rather than a naive per-pixel window
-    /// scan, which would be far too slow at full capture resolution.</summary>
-    private static Mat ApplySauvolaBinarization(Mat src)
+    /// scan, which would be far too slow at full capture resolution.
+    ///
+    /// Three additions over a textbook Sauvola pass, all aimed at the "noisy black dots"
+    /// failure mode the literature documents for exactly this algorithm on camera-captured
+    /// (not flatbed-scanned) photos:
+    /// 1. A light median pre-blur suppresses isolated sensor/JPEG noise pixels before
+    ///    thresholding, without softening stroke edges the way a Gaussian blur would.
+    /// 2. Near-uniform-variance ("flat") regions — where Sauvola's own formula is documented
+    ///    to become numerically unstable and speckle — fall back to a single global Otsu cutoff
+    ///    instead of the local formula. Using Otsu's cutoff (not a hardcoded "always white")
+    ///    correctly handles a flat dark region (a solid black-filled figure, say) the same as a
+    ///    flat bright one.
+    /// 3. A final connected-component despeckle pass removes isolated foreground specks too
+    ///    small to be real strokes.</summary>
+    private static Mat ApplySauvolaBinarization(Mat src, int dpi)
     {
         using var gray = new Mat();
         if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
         else src.CopyTo(gray);
 
+        using var denoised = new Mat();
+        Cv2.MedianBlur(gray, denoised, 3);
+
+        using var otsuDst = new Mat();
+        var globalThreshold = Cv2.Threshold(denoised, otsuDst, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+
         // Window scales with resolution rather than a fixed pixel count — captures range from
         // a few hundred to several thousand pixels wide, and a fixed small window would be far
         // too fine-grained (noisy per-pixel thresholds) on a large image.
-        var longEdge = Math.Max(gray.Cols, gray.Rows);
+        var longEdge = Math.Max(denoised.Cols, denoised.Rows);
         var windowRadius = Math.Clamp(longEdge / 160, 7, 35);
 
         using var sum = new Mat();
         using var sqSum = new Mat();
-        Cv2.Integral(gray, sum, sqSum, MatType.CV_64F);
+        Cv2.Integral(denoised, sum, sqSum, MatType.CV_64F);
 
-        gray.GetArray(out byte[] pixels);
+        denoised.GetArray(out byte[] pixels);
         sum.GetArray(out double[] sumData);
         sqSum.GetArray(out double[] sqSumData);
 
-        var rows = gray.Rows;
-        var cols = gray.Cols;
+        var rows = denoised.Rows;
+        var cols = denoised.Cols;
         var sumStride = cols + 1;
         var output = new byte[rows * cols];
 
         const double k = 0.34;
         const double r = 128.0; // Expected dynamic range of local standard deviation.
+        // Below this local standard deviation there's essentially no local contrast/edge —
+        // Sauvola's formula collapses toward mean*(1-k) regardless of genuine content there,
+        // which is the documented root cause of speckle in near-uniform background regions.
+        const double flatRegionStdDevFloor = 3.0;
 
         for (var y = 0; y < rows; y++)
         {
@@ -1665,13 +2159,53 @@ public class ImageProcessor
                 var variance = Math.Max(0, sq / area - mean * mean);
                 var stdDev = Math.Sqrt(variance);
 
+                if (stdDev < flatRegionStdDevFloor)
+                {
+                    output[rowOffset + x] = pixels[rowOffset + x] > globalThreshold ? (byte)255 : (byte)0;
+                    continue;
+                }
+
                 var threshold = mean * (1 + k * (stdDev / r - 1));
                 output[rowOffset + x] = pixels[rowOffset + x] > threshold ? (byte)255 : (byte)0;
             }
         }
 
-        var result = new Mat(rows, cols, MatType.CV_8UC1);
-        result.SetArray(output);
+        using var beforeDespeckle = new Mat(rows, cols, MatType.CV_8UC1);
+        beforeDespeckle.SetArray(output);
+        return DespeckleBinary(beforeDespeckle, dpi);
+    }
+
+    /// <summary>Removes isolated foreground specks from a bilevel (0/255) image via connected-
+    /// component filtering — the literature-recommended approach over median/morphological
+    /// filtering specifically because it preserves genuine thin strokes while dropping isolated
+    /// noise pixels, since it filters by connected blob size rather than a fixed spatial
+    /// footprint. The area floor scales with DPI (~4px² at 300 DPI) since "how many pixels make
+    /// up a real stroke fragment" is a resolution-relative question, not an absolute one.</summary>
+    private static Mat DespeckleBinary(Mat bilevel, int dpi)
+    {
+        using var inverted = new Mat();
+        Cv2.BitwiseNot(bilevel, inverted); // Our convention: ink=0/white=255 — ConnectedComponents treats non-zero as foreground.
+
+        using var labels = new Mat();
+        using var stats = new Mat();
+        using var centroids = new Mat();
+        var labelCount = Cv2.ConnectedComponentsWithStats(inverted, labels, stats, centroids, PixelConnectivity.Connectivity8);
+
+        var scale = dpi / 300.0;
+        var minBlobPixels = Math.Max(2, (int)Math.Round(4.0 * scale * scale));
+
+        var keep = new bool[labelCount];
+        for (var label = 0; label < labelCount; label++)
+            keep[label] = label == 0 || stats.At<int>(label, (int)ConnectedComponentsTypes.Area) >= minBlobPixels;
+
+        labels.GetArray(out int[] labelData);
+        bilevel.GetArray(out byte[] pixels);
+        var outputPixels = (byte[])pixels.Clone();
+        for (var i = 0; i < labelData.Length; i++)
+            if (!keep[labelData[i]]) outputPixels[i] = 255;
+
+        var result = new Mat(bilevel.Rows, bilevel.Cols, MatType.CV_8UC1);
+        result.SetArray(outputPixels);
         return result;
     }
 

@@ -10,6 +10,7 @@ public class AppDbContext : DbContext
     public DbSet<Project> Projects { get; set; } = null!;
     public DbSet<Batch> Batches { get; set; } = null!;
     public DbSet<CaptureJob> CaptureJobs { get; set; } = null!;
+    public DbSet<CameraCalibration> CameraCalibrations { get; set; } = null!;
 
     public string DbPath { get; }
 
@@ -46,5 +47,11 @@ public class AppDbContext : DbContext
             .HasMany(b => b.Captures)
             .WithOne(c => c.Batch)
             .HasForeignKey(c => c.BatchId);
+
+        modelBuilder.Entity<Batch>()
+            .HasOne(b => b.CameraCalibration)
+            .WithMany()
+            .HasForeignKey(b => b.CameraCalibrationId)
+            .IsRequired(false);
     }
 }

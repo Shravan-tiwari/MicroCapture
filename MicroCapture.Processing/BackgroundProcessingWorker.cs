@@ -84,9 +84,18 @@ public class BackgroundProcessingWorker
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
                     var metadata = new TiffMetadata(job.Batch?.Dpi ?? 300, job.Batch?.Operator, job.Timestamp);
+                    // Batch.CameraCalibration snapshots whichever lens calibration was active
+                    // at Start Batch (see Batch.CameraCalibrationId's own comment) — parse its
+                    // stored camera-matrix/distortion-coefficient strings back into the DTO
+                    // ImageProcessor actually consumes. A batch with no calibration performed
+                    // yet (CameraCalibration is null) just runs without lens undistortion.
+                    var calibrationEntity = job.Batch?.CameraCalibration;
+                    LensCalibration? lensCalibration = calibrationEntity != null
+                        ? ImageProcessor.ParseLensCalibration($"{calibrationEntity.CameraMatrix};{calibrationEntity.DistCoeffs};{calibrationEntity.ImageWidth},{calibrationEntity.ImageHeight}")
+                        : null;
                     var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled);
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {

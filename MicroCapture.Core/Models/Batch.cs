@@ -43,6 +43,14 @@ public class Batch
     // losing color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
     public bool BinarizeEnabled { get; set; } = false;
 
+    // Snapshots whichever CameraCalibration was active (see CameraCalibration.IsActive) at
+    // Start Batch — so recalibrating the rig mid-batch, or later, can never retroactively
+    // change how an already-queued batch's captures get undistorted. Null means no lens
+    // calibration has been performed for this rig yet; every geometric correction still runs,
+    // just without the one-time lens-undistortion pre-step. See ImageProcessor.Undistort.
+    public string? CameraCalibrationId { get; set; }
+    public CameraCalibration? CameraCalibration { get; set; }
+
     public Project? Project { get; set; }
     public ICollection<CaptureJob> Captures { get; set; } = new List<CaptureJob>();
 }

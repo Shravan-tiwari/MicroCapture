@@ -61,6 +61,8 @@ TestProcessFixedFramesProducesNOutputs();
 TestFixedFramesBypassesConfidenceGating();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
+TestDewarpControlPointsStayWithinPageBounds();
+TestWriteTiffPreservesLargeColorImagePixelData();
 await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
@@ -235,6 +237,25 @@ string WriteSolidImage(string path, int width, int height)
     using var bitmap = new SKBitmap(width, height);
     using var canvas = new SKCanvas(bitmap);
     canvas.Clear(new SKColor(128, 128, 128));
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>Several solid black horizontal bars on white — stands in for text lines (the
+/// line-blob detector behind dewarp/deskew only cares about blob geometry, not glyph shapes)
+/// so dewarp curve-fitting can be exercised without needing real rendered text.</summary>
+string WriteMultiBarTestImage(string path, int imageWidth, int imageHeight, (int X, int Y, int Width, int Height)[] bars)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(SKColors.White);
+    using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
+    foreach (var bar in bars)
+        canvas.DrawRect(new SKRect(bar.X, bar.Y, bar.X + bar.Width, bar.Y + bar.Height), paint);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -972,6 +993,105 @@ void TestTiffDisplayDecodeRoundTrip()
     Check("Non-TIFF files pass through unchanged", pngBytes != null && pngBytes.SequenceEqual(File.ReadAllBytes(pngPath)));
 
     Check("A missing file returns null instead of throwing", ImageDecodeHelper.GetDisplayBytes(Path.Combine(workDir, "missing.tif")) == null);
+}
+
+void TestDewarpControlPointsStayWithinPageBounds()
+{
+    Console.WriteLine("\n-- Dewarp baseline anchoring never extrapolates control points far outside the page (regression) --");
+    var workDir = TempWorkDir();
+    const int width = 1200, height = 900;
+
+    // The topmost "line" only spans the page's right portion — mirrors the exact real-photo
+    // failure this was built to fix: the original design anchored the curve's vertical
+    // baseline by evaluating a narrow-domain line's own cubic fit at x=0 (far outside that
+    // line's own data), which extrapolated to a Y value many times the page's own height and
+    // produced a wildly wrong dewarp on a real capture. Anchoring through the line's own real
+    // (median X, median Y) point instead must keep every control point sane regardless of how
+    // narrow/off-center the anchor line is.
+    var bars = new (int, int, int, int)[]
+    {
+        (900, 100, 250, 20), // topmost — narrow, confined to the right portion
+        (50, 250, 1100, 20),
+        (50, 400, 1100, 20),
+        (50, 550, 1100, 20),
+        (50, 700, 1100, 20), // bottommost — full width
+    };
+    var path = WriteMultiBarTestImage(Path.Combine(workDir, "multibar.png"), width, height, bars);
+
+    var model = ImageProcessor.DetectDewarpCurveFromBytes(File.ReadAllBytes(path));
+    Check("A curve model is detected from the multi-line page", model != null);
+    if (model is { } m)
+    {
+        var maxAbsY = m.TopControlPoints.Concat(m.BottomControlPoints).Max(p => Math.Abs(p.Y));
+        Check($"All control point Y values stay within a sane multiple of the page height (max |Y|={maxAbsY:F0}, page height={height})",
+            maxAbsY < height * 3);
+    }
+}
+
+void TestWriteTiffPreservesLargeColorImagePixelData()
+{
+    Console.WriteLine("\n-- Writing a processed TIFF with metadata never corrupts pixel data (regression) --");
+    var workDir = TempWorkDir();
+    const int width = 1600, height = 1200;
+
+    // Distinct-colored quadrants — any row/strip misalignment in the TIFF write (the actual
+    // root cause of a real corruption bug found while building this: reopening a just-written
+    // TIFF to add Artist/Software/DateTime tags via Tiff.RewriteDirectory() scrambled the row
+    // layout on at least one real, large capture, producing a diagonally-sheared image with no
+    // exception anywhere) would show up as sampled pixels no longer matching their quadrant.
+    var sourcePath = Path.Combine(workDir, "source.png");
+    using (var bitmap = new SKBitmap(width, height))
+    {
+        using var canvas = new SKCanvas(bitmap);
+        using var tl = new SKPaint { Color = new SKColor(220, 30, 30) };
+        using var tr = new SKPaint { Color = new SKColor(30, 200, 30) };
+        using var bl = new SKPaint { Color = new SKColor(30, 30, 220) };
+        using var br = new SKPaint { Color = new SKColor(230, 220, 30) };
+        canvas.DrawRect(new SKRect(0, 0, width / 2f, height / 2f), tl);
+        canvas.DrawRect(new SKRect(width / 2f, 0, width, height / 2f), tr);
+        canvas.DrawRect(new SKRect(0, height / 2f, width / 2f, height), bl);
+        canvas.DrawRect(new SKRect(width / 2f, height / 2f, width, height), br);
+        using var image = SKImage.FromBitmap(bitmap);
+        using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+        using var stream = File.Create(sourcePath);
+        data.SaveTo(stream);
+    }
+
+    var processor = new ImageProcessor();
+    var outDir = Path.Combine(workDir, "out");
+    // Manual full-frame crop keeps geometry deterministic — this test is about TIFF I/O
+    // fidelity, not detection.
+    var result = processor.Process(sourcePath, outDir, manualOverride: true,
+        leftCrop: $"0,0,{width},{height}",
+        metadata: new TiffMetadata(300, "Smoke Test Operator", DateTime.UtcNow));
+
+    Check("Processing succeeds", result.Success);
+    Check("Output is a real TIFF, not the emergency JPEG fallback",
+        result.OutputFilePaths.Count == 1 && result.OutputFilePaths[0].EndsWith(".tif", StringComparison.OrdinalIgnoreCase));
+
+    if (result.OutputFilePaths.Count == 1)
+    {
+        using var readBack = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Color);
+        Check("Written TIFF decodes back successfully", !readBack.Empty());
+        Check("Dimensions round-trip exactly", readBack.Cols == width && readBack.Rows == height);
+
+        // Sample well inside each quadrant (avoiding edges, which the pipeline's own
+        // enhancement/sharpen could legitimately soften slightly).
+        bool ColorNear(Vec3b actual, SKColor expected, int tolerance = 40) =>
+            Math.Abs(actual.Item2 - expected.Red) <= tolerance &&
+            Math.Abs(actual.Item1 - expected.Green) <= tolerance &&
+            Math.Abs(actual.Item0 - expected.Blue) <= tolerance;
+
+        var tlPixel = readBack.At<Vec3b>(height / 4, width / 4);
+        var trPixel = readBack.At<Vec3b>(height / 4, width * 3 / 4);
+        var blPixel = readBack.At<Vec3b>(height * 3 / 4, width / 4);
+        var brPixel = readBack.At<Vec3b>(height * 3 / 4, width * 3 / 4);
+
+        Check("Top-left quadrant color survives the write/read round-trip", ColorNear(tlPixel, new SKColor(220, 30, 30)));
+        Check("Top-right quadrant color survives the write/read round-trip", ColorNear(trPixel, new SKColor(30, 200, 30)));
+        Check("Bottom-left quadrant color survives the write/read round-trip", ColorNear(blPixel, new SKColor(30, 30, 220)));
+        Check("Bottom-right quadrant color survives the write/read round-trip", ColorNear(brPixel, new SKColor(230, 220, 30)));
+    }
 }
 
 async Task TestDeleteCaptureExcludesFromExport()

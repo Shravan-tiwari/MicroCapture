@@ -58,6 +58,39 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "DewarpManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "DewarpCurve", "TEXT NULL");
         EnsureColumn("Batches", "BinarizeEnabled", "INTEGER NOT NULL DEFAULT 0");
+        // CameraCalibrations is a brand-new table, not just a new column — EnsureCreated()
+        // only creates tables for a database that has no schema at all yet, so an existing
+        // installation (which already has *some* tables) needs this created explicitly the
+        // same way EnsureColumn explicitly ALTERs existing tables.
+        EnsureCameraCalibrationsTable();
+        EnsureColumn("Batches", "CameraCalibrationId", "TEXT NULL");
+    }
+
+    private void EnsureCameraCalibrationsTable()
+    {
+        var connection = _dbContext.Database.GetDbConnection();
+        var wasClosed = connection.State != System.Data.ConnectionState.Open;
+        if (wasClosed) connection.Open();
+        try
+        {
+            using var create = connection.CreateCommand();
+            create.CommandText =
+                "CREATE TABLE IF NOT EXISTS \"CameraCalibrations\" (" +
+                "\"Id\" TEXT NOT NULL CONSTRAINT \"PK_CameraCalibrations\" PRIMARY KEY, " +
+                "\"Label\" TEXT NOT NULL DEFAULT '', " +
+                "\"CalibratedUtc\" TEXT NOT NULL, " +
+                "\"ImageWidth\" INTEGER NOT NULL DEFAULT 0, " +
+                "\"ImageHeight\" INTEGER NOT NULL DEFAULT 0, " +
+                "\"CameraMatrix\" TEXT NOT NULL DEFAULT '', " +
+                "\"DistCoeffs\" TEXT NOT NULL DEFAULT '', " +
+                "\"ReprojectionErrorPx\" REAL NOT NULL DEFAULT 0, " +
+                "\"IsActive\" INTEGER NOT NULL DEFAULT 0)";
+            create.ExecuteNonQuery();
+        }
+        finally
+        {
+            if (wasClosed) connection.Close();
+        }
     }
 
     private void EnsureColumn(string table, string column, string definition)
@@ -114,6 +147,7 @@ public class CaptureQueueService
     {
         return await _dbContext.CaptureJobs
             .Include(j => j.Batch)
+            .ThenInclude(b => b!.CameraCalibration)
             .Where(j => j.ProcessingStatus == "Pending")
             .OrderBy(j => j.Timestamp)
             .ToListAsync();
