@@ -113,6 +113,31 @@ public class ImageProcessor
     // used to gate the automatic (non-manual) spread-vs-single-page promotion in Process(), not
     // the already-in-split-mode split-point picker, which only needs "where," not "whether."
     public double GutterAbsoluteDropThreshold { get; set; } = 20.0;
+    // Otsu's own between-class/total-variance separability score for the brightness-based
+    // foreground segmentation pass (FindContoursByBrightness) — below this, the split isn't a
+    // real bimodal "bright page on dark backdrop" separation (e.g. a light-colored desk, or a
+    // uniformly-lit scene with no real backdrop), and the pass should contribute nothing rather
+    // than trust a meaningless threshold. Starting point pending validation against real
+    // fixtures.
+    public double BrightnessSeparationMinScore { get; set; } = 0.35;
+    // YCrCb skin-tone range (Chai & Ngan) used to exclude a hand holding the page from the
+    // brightness-segmented foreground blob, so the detected page shape isn't extended/distorted
+    // by skin pixels that are similarly bright to the page itself. Deliberately generous —
+    // this only needs to keep the detected quad's shape sane, not achieve pixel-perfect hand
+    // removal (that's the separate, not-yet-built finger-removal/inpainting feature). Starting
+    // point pending validation against real fixtures.
+    public double SkinCrLow { get; set; } = 135.0;
+    public double SkinCrHigh { get; set; } = 180.0;
+    public double SkinCbLow { get; set; } = 85.0;
+    public double SkinCbHigh { get; set; } = 135.0;
+    // Perpendicular distance (pixels) from an approximate quad edge within which a Canny edge
+    // pixel is considered evidence for that edge's true line, in RefineQuadCorners. Starting
+    // point pending validation against real fixtures.
+    public double CornerRefinementBandPx { get; set; } = 20.0;
+    // Minimum edge-pixel inliers required before trusting a refined line fit for one corner;
+    // below this, that corner keeps its original (unrefined) position rather than fitting a
+    // line from too little evidence. Mirrors DetectDewarpCurve's own >= 8 samples bar.
+    public int CornerRefinementMinInliers { get; set; } = 8;
     // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
     // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
     // read as crisper edges/text, low enough to avoid visible halos on a document scan.
@@ -831,7 +856,10 @@ public class ImageProcessor
 
     // ───────────── AUTO-CROP ─────────────
 
-    private readonly record struct BoundaryDetection(bool Found, double Confidence, Rect PaddedRect, Point2f[]? Quad);
+    // SourcePass is diagnostic-only (which candidate pass produced this detection) — never fed
+    // back into BuildDetection's confidence math, so every existing call site (default/plain
+    // constructor) keeps compiling unchanged.
+    private readonly record struct BoundaryDetection(bool Found, double Confidence, Rect PaddedRect, Point2f[]? Quad, string? SourcePass = null);
 
     private readonly record struct ContourPass(Point[][] Contours);
 
@@ -891,10 +919,10 @@ public class ImageProcessor
     {
         var (directPass, normalizedPass) = FindDocumentContourPasses(regionMat);
         var imageArea = regionMat.Rows * (double)regionMat.Cols;
-        var best = BestDetectionFromContours(directPass.Contours, imageArea, regionMat.Cols, regionMat.Rows);
+        var best = BestDetectionFromContours(directPass.Contours, imageArea, regionMat.Cols, regionMat.Rows) with { SourcePass = "direct-canny" };
         if (normalizedPass is { } np)
         {
-            var normalizedBest = BestDetectionFromContours(np.Contours, imageArea, regionMat.Cols, regionMat.Rows);
+            var normalizedBest = BestDetectionFromContours(np.Contours, imageArea, regionMat.Cols, regionMat.Rows) with { SourcePass = "normalized-canny" };
             if (normalizedBest.Confidence > best.Confidence) best = normalizedBest;
         }
 
@@ -913,6 +941,21 @@ public class ImageProcessor
         // automated — see the memory note on this for the real per-image tally before reverting.
         // A real fix needs a way to tell a genuine (but small/oddly-shaped) page from a small
         // wrong object BEFORE trusting the aggressive pass, not merely a "found vs not" gate.
+        //
+        // The brightness pass below is not a retry of that same idea with a different knob — it
+        // reads a different physical signal (page brightness vs. dark backdrop, not edge
+        // gradient), so it can't inherit that failure mode the same way: a printed
+        // paragraph/table has no brightness contrast against its own page, so it can't form a
+        // separate "largest bright blob" the way it formed a separate "sharpest edge" under
+        // heavy dilation. It also runs unconditionally (not gated behind "only when the others
+        // found nothing") and is scored through the exact same BuildDetection confidence
+        // function as every other candidate — no source gets a trust bonus, the evidence has to
+        // win on its own merits, with its own dedicated safety gates
+        // (BrightnessSeparationScore, the all-four-edges-touched guard) for the failure modes
+        // that *are* specific to a brightness signal (glare, no real backdrop).
+        var brightnessContours = FindContoursByBrightness(regionMat, BrightnessSeparationMinScore, SkinCrLow, SkinCrHigh, SkinCbLow, SkinCbHigh);
+        var brightnessBest = BestDetectionFromContours(brightnessContours, imageArea, regionMat.Cols, regionMat.Rows) with { SourcePass = "brightness" };
+        if (brightnessBest.Confidence > best.Confidence) best = brightnessBest;
 
         return best;
     }
@@ -948,6 +991,119 @@ public class ImageProcessor
 
         Cv2.FindContours(dilated, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
         return contours;
+    }
+
+    /// <summary>Foreground segmentation by raw brightness rather than edge gradient: every real
+    /// capture fixture this app has (flat copy-stand and V-cradle alike) photographs the page
+    /// against a solid dark backdrop, which makes page-vs-backdrop a much stronger, more direct
+    /// separator than page-edge-gradient — the latter is what fragments on real photos (hand
+    /// holding the book, spine shadow, paper texture), which is why <see
+    /// cref="FindContoursWithAdaptiveCanny"/> alone misses or mis-shapes the page on a large
+    /// fraction of real captures. This is a genuinely different signal, not another tuning knob
+    /// on the same fragile one — an important distinction given the heavy-dilation attempt at
+    /// bridging fragmented Canny edges (see the "Tried and reverted" note in
+    /// <see cref="DetectBoundaryInMat"/>) confidently latched onto small wrong rectangular
+    /// objects (a paragraph, a printed table) instead of rescuing real misses.
+    ///
+    /// Never trusts a meaningless split: <see cref="BrightnessSeparationScore"/> gates on Otsu's
+    /// own separability metric first (handles a light-colored desk / no real dark backdrop), and
+    /// any candidate whose bounding rect touches all four image edges is discarded (handles a
+    /// blown-out/glare backdrop merging with the page into one full-frame blob) — both failure
+    /// modes degrade to "this pass contributes nothing," letting the existing Canny passes or an
+    /// honest "not found" arbitrate instead, never a confidently-wrong brightness-based guess.</summary>
+    private static Point[][] FindContoursByBrightness(Mat src, double separationMinScore,
+        double skinCrLow, double skinCrHigh, double skinCbLow, double skinCbHigh)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+
+        using var mask = new Mat();
+        var otsuThreshold = Cv2.Threshold(gray, mask, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+
+        if (BrightnessSeparationScore(gray, otsuThreshold) < separationMinScore)
+            return Array.Empty<Point[]>();
+
+        using (var skin = SkinExclusionMask(src, skinCrLow, skinCrHigh, skinCbLow, skinCbHigh))
+            Cv2.BitwiseAnd(mask, skin, mask);
+
+        // Square closing (unlike DetectTextLineBlobs's deliberately horizontal-only kernel):
+        // the page interior needs bridging in both axes to merge across printed text/photos
+        // that locally dip below the brightness threshold, not just across a text line's own
+        // width.
+        var kernelSize = Math.Max(21, Math.Min(src.Cols, src.Rows) / 30);
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(kernelSize, kernelSize));
+        using var closed = new Mat();
+        Cv2.MorphologyEx(mask, closed, MorphTypes.Close, kernel);
+
+        Cv2.FindContours(closed, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+        return contours.Where(c =>
+        {
+            var rect = Cv2.BoundingRect(c);
+            var touchesAllFour = rect.X <= 1 && rect.Y <= 1
+                && rect.Right >= src.Cols - 1 && rect.Bottom >= src.Rows - 1;
+            return !touchesAllFour;
+        }).ToArray();
+    }
+
+    /// <summary>Otsu's between-class/total-variance separability score at <paramref
+    /// name="threshold"/> (0 = no real separation — a near-uniform histogram; 1 = a perfect
+    /// two-spike histogram). Otsu's own threshold-selection always returns *a* number even when
+    /// the underlying image has no real bimodal brightness split to find (a uniformly-lit desk,
+    /// a blown-out frame) — this score is what lets <see cref="FindContoursByBrightness"/> tell
+    /// those cases apart from a genuine bright-page-on-dark-backdrop split, instead of trusting
+    /// Otsu blindly.</summary>
+    private static double BrightnessSeparationScore(Mat gray, double threshold)
+    {
+        gray.GetArray(out byte[] pixels);
+        if (pixels.Length == 0) return 0;
+
+        long sumBelow = 0, sumAbove = 0;
+        long countBelow = 0, countAbove = 0;
+        foreach (var p in pixels)
+        {
+            if (p <= threshold) { sumBelow += p; countBelow++; }
+            else { sumAbove += p; countAbove++; }
+        }
+        if (countBelow == 0 || countAbove == 0) return 0;
+
+        var meanBelow = sumBelow / (double)countBelow;
+        var meanAbove = sumAbove / (double)countAbove;
+        var weightBelow = countBelow / (double)pixels.Length;
+        var weightAbove = countAbove / (double)pixels.Length;
+        var betweenClassVariance = weightBelow * weightAbove * Math.Pow(meanAbove - meanBelow, 2);
+
+        var grandMean = (sumBelow + sumAbove) / (double)pixels.Length;
+        double totalVariance = 0;
+        foreach (var p in pixels) totalVariance += Math.Pow(p - grandMean, 2);
+        totalVariance /= pixels.Length;
+
+        return totalVariance > 0 ? Math.Clamp(betweenClassVariance / totalVariance, 0, 1) : 0;
+    }
+
+    /// <summary>Marks likely hand/skin pixels via a YCrCb chrominance range (Cr/Cb held stable
+    /// across a hand moving between lit and shadowed parts of the same real photo, unlike HSV's
+    /// saturation/value channels) — 255 = keep (not skin), 0 = exclude (skin), so the result can
+    /// be <see cref="Cv2.BitwiseAnd(Mat, Mat, Mat)"/>ed directly against a foreground mask. The
+    /// skin mask is dilated before exclusion — deliberately generous, since this only needs to
+    /// keep the detected page quad's shape sane where a hand overlaps its edge, not achieve
+    /// pixel-perfect hand removal; any resulting bite out of the true edge is what
+    /// <see cref="RefineQuadCorners"/> is for.</summary>
+    private static Mat SkinExclusionMask(Mat src, double crLow, double crHigh, double cbLow, double cbHigh)
+    {
+        using var ycrcb = new Mat();
+        Cv2.CvtColor(src, ycrcb, ColorConversionCodes.BGR2YCrCb);
+        using var skin = new Mat();
+        Cv2.InRange(ycrcb, new Scalar(0, crLow, cbLow), new Scalar(255, crHigh, cbHigh), skin);
+
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(9, 9));
+        var dilatedSkin = new Mat();
+        Cv2.Dilate(skin, dilatedSkin, kernel, iterations: 1);
+
+        var notSkin = new Mat();
+        Cv2.BitwiseNot(dilatedSkin, notSkin);
+        dilatedSkin.Dispose();
+        return notSkin;
     }
 
     /// <summary>Adaptive Canny thresholds anchored to the strongest edges actually present in
@@ -1249,7 +1405,15 @@ public class ImageProcessor
             Mat cropped;
             if (detection.Quad != null)
             {
-                cropped = WarpQuad(src, detection.Quad);
+                // Refine the approximate polygon-approximation corners against fresh edge
+                // evidence before warping — a real, non-degenerate quad can still be visibly
+                // keystoned in the output if its corners are imprecise (confirmed on a real
+                // photo: Trapezoid_Image001's right half, 54% confidence, real content, still
+                // visibly slanted). RefineQuadCorners never throws and falls back per-corner to
+                // the original vertex when it can't trust its own evidence, so this is always
+                // safe to call.
+                var refinedQuad = RefineQuadCorners(src, detection.Quad, CornerRefinementBandPx, CornerRefinementMinInliers);
+                cropped = WarpQuad(src, refinedQuad);
                 result.Warnings.Add("Document boundary detected and perspective-corrected.");
             }
             else
@@ -1420,7 +1584,7 @@ public class ImageProcessor
         if (!directBest.Found && !normalizedBest.Found)
         {
             var aggressive = FindContoursWithHeavyDilation(mat);
-            sb.AppendLine($"Aggressive (heavy-dilation) pass: {aggressive.Length} contour(s)");
+            sb.AppendLine($"Aggressive (heavy-dilation) pass, kept dormant/not scored — see the 'Tried and reverted' note in DetectBoundaryInMat: {aggressive.Length} contour(s)");
             foreach (var c in aggressive.OrderByDescending(c => Cv2.ContourArea(c)).Take(5))
             {
                 var d = BuildDetection(c, imageArea, mat.Cols, mat.Rows);
@@ -1428,8 +1592,21 @@ public class ImageProcessor
             }
         }
 
+        using var brightnessGray = new Mat();
+        Cv2.CvtColor(mat, brightnessGray, ColorConversionCodes.BGR2GRAY);
+        using var brightnessMaskPreview = new Mat();
+        var otsuThreshold = Cv2.Threshold(brightnessGray, brightnessMaskPreview, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+        var separationScore = BrightnessSeparationScore(brightnessGray, otsuThreshold);
+        var brightnessContours = FindContoursByBrightness(mat, BrightnessSeparationMinScore, SkinCrLow, SkinCrHigh, SkinCbLow, SkinCbHigh);
+        sb.AppendLine($"Brightness pass: separationScore={separationScore:F4} (min={BrightnessSeparationMinScore}) otsuThreshold={otsuThreshold:F1} {brightnessContours.Length} contour(s)");
+        foreach (var c in brightnessContours.OrderByDescending(c => Cv2.ContourArea(c)).Take(3))
+        {
+            var d = BuildDetection(c, imageArea, mat.Cols, mat.Rows);
+            sb.AppendLine($"  ratio={Cv2.ContourArea(c) / imageArea:F4} found={d.Found} confidence={d.Confidence:F4} rect={d.PaddedRect}");
+        }
+
         var best = DetectBoundaryInMat(mat);
-        sb.AppendLine($"Winner: found={best.Found} confidence={best.Confidence:F4} (MediumConfidenceThreshold={MediumConfidenceThreshold})");
+        sb.AppendLine($"Winner: found={best.Found} confidence={best.Confidence:F4} sourcePass={best.SourcePass} (MediumConfidenceThreshold={MediumConfidenceThreshold})");
         return sb.ToString();
     }
 
@@ -1540,6 +1717,126 @@ public class ImageProcessor
         var dx = first.X - second.X;
         var dy = first.Y - second.Y;
         return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    /// <summary>Refines a detected quad's 4 corners against fresh Canny edge evidence, instead
+    /// of trusting <see cref="DeriveQuad"/>'s raw <see cref="Cv2.ApproxPolyDP"/> vertices
+    /// directly. Fixes a real, confirmed failure mode distinct from "no contour found at all":
+    /// a genuine, non-degenerate detection can still be visibly keystoned in the output because
+    /// polygon approximation over a somewhat-fragmented real edge lands close to, but not
+    /// exactly on, the true corner (confirmed on a real photo — Trapezoid_Image001's right
+    /// half, 54% confidence, real page content, still visibly slanted after "correction").
+    ///
+    /// For each of the quad's 4 edges, fits a line to nearby Canny edge pixels via
+    /// <see cref="Cv2.FitLine(System.Collections.Generic.IEnumerable{Point2f}, DistanceTypes, double, double, double)"/>
+    /// — deliberately not this file's existing <see cref="WeightedPolyFit"/>, which assumes a
+    /// near-horizontal `y = f(x)` line (safe for <see cref="DetectDewarpCurve"/>/<see
+    /// cref="TryDeskew"/>'s text lines, but undefined/unstable for a near-vertical quad side,
+    /// which any of these 4 edges plausibly is) — then intersects each pair of adjacent fitted
+    /// lines to get a refined corner. Refinement is independent per corner: an edge with too
+    /// little evidence (occluded by a hand, off-frame) just leaves its two corners at their
+    /// original position rather than corrupting the other 3. Never throws — any failure returns
+    /// <paramref name="quad"/> unchanged, matching this file's existing defensive style
+    /// (<see cref="TryAutoCrop"/>'s own try/catch/fallback shape).</summary>
+    private static Point2f[] RefineQuadCorners(Mat src, Point2f[] quad, double bandPx, int minInliers)
+    {
+        if (quad.Length != 4) return quad;
+        try
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+            using var blurred = new Mat();
+            Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+            var (low, high) = AutoCannyThresholds(blurred);
+            using var edged = new Mat();
+            Cv2.Canny(blurred, edged, low, high);
+
+            using var edgePointsMat = new Mat();
+            Cv2.FindNonZero(edged, edgePointsMat);
+            if (edgePointsMat.Empty()) return quad;
+            edgePointsMat.GetArray(out Point[] edgePoints);
+
+            // lines[i] is the fitted line for the edge quad[i] -> quad[(i+1)%4].
+            var lines = new EdgeLine?[4];
+            for (var i = 0; i < 4; i++)
+                lines[i] = FitQuadEdge(edgePoints, quad[i], quad[(i + 1) % 4], bandPx, minInliers);
+
+            var refined = new Point2f[4];
+            for (var i = 0; i < 4; i++)
+            {
+                var incoming = lines[(i + 3) % 4]; // edge ending at this corner
+                var outgoing = lines[i]; // edge starting at this corner
+                refined[i] = incoming is { } inLine && outgoing is { } outLine
+                    && IntersectLines(inLine, outLine) is { } corner
+                    ? corner
+                    : quad[i];
+            }
+
+            var originalArea = Math.Abs(Cv2.ContourArea(quad));
+            var refinedArea = Math.Abs(Cv2.ContourArea(refined));
+            if (originalArea <= 0 || refinedArea < originalArea * 0.5 || refinedArea > originalArea * 1.5)
+                return quad; // Final sanity gate — a per-corner-plausible refinement can still be globally wrong.
+
+            return refined;
+        }
+        catch
+        {
+            return quad;
+        }
+    }
+
+    private readonly record struct EdgeLine(double Vx, double Vy, double X0, double Y0);
+
+    /// <summary>Fits one quad edge's true line from nearby Canny edge pixels: keeps points
+    /// within <paramref name="bandPx"/> perpendicular distance of the approximate edge segment
+    /// and whose projection onto it falls within the segment (plus a small margin, so a
+    /// neighboring edge's pixels near the corner don't contaminate this one's fit). Returns null
+    /// when there's too little evidence to trust — the caller then keeps that edge's original
+    /// corners rather than fitting a line from noise.</summary>
+    private static EdgeLine? FitQuadEdge(Point[] edgePoints, Point2f a, Point2f b, double bandPx, int minInliers)
+    {
+        var dx = b.X - a.X;
+        var dy = b.Y - a.Y;
+        var length = Math.Sqrt(dx * dx + dy * dy);
+        if (length < 1) return null;
+
+        var ux = dx / length;
+        var uy = dy / length;
+        var nx = -uy;
+        var ny = ux;
+        var margin = Math.Max(bandPx, length * 0.03);
+
+        var inliers = new List<Point2f>();
+        foreach (var p in edgePoints)
+        {
+            var px = p.X - a.X;
+            var py = p.Y - a.Y;
+            var t = px * ux + py * uy;
+            if (t < -margin || t > length + margin) continue;
+            var d = px * nx + py * ny;
+            if (Math.Abs(d) > bandPx) continue;
+            inliers.Add(new Point2f(p.X, p.Y));
+        }
+
+        if (inliers.Count < minInliers) return null;
+
+        var fit = Cv2.FitLine(inliers, DistanceTypes.L2, 0, 0.01, 0.01);
+        return new EdgeLine(fit.Vx, fit.Vy, fit.X1, fit.Y1);
+    }
+
+    /// <summary>Intersection of two lines, each given as a point plus direction vector. Returns
+    /// null when the lines are near-parallel (the quad's two edges meeting at this corner were
+    /// fit to evidence that doesn't actually converge — untrustworthy, not a real corner).</summary>
+    private static Point2f? IntersectLines(EdgeLine first, EdgeLine second)
+    {
+        var denom = first.Vx * second.Vy - first.Vy * second.Vx;
+        if (Math.Abs(denom) < 1e-6) return null;
+
+        var dx = second.X0 - first.X0;
+        var dy = second.Y0 - first.Y0;
+        var t = (dx * second.Vy - dy * second.Vx) / denom;
+
+        return new Point2f((float)(first.X0 + t * first.Vx), (float)(first.Y0 + t * first.Vy));
     }
 
     // ───────────── BOOK SPLIT (GUTTER DETECTION) ─────────────

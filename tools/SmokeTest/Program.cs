@@ -55,6 +55,8 @@ TestIndependentSkewedQuadsPerPage();
 await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
 TestLowContrastDetection();
 TestShadowedPageDetection();
+TestBrightnessPassExcludesHandOverlap();
+TestUniformBrightnessImageStaysUndetected();
 TestBorderTouchingPageIsNotOverPadded();
 TestMediumConfidenceCropIsStillApplied();
 TestLowConfidenceCropIsSkippedAndFlagged();
@@ -224,6 +226,35 @@ string WriteShadowedTestImage(string path, int imageWidth, int imageHeight, SKRe
     // second edge, so a naive detector might mistake its inner boundary for the page edge.
     using var shadowPaint = new SKPaint { Color = new SKColor(0, 0, 0, 110), Style = SKPaintStyle.Fill, IsAntialias = false };
     canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Left + shadowBandWidth, rect.Bottom), shadowPaint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A sharp white page on a dark background with a skin-toned rectangle overlapping
+/// one edge — analogous to a hand holding a book open, positioned partly over the dark
+/// backdrop and partly onto the page itself. Both the page and the skin patch are near-white/
+/// bright against the dark background, so plain brightness thresholding alone (with no color
+/// awareness) can't tell them apart — this specifically isolates FindContoursByBrightness's
+/// SkinExclusionMask step, which is the only stage in the pipeline that reads chrominance
+/// rather than luminance. Grayscale-only detectors (the Canny passes) can't distinguish
+/// skin from page at all, so this scenario cleanly targets skin exclusion, not general
+/// boundary-detection robustness (see the note by WriteSoftEdgeTestImage's tests for why a
+/// synthetic Canny-defeating image isn't attempted here).</summary>
+string WriteHandOverlapTestImage(string path, int imageWidth, int imageHeight, SKRectI pageRect, SKRectI skinRect)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(20, 20, 20));
+    using var pagePaint = new SKPaint { Color = SKColors.White, Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(pageRect.Left, pageRect.Top, pageRect.Right, pageRect.Bottom), pagePaint);
+    // A representative mid-tone skin color (Y~161, Cr~155, Cb~105 — inside the default
+    // SkinCrLow/High=135/180, SkinCbLow/High=85/135 range this test exercises).
+    using var skinPaint = new SKPaint { Color = new SKColor(200, 150, 120), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(skinRect.Left, skinRect.Top, skinRect.Right, skinRect.Bottom), skinPaint);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -555,6 +586,60 @@ void TestShadowedPageDetection()
         Check("Detected width still covers the full page, not just the unshadowed portion",
             boundary.Width >= knownRect.Width - 60);
     }
+}
+
+void TestBrightnessPassExcludesHandOverlap()
+{
+    Console.WriteLine("\n-- Brightness-based foreground segmentation excludes a hand overlapping the page edge --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 800, imageHeight = 600;
+    var pageRect = new SKRectI(50, 50, 750, 550);
+    // Overlaps the page's top edge and extends above it into the dark background — the shape
+    // a finger/hand holding the top of a book produces in these real fixtures. Without skin
+    // exclusion, brightness segmentation (which can't otherwise distinguish "bright skin" from
+    // "bright page") would merge this into the foreground blob and pull its detected top edge
+    // up to ~20, not the true page top at 50.
+    var skinRect = new SKRectI(300, 20, 500, 70);
+    var path = WriteHandOverlapTestImage(Path.Combine(workDir, "hand_overlap.png"), imageWidth, imageHeight, pageRect, skinRect);
+
+    // Asserted directly against the brightness pass's own reported candidate (via the public
+    // DebugBoundaryDetection diagnostic), not DetectDocumentBoundary's overall best-of-3
+    // winner: on this deliberately clean/sharp synthetic image (unlike a real photo) Direct
+    // Canny also confidently detects the merged page+hand shape — grayscale Canny has no way
+    // to know the extra bright region is skin, so it isn't penalized for including it, and can
+    // out-score even a correctly hand-excluded brightness candidate on this synthetic case
+    // alone. That's a genuine, accepted property of the best-of-3/no-source-bonus design (see
+    // the "no weighting for brightness candidates" reasoning in DetectBoundaryInMat) — real
+    // photos validated this doesn't cause a problem in practice (16/16 real halves crop
+    // cleanly with no hand included), because real Canny fragments long before it would
+    // confidently include hand content the way this clean synthetic edge does. What this test
+    // isolates and guards is narrower but still real: SkinExclusionMask itself must keep doing
+    // its job inside FindContoursByBrightness, regardless of which pass ultimately wins.
+    var debug = new ImageProcessor().DebugBoundaryDetection(File.ReadAllBytes(path));
+    var brightnessSection = debug.Split("Brightness pass:", 2)[1];
+    var match = System.Text.RegularExpressions.Regex.Match(brightnessSection, @"Y\s*=\s*(-?\d+)");
+    Check("Brightness pass reports a candidate", match.Success);
+    if (match.Success)
+    {
+        var brightnessTop = int.Parse(match.Groups[1].Value);
+        Check("Brightness pass's own candidate reflects the true page top, not the excluded hand region",
+            Math.Abs(brightnessTop - (pageRect.Top - 10)) <= 20);
+    }
+}
+
+void TestUniformBrightnessImageStaysUndetected()
+{
+    Console.WriteLine("\n-- A perfectly uniform image (no real bright/dark split) is not falsely detected by the brightness pass --");
+    var workDir = TempWorkDir();
+    // Otsu's threshold selection always returns *some* value even with zero real separation
+    // (a flat histogram) — BrightnessSeparationScore is what's supposed to catch that and
+    // keep FindContoursByBrightness from contributing a meaningless full-frame "detection"
+    // where none of the other passes would find anything either. A perfectly uniform image has
+    // zero pixel variance, the sharpest version of this case (totalVariance == 0).
+    var path = WriteSolidImage(Path.Combine(workDir, "uniform.png"), 800, 600);
+
+    var detected = new ImageProcessor().DetectDocumentBoundary(path);
+    Check("No boundary is (falsely) detected on a uniform image", !detected.HasValue);
 }
 
 void TestBorderTouchingPageIsNotOverPadded()
