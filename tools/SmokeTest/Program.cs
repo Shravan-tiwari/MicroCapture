@@ -44,6 +44,8 @@ TestDocumentBoundaryDetection();
 TestGutterSplitDetection();
 TestAutoSplitTriggersOnConfidentSpineShadow();
 TestAutoSplitDoesNotTriggerOnPlainSinglePage();
+TestAutoSplitDoesNotTriggerOnPageEdgeInsideGutterBand();
+TestBoundaryCurveStaysSafeOnNotchedEdge();
 TestManualOverrideLegacyRectCrop();
 TestManualOverrideQuadCrop();
 TestConvexityClampRejectsSelfIntersection();
@@ -66,6 +68,8 @@ TestFixedFramesBypassesConfidenceGating();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
 TestDewarpControlPointsStayWithinPageBounds();
+TestLineMeshFlattensSharedPageWideBow();
+TestLineMeshDeclinesOnPlainUniformPage();
 TestWriteTiffPreservesLargeColorImagePixelData();
 await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
@@ -175,6 +179,27 @@ string WriteGutterTestImage(string path, int imageWidth, int imageHeight, int gu
     return path;
 }
 
+/// <summary>A single bright page against a dark backdrop, photographed at enough of an angle
+/// that the page's own left edge (not a real spine) falls inside DetectGutter's central 30-70%
+/// search band — reproduces a real bug (Trapezoid_Image003.JPG) where that one-sided
+/// background-to-page transition was mistaken for a confident spine shadow because the darkest
+/// column in the band landed right at the band's own boundary, not at a genuine interior dip
+/// flanked by bright content on both sides.</summary>
+string WritePageEdgeInsideGutterBandTestImage(string path, int imageWidth, int imageHeight, int pageStartX)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(10, 10, 10));
+    using var paint = new SKPaint { Color = new SKColor(210, 210, 210), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(pageStartX, 0, imageWidth, imageHeight), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
 /// <summary>Two separate sharp white rectangles on a dark background, side by side with a
 /// gap between them — analogous to an open book photographed with a visible gutter shadow,
 /// for exercising ImageProcessor's two-page split detection.</summary>
@@ -262,6 +287,40 @@ string WriteHandOverlapTestImage(string path, int imageWidth, int imageHeight, S
     return path;
 }
 
+/// <summary>A page whose left edge has a real inward notch across its own middle third, so
+/// Canny evidence for that edge clusters into two separated groups near the top and bottom
+/// corners with nothing in between — the same *shape* of evidence gap behind a real regression
+/// (confirmed on a real photo, IMG_0022's right half: <c>FitEdgeCurve</c>'s degree-2 fit sat
+/// tight against two such clusters individually while swinging wildly *between* them, invisible
+/// to any check that only evaluates error at the inlier points themselves). This synthetic
+/// version does NOT reproduce that swing — tried, and a clean, noise-free, perfectly vertical
+/// two-cluster edge just fits a flat curve; the real instability needed the noise/asymmetry a
+/// real photo's Canny response has, which isn't faithfully fakeable (same conclusion reached
+/// once before in this codebase for a different detection edge case — see the "Tried and
+/// reverted" note in ImageProcessor.cs). What this test *does* legitimately guard: Process()
+/// producing a real, uncorrupted crop on a page whose edge has a genuine gap in evidence,
+/// whichever path (boundary-curve or corner-fallback) it takes. The actual regression's real
+/// fix is verified against the real fixture instead — re-run
+/// <c>dotnet run --project tools/DewarpDiagnostic -- corners &lt;path-to-real-photo-half&gt;</c>
+/// and confirm MaxOffsetPx stays sane (declines rather than reporting a wild value) if this
+/// area is ever touched again.</summary>
+string WriteNotchedEdgeTestImage(string path, int imageWidth, int imageHeight, SKRectI pageRect, int notchDepth, int notchTop, int notchBottom)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(20, 20, 20));
+    using var pagePaint = new SKPaint { Color = SKColors.White, Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(pageRect.Left, pageRect.Top, pageRect.Right, pageRect.Bottom), pagePaint);
+    using var notchPaint = new SKPaint { Color = new SKColor(20, 20, 20), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(pageRect.Left, notchTop, pageRect.Left + notchDepth, notchBottom), notchPaint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
 /// <summary>A plain solid-color image with no features — used where the crop-shape math
 /// itself is what's under test, not detection.</summary>
 string WriteSolidImage(string path, int width, int height)
@@ -289,6 +348,36 @@ string WriteMultiBarTestImage(string path, int imageWidth, int imageHeight, (int
     using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
     foreach (var bar in bars)
         canvas.DrawRect(new SKRect(bar.X, bar.Y, bar.X + bar.Width, bar.Y + bar.Height), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>Several black horizontal bars, each following the *same* smooth curve shape (a
+/// centered parabola bowing upward toward the page's horizontal center) but at different
+/// vertical baselines — stands in for real text lines that share one systematic page-wide bend
+/// (the case <see cref="ImageProcessor.TryApplyLineMesh"/> targets), built from many thin
+/// vertical strokes since SkiaSharp has no direct "draw a bowed rectangle" primitive.</summary>
+string WriteCurvedBarTestImage(string path, int imageWidth, int imageHeight, int[] baselines, int barThickness, double amplitudePx)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(SKColors.White);
+    using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
+    var marginX = imageWidth / 20;
+    foreach (var baseline in baselines)
+    {
+        for (var x = marginX; x < imageWidth - marginX; x += 2)
+        {
+            var t = (x - marginX) / (double)(imageWidth - 2 * marginX); // 0..1
+            var bow = amplitudePx * Math.Sin(Math.PI * t); // 0 at both ends, peak at center
+            var y = baseline - bow;
+            canvas.DrawRect(new SKRect(x, (float)y, x + 2, (float)(y + barThickness)), paint);
+        }
+    }
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -473,6 +562,52 @@ void TestAutoSplitDoesNotTriggerOnPlainSinglePage()
     Check("No gutter signal means exactly one output file, not a false-positive split", result.OutputFilePaths.Count == 1);
     if (result.OutputFilePaths.Count == 1)
         Check("The single output is the whole-page path", result.OutputFilePaths[0].Contains("_processed"));
+}
+
+void TestAutoSplitDoesNotTriggerOnPageEdgeInsideGutterBand()
+{
+    Console.WriteLine("\n-- Process() does not split a single angled page whose own edge falls inside the gutter search band --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 1000, imageHeight = 400;
+    // Page starts at 31% of width — just inside the 30% search-band boundary, same shape as
+    // the real Trapezoid_Image003.JPG failure: dark background up to the boundary, uniform
+    // bright page for the entire rest of the frame, no second bright region beyond a real dip.
+    var sourcePath = WritePageEdgeInsideGutterBandTestImage(Path.Combine(workDir, "page_edge_in_band.png"), imageWidth, imageHeight, pageStartX: 310);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var splitPercent = new ImageProcessor().DetectGutterSplitPercent(sourcePath);
+    Check("Gutter detection falls back to an even 50/50 rather than trusting the page-edge boundary artifact", splitPercent == 50.0);
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+    Check("Processing succeeds", result.Success);
+    Check("A single page's own edge inside the search band does not trigger a false-positive split", result.OutputFilePaths.Count == 1);
+}
+
+void TestBoundaryCurveStaysSafeOnNotchedEdge()
+{
+    Console.WriteLine("\n-- A page edge with a genuine evidence gap (real notch) still produces a real, uncorrupted crop --");
+    var workDir = TempWorkDir();
+    const int imageWidth = 1000, imageHeight = 1200;
+    var pageRect = new SKRectI(200, 100, 900, 1100);
+    // Notch spans the middle third of the left edge, 60px deep — comfortably past
+    // BoundaryCurveBandPx (30px default), so that region contributes zero inlier evidence
+    // while the top/bottom thirds (each 300px, well past the 15%/85% span gate) still do.
+    var sourcePath = WriteNotchedEdgeTestImage(Path.Combine(workDir, "notched_edge.png"), imageWidth, imageHeight, pageRect, notchDepth: 60, notchTop: 400, notchBottom: 800);
+    var outDir = Path.Combine(workDir, "Processed");
+
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
+    Check("Processing succeeds", result.Success);
+    Check("Produces exactly one output file", result.OutputFilePaths.Count == 1);
+    if (result.OutputFilePaths.Count == 1)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Grayscale);
+        Check("Output is a real, non-trivial image", output.Width > 10 && output.Height > 10);
+        Cv2.MeanStdDev(output, out var mean, out _);
+        // The confirmed real regression pulled in background/off-page pixels, dragging mean
+        // brightness far down toward black; the page interior here is solid white (255) on a
+        // dark (20) backdrop, so a correctly-cropped-or-safely-declined result must read bright.
+        Check($"Output isn't corrupted-dark (mean brightness {mean.Val0:F0}, expect page-bright)", mean.Val0 > 150);
+    }
 }
 
 void TestManualOverrideLegacyRectCrop()
@@ -1151,6 +1286,80 @@ void TestDewarpControlPointsStayWithinPageBounds()
         Check($"All control point Y values stay within a sane multiple of the page height (max |Y|={maxAbsY:F0}, page height={height})",
             maxAbsY < height * 3);
     }
+}
+
+/// <summary>Mean row of dark pixels across a narrow X window, for measuring where a synthetic
+/// bar actually sits at that column without depending on ImageProcessor's own line detector —
+/// an independent check of the mesh step's real pixel effect, not just its own report of what
+/// it did.</summary>
+double MeasureBarCentroidY(Mat grayOrColor, int x, int windowHalfWidth, int yStart, int yEnd)
+{
+    using var gray = grayOrColor.Channels() == 1 ? grayOrColor.Clone() : new Mat();
+    if (grayOrColor.Channels() != 1) Cv2.CvtColor(grayOrColor, gray, ColorConversionCodes.BGR2GRAY);
+    double sum = 0;
+    var count = 0;
+    for (var xi = Math.Max(0, x - windowHalfWidth); xi < Math.Min(gray.Cols, x + windowHalfWidth); xi++)
+        for (var y = yStart; y < yEnd; y++)
+            if (gray.At<byte>(y, xi) < 140) { sum += y; count++; }
+    return count > 0 ? sum / count : double.NaN;
+}
+
+void TestLineMeshFlattensSharedPageWideBow()
+{
+    Console.WriteLine("\n-- Text-line mesh correction flattens a real, shared page-wide bow (positive case) --");
+    var workDir = TempWorkDir();
+    const int width = 1400, height = 1600;
+    const double amplitude = 50.0;
+    const int barThickness = 16;
+    // 8 bars sharing the exact same bow shape (peaks at page center) at different baselines —
+    // the case TryApplyLineMesh's pooled-fit design targets: one systematic curve shared by
+    // every line, not independent per-line shapes.
+    var baselines = new[] { 150, 320, 490, 660, 830, 1000, 1170, 1340 };
+    var path = WriteCurvedBarTestImage(Path.Combine(workDir, "curved_bars.png"), width, height, baselines, barThickness, amplitude);
+    var bytes = File.ReadAllBytes(path);
+
+    var correctedBytes = new ImageProcessor().ApplyLineMeshFromBytes(bytes);
+    Check("Mesh correction applies (enough shared-shape lines detected)", correctedBytes != null);
+    if (correctedBytes == null) return;
+
+    using var original = Cv2.ImDecode(bytes, ImreadModes.Color);
+    using var corrected = Cv2.ImDecode(correctedBytes, ImreadModes.Color);
+    Check("Corrected output keeps the same dimensions", corrected.Cols == original.Cols && corrected.Rows == original.Rows);
+
+    // Independently re-measure the first bar's own bow (not via ImageProcessor's own detector)
+    // before and after correction — the real, direct assertion that pixels actually moved,
+    // not just that a warning string was emitted.
+    var baseline0 = baselines[0];
+    var yStart = Math.Max(0, baseline0 - (int)amplitude - 20);
+    var yEnd = Math.Min(height, baseline0 + barThickness + 20);
+    var xs = new[] { 100, 300, 500, 700, 900, 1100, 1300 };
+
+    double MaxDeviation(Mat mat)
+    {
+        var ys = xs.Select(x => MeasureBarCentroidY(mat, x, 10, yStart, yEnd)).Where(y => !double.IsNaN(y)).ToList();
+        if (ys.Count < 3) return double.NaN;
+        var median = ys.OrderBy(y => y).ElementAt(ys.Count / 2);
+        return ys.Max(y => Math.Abs(y - median));
+    }
+
+    var beforeDeviation = MaxDeviation(original);
+    var afterDeviation = MaxDeviation(corrected);
+    // Deviation-from-median across 7 sample points on a sine hump reads as roughly half the
+    // injected 50px amplitude (median sits partway up the curve, not at the flat endpoints) —
+    // confirmed empirically at ~24px, not a bug in the correction itself.
+    Check($"Original bar shows the injected bow (before deviation {beforeDeviation:F0}px, expect > 15px)", beforeDeviation > 15);
+    Check($"Mesh correction substantially flattens it (after deviation {afterDeviation:F0}px, expect < half of before)", afterDeviation < beforeDeviation / 2);
+}
+
+void TestLineMeshDeclinesOnPlainUniformPage()
+{
+    Console.WriteLine("\n-- Text-line mesh correction declines (never corrupts) a page with no text lines --");
+    var workDir = TempWorkDir();
+    var path = WriteSolidImage(Path.Combine(workDir, "plain.png"), 800, 600);
+    var bytes = File.ReadAllBytes(path);
+
+    var result = new ImageProcessor().ApplyLineMeshFromBytes(bytes);
+    Check("No lines detected -> declines rather than inventing a correction", result == null);
 }
 
 void TestWriteTiffPreservesLargeColorImagePixelData()

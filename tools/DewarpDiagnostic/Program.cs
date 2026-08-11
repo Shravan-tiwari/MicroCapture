@@ -31,6 +31,14 @@ switch (args[0])
         return RunSpread(args);
     case "boundary":
         return RunBoundary(args);
+    case "corners":
+        return RunCorners(args);
+    case "rotfield":
+        return RunRotField(args);
+    case "points":
+        return RunPoints(args);
+    case "mesh":
+        return RunMesh(args);
     default:
         PrintUsage();
         return 1;
@@ -44,6 +52,10 @@ static void PrintUsage()
     Console.WriteLine("  dewarp-lines <cropped-page-image>");
     Console.WriteLine("  spread <image-or-dir>");
     Console.WriteLine("  boundary <image-or-dir>");
+    Console.WriteLine("  corners <image-or-dir>");
+    Console.WriteLine("  rotfield <image-or-dir>");
+    Console.WriteLine("  points <image> [pointsPerEdge]");
+    Console.WriteLine("  mesh <image-or-dir>");
 }
 
 static int RunProcess(string[] args)
@@ -57,6 +69,7 @@ static int RunProcess(string[] args)
     // real spread goes through the old single-whole-image path, without needing to hand-edit
     // ImageProcessor to see the before/after difference.
     var forceSingle = args.Contains("--force-single");
+    var noDewarp = args.Contains("--no-dewarp");
 
     if (!Directory.Exists(inputDir))
     {
@@ -86,7 +99,7 @@ static int RunProcess(string[] args)
         var name = Path.GetFileNameWithoutExtension(imagePath);
         Console.WriteLine($"=== {name} ===");
 
-        var result = processor.Process(imagePath, outputDir, binarizeEnabled: binarize, dewarpEnabled: true);
+        var result = processor.Process(imagePath, outputDir, binarizeEnabled: binarize, dewarpEnabled: !noDewarp);
 
         Console.WriteLine($"  Success: {result.Success}");
         Console.WriteLine($"  CropConfidence: {result.CropConfidence:P1}");
@@ -228,5 +241,106 @@ static int RunBoundary(string[] args)
         var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
         Console.WriteLine(processor.DebugBoundaryDetection(bytes));
     }
+    return 0;
+}
+
+static int RunCorners(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugCornerRefinement(bytes));
+    }
+    return 0;
+}
+
+static int RunRotField(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugDeskewRotationField(bytes));
+    }
+    return 0;
+}
+
+static int RunMesh(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugLineMesh(bytes));
+    }
+    return 0;
+}
+
+static int RunPoints(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var path = args[1];
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"File not found: {path}");
+        return 1;
+    }
+    var pointsPerEdge = args.Length >= 3 && int.TryParse(args[2], out var n) ? n : 16;
+
+    var processor = new ImageProcessor();
+    var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+    Console.WriteLine(processor.DebugBoundaryPoints(bytes, pointsPerEdge));
     return 0;
 }

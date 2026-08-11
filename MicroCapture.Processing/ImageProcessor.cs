@@ -113,6 +113,60 @@ public class ImageProcessor
     // used to gate the automatic (non-manual) spread-vs-single-page promotion in Process(), not
     // the already-in-split-mode split-point picker, which only needs "where," not "whether."
     public double GutterAbsoluteDropThreshold { get; set; } = 20.0;
+    // A real spine sits *between* two page halves, so the darkest column found in
+    // DetectGutter's central search band should have genuine bright page content flanking it
+    // on both sides within that same band. Without this, a single page shot at an angle whose
+    // own left/right edge (against the dark backdrop) happens to fall inside the search band
+    // reads as a fake high-confidence "gutter": the darkest column lands right at the search
+    // band's own boundary (a one-sided dark-to-bright transition, not an interior dip), while
+    // the bright page filling the rest of the band inflates windowAvg enough to still score a
+    // large relative drop. Confirmed on a real fixture (Trapezoid_Image003.JPG, a single page
+    // photographed at a steep angle): minIdx landed exactly on searchStart at confidence 0.92,
+    // and the resulting "left half" split out was 100% black background, no page content at
+    // all. All 7 genuine real-fixture spreads have their true spine at least ~800px inside the
+    // search band on both sides — comfortably clearing a 5% margin — so this only rejects
+    // boundary-riding false positives, not real interior dips.
+    public double GutterMinFlankMarginFraction { get; set; } = 0.05;
+    // A residual distortion distinct from both global rotation (one angle for the whole page)
+    // and book-curve dewarp (per-line horizontal bulge): each text line's own left margin
+    // drifts sideways as a near-linear function of its vertical position — a shear, not a
+    // rotation or a curve. Confirmed on a real photo (Trapezoid_Image001's right half): text-
+    // line angles were too inconsistent (high IQR) to trust a single global rotation, which is
+    // exactly what TryDeskew's own sanity gate correctly detected — but the *left margin's own
+    // x-position*, tracked line-by-line, showed a clean ~2° trend the angle-based method
+    // couldn't see because a pure shear leaves each individual line's own slope near zero (only
+    // its horizontal position moves), so it hides from an angle-only estimator. Needs more line
+    // support than global-angle deskew (MinShearLines vs. the 3-line minimum above) because
+    // fitting a trend, not a median, is more exposed to indentation/short-line noise.
+    public int MinShearLines { get; set; } = 8;
+    // Theil-Sen residual tolerance (px) for a line to count as following the fitted margin
+    // trend rather than being paragraph-indentation/short-line noise.
+    public double ShearInlierPx { get; set; } = 15.0;
+    public double MinShearInlierFraction { get; set; } = 0.6;
+    // Below this, the implied lean isn't worth correcting (matches ApplyDeskewAngle's own 0.1°
+    // no-op floor, raised because a shear fit is noisier evidence than a direct angle median).
+    public double MinShearCorrectionDegrees { get; set; } = 0.3;
+    // Sanity clamp mirroring MaxDeskewDegrees — a fitted trend implying more lean than this is
+    // more likely a bad fit than a real physical shear this severe.
+    public double MaxShearCorrectionDegrees { get; set; } = 10.0;
+    // A margin shear (above) only moves *where* a line sits — it cannot change a line's own
+    // orientation, because it never adjusts Y as a function of X. Confirmed necessary on a real
+    // photo (Trapezoid_Image001's right half): even after both boundary-curve rectification and
+    // margin-shear correction, individual text lines were still visibly tilted, and by a
+    // *different* amount near the top than near the bottom — a rotation that itself varies with
+    // vertical position, which needs a real 2D field (Y depends on both X and Y), not a shear.
+    public int MinRotationFieldLines { get; set; } = 8;
+    // Theil-Sen residual tolerance for a line's own fitted slope (dy/dx, not degrees) to count
+    // as following the fitted rotation-vs-Y trend. ~0.03 is about 1.7°.
+    public double RotationFieldInlierSlope { get; set; } = 0.03;
+    // Lower than MinShearInlierFraction (0.6) — individual per-line slope fits are noisier
+    // evidence than a line's own left-edge position (more exposed to font/glyph irregularity),
+    // so demanding the same majority is unrealistic. Starting point pending validation.
+    public double MinRotationFieldInlierFraction { get; set; } = 0.5;
+    // Below this implied top-to-bottom span, the trend isn't worth correcting.
+    public double MinRotationFieldRangeDegrees { get; set; } = 0.5;
+    // Sanity clamp mirroring MaxShearCorrectionDegrees.
+    public double MaxRotationFieldRangeDegrees { get; set; } = 10.0;
     // Otsu's own between-class/total-variance separability score for the brightness-based
     // foreground segmentation pass (FindContoursByBrightness) — below this, the split isn't a
     // real bimodal "bright page on dark backdrop" separation (e.g. a light-colored desk, or a
@@ -138,6 +192,60 @@ public class ImageProcessor
     // below this, that corner keeps its original (unrefined) position rather than fitting a
     // line from too little evidence. Mirrors DetectDewarpCurve's own >= 8 samples bar.
     public int CornerRefinementMinInliers { get; set; } = 8;
+    // A single straight line per edge (RefineQuadCorners/CornerRefinementBandPx above) can only
+    // ever approximate a genuinely curved or trapezoidal edge — it can't reproduce one. This
+    // family of tunables governs a stronger alternative: fit each of the quad's 4 edges as its
+    // own curve (a degree-2 polynomial across many sample points along that edge, not just its
+    // 2 endpoints), then map all 4 fitted edges directly onto the output rectangle's edges via
+    // boundary (Coons-patch) interpolation — same physical idea as RefineQuadCorners, just not
+    // limited to a straight line. Confirmed necessary on a real photo (Trapezoid_Image001's
+    // right half): even after straight-line corner refinement, the page was still visibly
+    // slanted, because its true edges are not straight lines under this camera angle.
+    // Wider band than corner refinement's — a curve fit needs points spread along the *whole*
+    // edge, not just near 2 endpoints, so it must tolerate more perpendicular scatter to gather
+    // enough of them.
+    public double BoundaryCurveBandPx { get; set; } = 30.0;
+    // Needs more support than a 2-point line (CornerRefinementMinInliers) — fitting a degree-2
+    // curve from too few points overfits noise into a fake bend. Starting point pending
+    // validation against real fixtures.
+    public int BoundaryCurveMinInliers { get; set; } = 24;
+    // A fitted edge curve implying a perpendicular bend larger than this fraction of the
+    // page's own relevant dimension is more likely an overfit to noise than a real physical
+    // page edge — reject and fall back rather than trust it. 20% is a generous ceiling: the
+    // real defect this was built for (Trapezoid_Image001) implied roughly 3-5%.
+    public double BoundaryCurveMaxOffsetFraction { get; set; } = 0.2;
+    // Boundary-curve rectification (above) guarantees the page's *outer* rectangle comes out
+    // straight — it does not guarantee interior content does too, because a Coons-patch blend
+    // of only 4 edge curves can't represent every real page's actual per-line distortion.
+    // Confirmed by the user's own annotated screenshot: straight reference lines drawn over the
+    // rectified output show text still visibly bowing away from them, on every real fixture
+    // tested. This family of tunables governs the user's own proposed fix, applied literally:
+    // detect every text line's own actual shape (reusing the same evidence
+    // DetectDewarpCurve/TryDeskew already collect) and flatten each one individually to its own
+    // median row — "no change in Y across a line's own width" — rather than trusting a smooth
+    // blend of a handful of curves to get the interior right too. See TryApplyLineMesh.
+    // Needs more lines than the coarse dewarp curve fit's minimum (3) — a sparse mesh leaves
+    // large unsupported gaps between anchor lines that a blend would have to paper over anyway,
+    // defeating the point of doing this per-line instead.
+    public int MinMeshLines { get; set; } = 6;
+    // Matches the sample-count bar used everywhere else a single line's own edge is fit
+    // (FitAveragedCurve, TryDeskewRotationField) — fewer points makes a single line's own shape
+    // too noisy to trust as a flattening target.
+    public int MeshLineMinSamples { get; set; } = 8;
+    // Same degree as the coarse top/bottom curve fit (FitAveragedCurve) — this pass reuses that
+    // exact "cubic sheet" assumption, just pooling every detected line's own residual instead of
+    // only the topmost/bottommost line's.
+    public int MeshCurveDegree { get; set; } = 3;
+    // Column-averaging window (each side) for SampleLineCentroid's ink-centroid signal — wide
+    // enough to average out single-glyph-scale jitter (roughly a character's width or a bit
+    // more), narrow enough to still track real curvature that develops gradually across a line
+    // rather than smoothing it away too.
+    public int MeshCentroidSmoothWindowPx { get; set; } = 20;
+    // A line implying more correction than this fraction of the page's own height is more
+    // likely a false "line" detection (a photo, a rule, a table border) than real residual
+    // curvature this late in the pipeline (after boundary rectification and the coarse dewarp
+    // curve have already run) — decline the whole mesh rather than trust it.
+    public double MeshMaxDisplacementFraction { get; set; } = 0.06;
     // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
     // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
     // read as crisper edges/text, low enough to avoid visible halos on a document scan.
@@ -264,7 +372,7 @@ public class ImageProcessor
             // have a visible gap, never as the trigger for whether to split at all.
             // Skipped entirely under manualOverride: an operator who already reviewed the crop
             // in Crop Review made an explicit choice that shouldn't be second-guessed.
-            var gutter = DetectGutter(src);
+            var gutter = DetectGutter(src, GutterMinFlankMarginFraction);
             var autoSplitBySpine = !manualOverride
                 && gutter.Confidence >= GutterConfidenceThreshold
                 && gutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold;
@@ -842,6 +950,11 @@ public class ImageProcessor
         // global rotation resolved before the finer per-column curve).
         working = TryDeskew(working, result);
         working = TryApplyDewarp(working, result, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint);
+        // Not gated behind dewarpEnabled (the book-curve toggle): the residual bow this fixes
+        // shows up on flat trapezoid/keystone photos as much as curved book pages — confirmed
+        // on the user's own annotated Trapezoid_Image001 screenshot, which has no book
+        // curvature at all. See TryApplyLineMesh's own doc comment.
+        working = TryApplyLineMesh(working, result) ?? working;
 
         working = ApplyEnhancement(working);
         working = Sharpen(working);
@@ -1026,6 +1139,19 @@ public class ImageProcessor
         using (var skin = SkinExclusionMask(src, skinCrLow, skinCrHigh, skinCbLow, skinCbHigh))
             Cv2.BitwiseAnd(mask, skin, mask);
 
+        // Opening (erode then dilate) before closing — removes thin bright artifacts (a
+        // lighting reflection/sheen streak on the black backdrop, confirmed on a real photo:
+        // Trapezoid_Image001's right half, a ~21px-wide reflection ran from the true page edge
+        // another ~300px down into the backdrop and was bright enough to cross Otsu's threshold
+        // directly) before they can reach the contour at all. Sized well below the closing
+        // kernel below: large enough to erase a several-pixel-wide streak completely, small
+        // enough that a real page's own bulk survives erosion+dilation intact (only rounding
+        // true corners slightly, which corner refinement downstream already corrects for).
+        var openKernelSize = Math.Max(15, Math.Min(src.Cols, src.Rows) / 80);
+        using var openKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(openKernelSize, openKernelSize));
+        using var opened = new Mat();
+        Cv2.MorphologyEx(mask, opened, MorphTypes.Open, openKernel);
+
         // Square closing (unlike DetectTextLineBlobs's deliberately horizontal-only kernel):
         // the page interior needs bridging in both axes to merge across printed text/photos
         // that locally dip below the brightness threshold, not just across a text line's own
@@ -1033,7 +1159,7 @@ public class ImageProcessor
         var kernelSize = Math.Max(21, Math.Min(src.Cols, src.Rows) / 30);
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(kernelSize, kernelSize));
         using var closed = new Mat();
-        Cv2.MorphologyEx(mask, closed, MorphTypes.Close, kernel);
+        Cv2.MorphologyEx(opened, closed, MorphTypes.Close, kernel);
 
         Cv2.FindContours(closed, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
 
@@ -1405,16 +1531,30 @@ public class ImageProcessor
             Mat cropped;
             if (detection.Quad != null)
             {
-                // Refine the approximate polygon-approximation corners against fresh edge
-                // evidence before warping — a real, non-degenerate quad can still be visibly
-                // keystoned in the output if its corners are imprecise (confirmed on a real
-                // photo: Trapezoid_Image001's right half, 54% confidence, real content, still
-                // visibly slanted). RefineQuadCorners never throws and falls back per-corner to
-                // the original vertex when it can't trust its own evidence, so this is always
-                // safe to call.
-                var refinedQuad = RefineQuadCorners(src, detection.Quad, CornerRefinementBandPx, CornerRefinementMinInliers);
-                cropped = WarpQuad(src, refinedQuad);
-                result.Warnings.Add("Document boundary detected and perspective-corrected.");
+                // Try the strongest correction first: map each of the 4 edges' own actual
+                // *shape* (curve, not just 2 endpoints) onto the output rectangle. A corner-only
+                // homography (below) cannot rectify an edge that isn't a straight line — confirmed
+                // on a real photo (Trapezoid_Image001's right half) still visibly bent after
+                // straight-line corner refinement alone. RectifyWithBoundaryCurves never throws
+                // and returns null whenever it can't trust the evidence, so falling back to the
+                // corner-only path is always safe.
+                var boundaryRectified = RectifyWithBoundaryCurves(src, detection.Quad, BoundaryCurveBandPx, BoundaryCurveMinInliers, BoundaryCurveMaxOffsetFraction);
+                if (boundaryRectified != null)
+                {
+                    cropped = boundaryRectified;
+                    result.Warnings.Add("Document boundary detected and perspective-corrected (multi-point edge rectification).");
+                }
+                else
+                {
+                    // Refine the approximate polygon-approximation corners against fresh edge
+                    // evidence before warping — a real, non-degenerate quad can still be visibly
+                    // keystoned in the output if its corners are imprecise. RefineQuadCorners never
+                    // throws and falls back per-corner to the original vertex when it can't trust
+                    // its own evidence, so this is always safe to call.
+                    var refinedQuad = RefineQuadCorners(src, detection.Quad, CornerRefinementBandPx, CornerRefinementMinInliers);
+                    cropped = WarpQuad(src, refinedQuad);
+                    result.Warnings.Add("Document boundary detected and perspective-corrected.");
+                }
             }
             else
             {
@@ -1512,6 +1652,157 @@ public class ImageProcessor
         }
     }
 
+    /// <summary>Reports the exact same per-line (Y, slope) data and Theil-Sen fit
+    /// <see cref="TryDeskewRotationField"/> computes internally (degree-1 fit per line, not
+    /// <see cref="DebugDewarpLines"/>'s degree-3 curve fit, which is a different, noisier
+    /// signal) — for diagnosing why the rotation-field check did or didn't fire on a specific
+    /// image, without guessing from a differently-fit diagnostic.</summary>
+    public string DebugDeskewRotationField(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+
+        var (binary, lines) = DetectTextLineBlobs(mat);
+        using (binary)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+            sb.AppendLine($"Lines detected: {lines.Count}");
+
+            var lineAngles = new List<(double Y, double Slope, double AngleDeg)>();
+            foreach (var line in lines)
+            {
+                var samples = SampleLineEdge(binary, line, topEdge: true);
+                if (samples.Count < 8) continue;
+                var fit = WeightedPolyFit(samples.Select(s => (s.X, s.Y, 1.0)).ToList(), degree: 1);
+                if (fit == null) continue;
+                var slope = fit[1];
+                var angleDeg = Math.Atan2(slope, 1.0) * 180.0 / Math.PI;
+                lineAngles.Add((line.Y + line.Height / 2.0, slope, angleDeg));
+                sb.AppendLine($"  Y={line.Y + line.Height / 2.0:F0} slope={slope:F4} angle={angleDeg:F2}deg (rect width={line.Width})");
+            }
+
+            if (lineAngles.Count < MinRotationFieldLines)
+            {
+                sb.AppendLine($"Only {lineAngles.Count} usable lines, need >= {MinRotationFieldLines} — would decline.");
+                return sb.ToString();
+            }
+
+            var minYGap = mat.Rows * 0.02;
+            var slopeTrendCandidates = new List<double>();
+            for (var i = 0; i < lineAngles.Count; i++)
+                for (var j = i + 1; j < lineAngles.Count; j++)
+                {
+                    var dy = lineAngles[j].Y - lineAngles[i].Y;
+                    if (Math.Abs(dy) < minYGap) continue;
+                    slopeTrendCandidates.Add((lineAngles[j].Slope - lineAngles[i].Slope) / dy);
+                }
+            slopeTrendCandidates.Sort();
+            var b = slopeTrendCandidates.Count > 0 ? slopeTrendCandidates[slopeTrendCandidates.Count / 2] : 0;
+
+            var intercepts = lineAngles.Select(p => p.Slope - b * p.Y).OrderBy(v => v).ToList();
+            var a = intercepts.Count > 0 ? intercepts[intercepts.Count / 2] : 0;
+
+            var inliers = lineAngles.Count(p => Math.Abs(p.Slope - (a + b * p.Y)) <= RotationFieldInlierSlope);
+            var inlierFraction = inliers / (double)lineAngles.Count;
+
+            var topY = lineAngles.Min(p => p.Y);
+            var bottomY = lineAngles.Max(p => p.Y);
+            var slopeAtTopDeg = Math.Atan(a + b * topY) * 180.0 / Math.PI;
+            var slopeAtBottomDeg = Math.Atan(a + b * bottomY) * 180.0 / Math.PI;
+            var rangeDeg = Math.Abs(slopeAtBottomDeg - slopeAtTopDeg);
+
+            sb.AppendLine($"Theil-Sen fit: slope(Y) = {a:F5} + {b:F7}*Y");
+            sb.AppendLine($"Inliers: {inliers}/{lineAngles.Count} ({inlierFraction:P0}), need >= {MinRotationFieldInlierFraction:P0}");
+            sb.AppendLine($"Implied span top-to-bottom: {rangeDeg:F2}deg (min={MinRotationFieldRangeDegrees}, max={MaxRotationFieldRangeDegrees})");
+            sb.AppendLine(inlierFraction >= MinRotationFieldInlierFraction && rangeDeg >= MinRotationFieldRangeDegrees && rangeDeg <= MaxRotationFieldRangeDegrees
+                ? "Would APPLY the rotation field."
+                : "Would DECLINE (falls through to margin-shear / Hough).");
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Reports what <see cref="TryApplyLineMesh"/> would do to a page — per-line X
+    /// coverage, median Y, and each line's own max absolute displacement from that median —
+    /// without needing to run the full pipeline to see whether the mesh step would apply,
+    /// decline, or which lines contributed.</summary>
+    /// <summary>Byte-decoded, crop/dewarp-free entry point into <see cref="TryApplyLineMesh"/>
+    /// alone — for SmokeTest to verify the mesh step's own actual pixel output (not just its
+    /// text diagnostic) without the rest of the pipeline (auto-crop, boundary rectification)
+    /// obscuring what changed. Returns null on any failure or decline, same convention as every
+    /// other Try*/Detect* entry point in this class.</summary>
+    public byte[]? ApplyLineMeshFromBytes(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return null;
+        var result = new ProcessingResult();
+        using var warped = TryApplyLineMesh(mat, result);
+        if (warped == null) return null;
+        Cv2.ImEncode(".png", warped, out var bytes);
+        return bytes;
+    }
+
+    public string DebugLineMesh(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+
+        var (binary, lines) = DetectTextLineBlobs(mat);
+        using (binary)
+        {
+            sb.AppendLine($"Lines detected: {lines.Count} (need >= {MinMeshLines})");
+
+            var pooled = new List<(double X, double Y, double W)>();
+            var usable = 0;
+            foreach (var line in lines)
+            {
+                var samples = SampleLineCentroid(binary, line, MeshCentroidSmoothWindowPx);
+                if (samples.Count < MeshLineMinSamples)
+                {
+                    sb.AppendLine($"  Y~{line.Y + line.Height / 2}: {samples.Count} samples, below minimum ({MeshLineMinSamples}), skipped.");
+                    continue;
+                }
+                var sortedY = samples.Select(s => s.Y).OrderBy(y => y).ToList();
+                var medianY = sortedY[sortedY.Count / 2];
+                var maxDisp = samples.Max(s => Math.Abs(s.Y - medianY));
+                foreach (var s in samples) pooled.Add((s.X, s.Y - medianY, 1.0));
+                usable++;
+                sb.AppendLine($"  Y~{line.Y + line.Height / 2}: {samples.Count} samples, medianY={medianY:F1}, ownMaxAbsDisp={maxDisp:F1}px, X=[{samples.Min(s => s.X):F0},{samples.Max(s => s.X):F0}]");
+            }
+
+            sb.AppendLine($"Usable lines: {usable} (need >= {MinMeshLines})");
+            if (usable < MinMeshLines)
+            {
+                sb.AppendLine("Would DECLINE (not enough usable lines).");
+                return sb.ToString();
+            }
+
+            var coeffs = WeightedPolyFit(pooled, MeshCurveDegree);
+            if (coeffs == null)
+            {
+                sb.AppendLine("Would DECLINE (pooled fit failed — singular system).");
+                return sb.ToString();
+            }
+
+            var maxAbsDelta = 0.0;
+            var minX = 0;
+            var maxX = mat.Cols - 1;
+            for (var x = minX; x <= maxX; x += Math.Max(1, mat.Cols / 200))
+                maxAbsDelta = Math.Max(maxAbsDelta, Math.Abs(EvalPoly(coeffs, x)));
+
+            var maxAllowed = mat.Rows * MeshMaxDisplacementFraction;
+            sb.AppendLine($"Pooled fit coeffs: {FormatCoeffs(coeffs)}");
+            sb.AppendLine($"Max |fitted column delta| across width: {maxAbsDelta:F1}px (limit {maxAllowed:F1}px)");
+            sb.AppendLine(maxAbsDelta <= maxAllowed
+                ? "Would APPLY the text-line mesh correction."
+                : "Would DECLINE (fitted correction too large).");
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Diagnostic-only entry point: runs the real <see cref="DetectDewarpCurve"/> and
     /// dumps the resulting model's control points, for troubleshooting a wrong-looking dewarp
     /// result at the level of "what curve did it actually compute" rather than per-line
@@ -1538,9 +1829,9 @@ public class ImageProcessor
         if (mat.Empty()) return "decode failed";
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
-        var gutter = DetectGutter(mat);
-        sb.AppendLine($"Gutter: fraction={gutter.Fraction:F4} confidence={gutter.Confidence:F4} absoluteDropLevels={gutter.AbsoluteDropLevels:F2}");
         var instance = new ImageProcessor();
+        var gutter = DetectGutter(mat, instance.GutterMinFlankMarginFraction);
+        sb.AppendLine($"Gutter: fraction={gutter.Fraction:F4} confidence={gutter.Confidence:F4} absoluteDropLevels={gutter.AbsoluteDropLevels:F2}");
         var twoPage = instance.DetectTwoPageBoundaries(mat);
         sb.AppendLine($"TwoPage: found={twoPage.Found} leftConfidence={twoPage.Left.Confidence:F4} rightConfidence={twoPage.Right.Confidence:F4}");
         return sb.ToString();
@@ -1607,6 +1898,117 @@ public class ImageProcessor
 
         var best = DetectBoundaryInMat(mat);
         sb.AppendLine($"Winner: found={best.Found} confidence={best.Confidence:F4} sourcePass={best.SourcePass} (MediumConfidenceThreshold={MediumConfidenceThreshold})");
+        return sb.ToString();
+    }
+
+    /// <summary>Reports the raw <see cref="DeriveQuad"/> corners against what
+    /// <see cref="RefineQuadCorners"/> moves them to, plus each edge's own line-fit inlier
+    /// count — for diagnosing cases where a real, non-degenerate crop still comes out visibly
+    /// keystoned (e.g. <c>Trapezoid_Image001</c>'s right half) without guessing from pixels.
+    /// Edge index 0 is quad[0]-&gt;quad[1] (top), 1 is quad[1]-&gt;quad[2] (right), 2 is
+    /// quad[2]-&gt;quad[3] (bottom), 3 is quad[3]-&gt;quad[0] (left/spine-side on a post-split
+    /// right half).</summary>
+    public string DebugCornerRefinement(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+
+        var detection = DetectBoundary(mat);
+        if (!detection.Found || detection.Quad == null)
+        {
+            sb.AppendLine($"No quad detection (found={detection.Found}).");
+            return sb.ToString();
+        }
+
+        var quad = detection.Quad;
+        sb.AppendLine($"Confidence: {detection.Confidence:F4}");
+        for (var i = 0; i < 4; i++)
+            sb.AppendLine($"Raw quad[{i}]: ({quad[i].X:F1}, {quad[i].Y:F1})");
+
+        var edgePoints = GetCannyEdgePoints(mat);
+
+        for (var i = 0; i < 4; i++)
+        {
+            var line = FitQuadEdge(edgePoints, quad[i], quad[(i + 1) % 4], CornerRefinementBandPx, CornerRefinementMinInliers);
+            sb.AppendLine(line is { } l
+                ? $"Edge {i} (quad[{i}]->quad[{(i + 1) % 4}]): inliers={l.Inliers} dir=({l.Vx:F3},{l.Vy:F3})"
+                : $"Edge {i} (quad[{i}]->quad[{(i + 1) % 4}]): no line (insufficient evidence, corners kept as-is)");
+        }
+
+        var refined = RefineQuadCorners(mat, quad, CornerRefinementBandPx, CornerRefinementMinInliers);
+        for (var i = 0; i < 4; i++)
+        {
+            var dx = refined[i].X - quad[i].X;
+            var dy = refined[i].Y - quad[i].Y;
+            sb.AppendLine($"Refined quad[{i}]: ({refined[i].X:F1}, {refined[i].Y:F1})  moved=({dx:F1}, {dy:F1})");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("--- Boundary-curve rectification (multi-point per edge) ---");
+        for (var i = 0; i < 4; i++)
+        {
+            var curve = FitEdgeCurve(edgePoints, quad[i], quad[(i + 1) % 4], BoundaryCurveBandPx, BoundaryCurveMinInliers);
+            sb.AppendLine(curve is { } c
+                ? $"Edge {i}: inliers={c.Inliers} maxOffsetPx={c.MaxAbsOffset:F1}"
+                : $"Edge {i}: no curve (insufficient evidence)");
+        }
+        var rectified = RectifyWithBoundaryCurves(mat, quad, BoundaryCurveBandPx, BoundaryCurveMinInliers, BoundaryCurveMaxOffsetFraction);
+        sb.AppendLine(rectified != null
+            ? $"Boundary-curve rectification: SUCCEEDED, output {rectified.Cols}x{rectified.Rows}"
+            : "Boundary-curve rectification: declined (falls back to corner-based WarpQuad)");
+        rectified?.Dispose();
+
+        return sb.ToString();
+    }
+
+    /// <summary>Dumps every geometric point this class's boundary/split detection actually
+    /// found, as plain "label,x,y" CSV lines — for drawing a literal overlay on the source
+    /// image instead of describing detection results in prose. Includes: the gutter split
+    /// column (full-frame images only — a post-split half has nothing to split further), the
+    /// raw quad corners, and <paramref name="pointsPerEdge"/> points sampled along each of the
+    /// 4 fitted boundary curves (falling back to the straight-line quad edge, unlabeled as a
+    /// curve, when that edge's curve fit declines).</summary>
+    public string DebugBoundaryPoints(byte[] encodedImage, int pointsPerEdge = 16)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"page,{mat.Cols},{mat.Rows}");
+
+        var gutter = DetectGutter(mat, GutterMinFlankMarginFraction);
+        sb.AppendLine($"gutter_fraction,{gutter.Fraction:F4},{gutter.Confidence:F4}");
+
+        var detection = DetectBoundary(mat);
+        if (!detection.Found || detection.Quad == null)
+        {
+            sb.AppendLine($"no_quad_detection,found={detection.Found}");
+            return sb.ToString();
+        }
+        var quad = detection.Quad;
+        for (var i = 0; i < 4; i++)
+            sb.AppendLine($"raw_corner_{i},{quad[i].X:F1},{quad[i].Y:F1}");
+
+        var edgePoints = GetCannyEdgePoints(mat);
+        var edgeDefs = new (string Name, Point2f A, Point2f B)[]
+        {
+            ("top", quad[0], quad[1]),
+            ("right", quad[1], quad[2]),
+            ("bottom", quad[3], quad[2]),
+            ("left", quad[0], quad[3]),
+        };
+        foreach (var (name, a, b) in edgeDefs)
+        {
+            var curve = FitEdgeCurve(edgePoints, a, b, BoundaryCurveBandPx, BoundaryCurveMinInliers);
+            for (var i = 0; i < pointsPerEdge; i++)
+            {
+                var t = pointsPerEdge <= 1 ? 0.0 : i / (double)(pointsPerEdge - 1);
+                var p = curve is { } c ? EvalEdgeCurve(c, t) : new Point2f((float)(a.X + (b.X - a.X) * t), (float)(a.Y + (b.Y - a.Y) * t));
+                sb.AppendLine($"edge_{name}_{(curve != null ? "curve" : "line")},{p.X:F1},{p.Y:F1}");
+            }
+        }
+
         return sb.ToString();
     }
 
@@ -1719,6 +2121,26 @@ public class ImageProcessor
         return Math.Sqrt(dx * dx + dy * dy);
     }
 
+    /// <summary>Shared Canny edge-pixel extraction behind every corner/edge-curve refinement
+    /// step in this class (<see cref="RefineQuadCorners"/>, <see cref="RectifyWithBoundaryCurves"/>,
+    /// <see cref="DebugCornerRefinement"/>) — one definition of "what counts as edge evidence."</summary>
+    private static Point[] GetCannyEdgePoints(Mat src)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+        var (low, high) = AutoCannyThresholds(blurred);
+        using var edged = new Mat();
+        Cv2.Canny(blurred, edged, low, high);
+
+        using var edgePointsMat = new Mat();
+        Cv2.FindNonZero(edged, edgePointsMat);
+        if (edgePointsMat.Empty()) return Array.Empty<Point>();
+        edgePointsMat.GetArray(out Point[] edgePoints);
+        return edgePoints;
+    }
+
     /// <summary>Refines a detected quad's 4 corners against fresh Canny edge evidence, instead
     /// of trusting <see cref="DeriveQuad"/>'s raw <see cref="Cv2.ApproxPolyDP"/> vertices
     /// directly. Fixes a real, confirmed failure mode distinct from "no contour found at all":
@@ -1743,18 +2165,8 @@ public class ImageProcessor
         if (quad.Length != 4) return quad;
         try
         {
-            using var gray = new Mat();
-            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-            using var blurred = new Mat();
-            Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
-            var (low, high) = AutoCannyThresholds(blurred);
-            using var edged = new Mat();
-            Cv2.Canny(blurred, edged, low, high);
-
-            using var edgePointsMat = new Mat();
-            Cv2.FindNonZero(edged, edgePointsMat);
-            if (edgePointsMat.Empty()) return quad;
-            edgePointsMat.GetArray(out Point[] edgePoints);
+            var edgePoints = GetCannyEdgePoints(src);
+            if (edgePoints.Length == 0) return quad;
 
             // lines[i] is the fitted line for the edge quad[i] -> quad[(i+1)%4].
             var lines = new EdgeLine?[4];
@@ -1785,7 +2197,7 @@ public class ImageProcessor
         }
     }
 
-    private readonly record struct EdgeLine(double Vx, double Vy, double X0, double Y0);
+    private readonly record struct EdgeLine(double Vx, double Vy, double X0, double Y0, int Inliers);
 
     /// <summary>Fits one quad edge's true line from nearby Canny edge pixels: keeps points
     /// within <paramref name="bandPx"/> perpendicular distance of the approximate edge segment
@@ -1821,7 +2233,7 @@ public class ImageProcessor
         if (inliers.Count < minInliers) return null;
 
         var fit = Cv2.FitLine(inliers, DistanceTypes.L2, 0, 0.01, 0.01);
-        return new EdgeLine(fit.Vx, fit.Vy, fit.X1, fit.Y1);
+        return new EdgeLine(fit.Vx, fit.Vy, fit.X1, fit.Y1, inliers.Count);
     }
 
     /// <summary>Intersection of two lines, each given as a point plus direction vector. Returns
@@ -1837,6 +2249,189 @@ public class ImageProcessor
         var t = (dx * second.Vy - dy * second.Vx) / denom;
 
         return new Point2f((float)(first.X0 + t * first.Vx), (float)(first.Y0 + t * first.Vy));
+    }
+
+    // ───────────── BOUNDARY-CURVE RECTIFICATION (multi-point per edge) ─────────────
+
+    /// <summary>One quad edge's true shape as a degree-2 curve in its own local (t, d)
+    /// frame — t along the edge from <c>A</c> (t=0) to its paired corner (t=Length), d
+    /// perpendicular to it — rather than <see cref="EdgeLine"/>'s single straight line.
+    /// <see cref="Coeffs"/> is corrected so the curve evaluates to exactly d=0 at both t=0 and
+    /// t=Length: a Coons patch needs each pair of edges meeting at a corner to agree on that
+    /// corner's exact position, so the fit's own linear trend between its endpoint values is
+    /// subtracted out (keeping the fitted bend, discarding only what would otherwise create a
+    /// seam) rather than forcing the raw least-squares fit through the corners directly.</summary>
+    private readonly record struct EdgeCurve(Point2f A, double Ux, double Uy, double Nx, double Ny, double Length, double[] Coeffs, int Inliers, double MaxAbsOffset);
+
+    /// <summary>Fits edge <paramref name="a"/>-&gt;<paramref name="b"/> as a curve from every
+    /// nearby Canny edge pixel along its whole length, not just 2 endpoints — the direct
+    /// generalization of <see cref="FitQuadEdge"/> from a line to a curve. Returns null when
+    /// there's too little evidence to trust a shape this specific, matching every other
+    /// evidence-gated fit in this file.</summary>
+    private static EdgeCurve? FitEdgeCurve(Point[] edgePoints, Point2f a, Point2f b, double bandPx, int minInliers)
+    {
+        var dx = b.X - a.X;
+        var dy = b.Y - a.Y;
+        var length = Math.Sqrt(dx * dx + dy * dy);
+        if (length < 1) return null;
+
+        var ux = dx / length;
+        var uy = dy / length;
+        var nx = -uy;
+        var ny = ux;
+        var margin = Math.Max(bandPx, length * 0.03);
+
+        var samples = new List<(double T, double D, double W)>();
+        foreach (var p in edgePoints)
+        {
+            var px = p.X - a.X;
+            var py = p.Y - a.Y;
+            var t = px * ux + py * uy;
+            if (t < -margin || t > length + margin) continue;
+            var d = px * nx + py * ny;
+            if (Math.Abs(d) > bandPx) continue;
+            samples.Add((t, d, 1.0));
+        }
+        if (samples.Count < minInliers) return null;
+
+        // Require inliers spread across most of the edge, not clustered in one region — a
+        // degree-2 fit can look tight at its sample points while swinging wildly in a gap
+        // those samples never covered (confirmed on a real photo: IMG_0022's right half —
+        // see MaxAbsOffset's own doc comment below for what this fed into).
+        var minT = samples.Min(s => s.T);
+        var maxT = samples.Max(s => s.T);
+        if (minT > length * 0.15 || maxT < length * 0.85) return null;
+
+        var coeffs = WeightedPolyFit(samples, degree: 2);
+        if (coeffs == null) return null;
+
+        var d0 = EvalPoly(coeffs, 0);
+        var dEnd = EvalPoly(coeffs, length);
+        var corrected = (double[])coeffs.Clone();
+        corrected[0] -= d0;
+        corrected[1] -= (dEnd - d0) / length;
+
+        // Evaluated at dense, uniform steps across the *whole* edge — not just at the inlier
+        // sample points, which was the actual bug: a degree-2 fit can sit tight against every
+        // sample it was measured against while still swinging far out between sparse regions of
+        // them, and checking error only at those same points can never catch that. Confirmed on
+        // a real photo (IMG_0022's right half): the sample-point-only check passed comfortably
+        // while the curve, evaluated between samples, swept far enough off the real edge to
+        // sample from background/off-page pixels in the final remap — the "dark swoosh"
+        // artifact this was built to catch.
+        const int denseSteps = 50;
+        var maxAbsOffset = 0.0;
+        for (var i = 0; i <= denseSteps; i++)
+        {
+            var t = length * i / denseSteps;
+            maxAbsOffset = Math.Max(maxAbsOffset, Math.Abs(EvalPoly(corrected, t)));
+        }
+        return new EdgeCurve(a, ux, uy, nx, ny, length, corrected, samples.Count, maxAbsOffset);
+    }
+
+    private static Point2f EvalEdgeCurve(EdgeCurve curve, double t01)
+    {
+        var t = t01 * curve.Length;
+        var d = EvalPoly(curve.Coeffs, t);
+        return new Point2f((float)(curve.A.X + t * curve.Ux + d * curve.Nx), (float)(curve.A.Y + t * curve.Uy + d * curve.Ny));
+    }
+
+    /// <summary>Rectifies a detected page by mapping all 4 of its actual edge *shapes* — not
+    /// just 4 corners — onto the output rectangle's edges, via boundary (Coons-patch)
+    /// interpolation: every output pixel is a bilinear blend of where the 4 fitted edge curves
+    /// place it, corrected so the 4 corners land exactly on the rectangle's own corners. This
+    /// is what <see cref="WarpQuad"/>'s single 4-point homography structurally cannot do — a
+    /// homography can only exactly rectify a flat quad with straight edges, and confirmed on a
+    /// real photo (Trapezoid_Image001's right half) that isn't enough: even after
+    /// <see cref="RefineQuadCorners"/>'s straight-line-per-edge refinement, real edges under a
+    /// steep camera angle are visibly *not* straight, so a corner-only correction leaves a
+    /// residual bend no amount of corner nudging can remove.
+    ///
+    /// Returns null (never throws) whenever any of the 4 edges lacks enough evidence to trust a
+    /// curve, or a fitted curve implies an implausibly large bend — callers should fall back to
+    /// <see cref="RefineQuadCorners"/> + <see cref="WarpQuad"/> in that case, exactly as if this
+    /// method didn't exist.</summary>
+    private static Mat? RectifyWithBoundaryCurves(Mat src, Point2f[] quad, double bandPx, int minInliers, double maxOffsetFraction)
+    {
+        if (quad.Length != 4) return null;
+        try
+        {
+            var edgePoints = GetCannyEdgePoints(src);
+            if (edgePoints.Length == 0) return null;
+
+            var top = FitEdgeCurve(edgePoints, quad[0], quad[1], bandPx, minInliers);
+            var bottom = FitEdgeCurve(edgePoints, quad[3], quad[2], bandPx, minInliers);
+            var left = FitEdgeCurve(edgePoints, quad[0], quad[3], bandPx, minInliers);
+            var right = FitEdgeCurve(edgePoints, quad[1], quad[2], bandPx, minInliers);
+            if (top is not { } t || bottom is not { } bo || left is not { } le || right is not { } ri)
+                return null;
+
+            var width = Math.Max(1, (int)Math.Round(Math.Max(Distance(quad[0], quad[1]), Distance(quad[3], quad[2]))));
+            var height = Math.Max(1, (int)Math.Round(Math.Max(Distance(quad[0], quad[3]), Distance(quad[1], quad[2]))));
+
+            // A wildly bending fit (noise overfit past minInliers, not a real page edge) would
+            // distort more than it corrects — same defensive spirit as RefineQuadCorners' own
+            // area sanity gate.
+            if (t.MaxAbsOffset > height * maxOffsetFraction || bo.MaxAbsOffset > height * maxOffsetFraction
+                || le.MaxAbsOffset > width * maxOffsetFraction || ri.MaxAbsOffset > width * maxOffsetFraction)
+                return null;
+
+            var (tl, tr, br, bl) = (quad[0], quad[1], quad[2], quad[3]);
+
+            var topPts = new Point2f[width];
+            var bottomPts = new Point2f[width];
+            for (var x = 0; x < width; x++)
+            {
+                var u = width <= 1 ? 0.0 : x / (double)(width - 1);
+                topPts[x] = EvalEdgeCurve(t, u);
+                bottomPts[x] = EvalEdgeCurve(bo, u);
+            }
+            var leftPts = new Point2f[height];
+            var rightPts = new Point2f[height];
+            for (var y = 0; y < height; y++)
+            {
+                var v = height <= 1 ? 0.0 : y / (double)(height - 1);
+                leftPts[y] = EvalEdgeCurve(le, v);
+                rightPts[y] = EvalEdgeCurve(ri, v);
+            }
+
+            var mapXData = new float[height * width];
+            var mapYData = new float[height * width];
+            for (var y = 0; y < height; y++)
+            {
+                var v = height <= 1 ? 0.0 : y / (double)(height - 1);
+                var (lpx, lpy) = (leftPts[y].X, leftPts[y].Y);
+                var (rpx, rpy) = (rightPts[y].X, rightPts[y].Y);
+                var row = y * width;
+                for (var x = 0; x < width; x++)
+                {
+                    var u = width <= 1 ? 0.0 : x / (double)(width - 1);
+                    var (tpx, tpy) = (topPts[x].X, topPts[x].Y);
+                    var (bpx, bpy) = (bottomPts[x].X, bottomPts[x].Y);
+
+                    var sx = (1 - v) * tpx + v * bpx + (1 - u) * lpx + u * rpx
+                        - ((1 - u) * (1 - v) * tl.X + u * (1 - v) * tr.X + (1 - u) * v * bl.X + u * v * br.X);
+                    var sy = (1 - v) * tpy + v * bpy + (1 - u) * lpy + u * rpy
+                        - ((1 - u) * (1 - v) * tl.Y + u * (1 - v) * tr.Y + (1 - u) * v * bl.Y + u * v * br.Y);
+
+                    mapXData[row + x] = (float)sx;
+                    mapYData[row + x] = (float)sy;
+                }
+            }
+
+            using var mapX = new Mat(height, width, MatType.CV_32FC1);
+            using var mapY = new Mat(height, width, MatType.CV_32FC1);
+            mapX.SetArray(mapXData);
+            mapY.SetArray(mapYData);
+
+            var warped = new Mat();
+            Cv2.Remap(src, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Replicate);
+            return warped;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // ───────────── BOOK SPLIT (GUTTER DETECTION) ─────────────
@@ -1856,7 +2451,7 @@ public class ImageProcessor
     /// Confidence is the relative brightness drop versus the search window's average —
     /// callers should fall back to an even 50/50 split when confidence is low rather than
     /// trust a false positive from uneven lighting.</summary>
-    private static GutterDetection DetectGutter(Mat src)
+    private static GutterDetection DetectGutter(Mat src, double minFlankMarginFraction)
     {
         using var gray = new Mat();
         Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
@@ -1887,6 +2482,14 @@ public class ImageProcessor
 
         float windowAvg = count > 0 ? sum / count : 0;
         double confidence = windowAvg > 0 ? Math.Max(0, (windowAvg - minVal) / windowAvg) : 0;
+
+        // Reject a "dip" that's really just the search band's own boundary riding a one-sided
+        // background-to-page transition (see GutterMinFlankMarginFraction doc comment) — a real
+        // spine has genuine interior margin on both sides within the band.
+        int marginPx = (int)(width * minFlankMarginFraction);
+        bool hasBothFlanks = (minIdx - searchStart) >= marginPx && (searchEnd - minIdx) >= marginPx;
+        if (!hasBothFlanks) confidence = 0;
+
         return new GutterDetection((double)minIdx / width, confidence, Math.Max(0, windowAvg - minVal));
     }
 
@@ -1901,7 +2504,7 @@ public class ImageProcessor
         {
             using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
             if (src.Empty()) return 50.0;
-            var gutter = DetectGutter(src);
+            var gutter = DetectGutter(src, GutterMinFlankMarginFraction);
             if (gutter.Confidence < GutterConfidenceThreshold) return 50.0;
             return Math.Clamp(gutter.Fraction * 100.0, 1.0, 99.0);
         }
@@ -1937,6 +2540,121 @@ public class ImageProcessor
         {
             result.Warnings.Add($"Book curve correction failed: {ex.Message}");
             return src;
+        }
+    }
+
+    /// <summary>The user's own proposed fix for residual interior curvature that boundary-curve
+    /// rectification (<see cref="RectifyWithBoundaryCurves"/>) and the coarse top/bottom dewarp
+    /// curve (<see cref="ApplyDewarp"/>) both leave behind: every text line should have "no
+    /// change in Y across its own width," and a real photo's residual bow after those two steps
+    /// turned out (confirmed against the user's own annotated screenshot, and by inspecting
+    /// several real fixtures column-by-column) to be one *systematic, page-wide* drift shared by
+    /// every line — not an independent per-line shape — exactly the same physical assumption
+    /// <see cref="FitAveragedCurve"/> already makes for the coarse top/bottom curves, just
+    /// applied here from every detected line's own residual instead of only the topmost/bottommost.
+    ///
+    /// First attempt at this built an independent per-line piecewise map (each line's own local
+    /// samples as separate anchors, blended between lines per column). That produced ghosted,
+    /// shredded output on real photos: DetectTextLineBlobs's blobs aren't reliably one-per-visual-row
+    /// (a drop cap or indent can split one printed line into two blobs with overlapping X ranges),
+    /// and — even after fixing that into a provably non-folding map — different lines cover
+    /// different X sub-ranges, so the set of "covering" anchors changes column to column and the
+    /// blended correction jumps discontinuously at those boundaries, visible as blocky seams.
+    /// Pooling every line's row-normalized samples into ONE smooth fit (this method) sidesteps
+    /// both failure modes by construction: one continuous function of X, no per-line boundaries,
+    /// same proven technique and centered/conditioned <see cref="WeightedPolyFit"/> call
+    /// <see cref="FitAveragedCurve"/> already uses safely on real photos.
+    ///
+    /// Pure per-column vertical shift (mapX untouched, same family as <see cref="ApplyDewarp"/>).
+    /// Returns null (never throws, never partially applies) whenever there isn't enough
+    /// trustworthy evidence — callers should keep the input unchanged in that case, exactly as
+    /// if this step didn't run.</summary>
+    private Mat? TryApplyLineMesh(Mat src, ProcessingResult result)
+    {
+        try
+        {
+            var (binary, lines) = DetectTextLineBlobs(src);
+            using (binary)
+            {
+                if (lines.Count < MinMeshLines) return null;
+
+                // Same pooling trick as FitAveragedCurve: each line contributes only its own
+                // *shape* (samples minus that line's own median Y), not its absolute row
+                // position, so lines at very different heights don't fight each other in one
+                // fit — the fit becomes "the typical per-column bend," not "the average row."
+                //
+                // Uses the smoothed ink-centroid signal (SampleLineCentroid), not
+                // SampleLineEdge's raw topmost-pixel-per-column: confirmed on a real photo that
+                // the topmost-pixel signal is dominated by per-glyph noise (ascenders, capitals,
+                // punctuation) at the same order of magnitude (tens of px) as the real residual
+                // curve this is trying to measure, which a low-degree pooled fit legitimately
+                // (and correctly) treats as unshared noise and averages away — so the fit found
+                // almost nothing even though individual lines looked visibly bent. Centroid +
+                // local smoothing suppresses that glyph-level jitter before it ever reaches the
+                // fit.
+                var pooled = new List<(double X, double Y, double W)>();
+                var usableLines = 0;
+                foreach (var line in lines)
+                {
+                    var samples = SampleLineCentroid(binary, line, MeshCentroidSmoothWindowPx);
+                    if (samples.Count < MeshLineMinSamples) continue;
+                    var sortedY = samples.Select(s => s.Y).OrderBy(y => y).ToList();
+                    var medianY = sortedY[sortedY.Count / 2];
+                    foreach (var s in samples) pooled.Add((s.X, s.Y - medianY, 1.0));
+                    usableLines++;
+                }
+                if (usableLines < MinMeshLines) return null;
+
+                var coeffs = WeightedPolyFit(pooled, MeshCurveDegree);
+                if (coeffs == null) return null;
+
+                var width = src.Cols;
+                var height = src.Rows;
+
+                // A fitted residual implying more correction than this fraction of the page's
+                // own height is more likely an overfit/false-line artifact than real residual
+                // curvature this late in the pipeline (after boundary rectification and the
+                // coarse dewarp curve have already run) — decline rather than trust it, same
+                // defensive spirit as every other evidence-gated fit in this file.
+                var maxAbsDelta = 0.0;
+                for (var x = 0; x < width; x++)
+                    maxAbsDelta = Math.Max(maxAbsDelta, Math.Abs(EvalPoly(coeffs, x)));
+                if (maxAbsDelta > height * MeshMaxDisplacementFraction)
+                {
+                    result.Warnings.Add($"Text-line mesh implies too large a correction ({maxAbsDelta:F0}px) — declining, likely a false line detection.");
+                    return null;
+                }
+
+                var colDelta = new float[width];
+                for (var x = 0; x < width; x++) colDelta[x] = (float)EvalPoly(coeffs, x);
+
+                var mapXData = new float[height * width];
+                var mapYData = new float[height * width];
+                for (var y = 0; y < height; y++)
+                {
+                    var row = y * width;
+                    for (var x = 0; x < width; x++)
+                    {
+                        mapXData[row + x] = x;
+                        mapYData[row + x] = y + colDelta[x];
+                    }
+                }
+
+                using var mapX = new Mat(height, width, MatType.CV_32FC1);
+                using var mapY = new Mat(height, width, MatType.CV_32FC1);
+                mapX.SetArray(mapXData);
+                mapY.SetArray(mapYData);
+
+                var warped = new Mat();
+                Cv2.Remap(src, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Replicate);
+                result.Warnings.Add($"Text-line mesh correction applied ({usableLines} lines, max {maxAbsDelta:F0}px).");
+                return warped;
+            }
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Text-line mesh correction failed: {ex.Message}");
+            return null;
         }
     }
 
@@ -2107,6 +2825,54 @@ public class ImageProcessor
                     if (binary.At<byte>(y, x) != 0) { samples.Add((x, y)); break; }
                 }
             }
+        }
+        return samples;
+    }
+
+    /// <summary>Per-column mean row of foreground pixels within <paramref name="rect"/>'s own
+    /// rows, smoothed by averaging over <paramref name="smoothWindowPx"/> neighboring columns —
+    /// a far more robust "where is this line, at this column" signal than
+    /// <see cref="SampleLineEdge"/>'s topmost-foreground-pixel for detecting genuine sub-glyph-
+    /// scale curvature (see <see cref="TryApplyLineMesh"/>): the topmost pixel jumps between a
+    /// letter's cap-height and x-height depending purely on which glyph happens to sit at that
+    /// column, noise at the same order of magnitude as the real curvature signal being measured;
+    /// the ink centroid moves far less per glyph, and the smoothing window further suppresses
+    /// what's left. Skips columns with no foreground pixel in range rather than inventing one.</summary>
+    private static List<(double X, double Y)> SampleLineCentroid(Mat binary, Rect rect, int smoothWindowPx)
+    {
+        var yStart = Math.Max(0, rect.Y);
+        var yEnd = Math.Min(binary.Rows - 1, rect.Y + rect.Height - 1);
+        var xStart = Math.Max(0, rect.X);
+        var xEnd = Math.Min(binary.Cols, rect.X + rect.Width);
+        if (xEnd <= xStart) return new List<(double, double)>();
+
+        var raw = new double?[xEnd - xStart];
+        for (var x = xStart; x < xEnd; x++)
+        {
+            double sum = 0;
+            var count = 0;
+            for (var y = yStart; y <= yEnd; y++)
+            {
+                if (binary.At<byte>(y, x) == 0) continue;
+                sum += y;
+                count++;
+            }
+            if (count > 0) raw[x - xStart] = sum / count;
+        }
+
+        var samples = new List<(double, double)>();
+        for (var i = 0; i < raw.Length; i++)
+        {
+            if (raw[i] is not { } _) continue;
+            double sum = 0;
+            var count = 0;
+            for (var j = Math.Max(0, i - smoothWindowPx); j <= Math.Min(raw.Length - 1, i + smoothWindowPx); j++)
+            {
+                if (raw[j] is not { } v) continue;
+                sum += v;
+                count++;
+            }
+            samples.Add((xStart + i, sum / count));
         }
         return samples;
     }
@@ -2343,40 +3109,73 @@ public class ImageProcessor
             var (binary, lines) = DetectTextLineBlobs(src);
             using (binary)
             {
-                if (lines.Count >= 3)
-                {
-                    var angles = new List<double>();
-                    foreach (var line in lines)
-                    {
-                        var samples = SampleLineEdge(binary, line, topEdge: true);
-                        if (samples.Count < 8) continue;
-                        var fit = WeightedPolyFit(samples.Select(s => (s.X, s.Y, 1.0)).ToList(), degree: 1);
-                        if (fit == null) continue;
-                        angles.Add(Math.Atan2(fit[1], 1.0) * 180.0 / Math.PI); // fit[1] = dy/dx slope
-                    }
-
-                    if (angles.Count >= 3)
-                    {
-                        angles.Sort();
-                        var medianAngle = angles[angles.Count / 2];
-                        var iqr = angles[(int)(angles.Count * 0.75)] - angles[(int)(angles.Count * 0.25)];
-                        if (iqr <= MaxDeskewAngleIqrDegrees)
-                            return ApplyDeskewAngle(src, medianAngle, result, "text-line");
-
-                        result.Warnings.Add($"Text-line angles inconsistent (IQR {iqr:F1}°) — using whole-image line detection for deskew.");
-                    }
-                    else
-                    {
-                        result.Warnings.Add("Not enough reliable text-line angle fits — using whole-image line detection for deskew.");
-                    }
-                }
-                else
+                if (lines.Count < 3)
                 {
                     result.Warnings.Add("Not enough text lines for line-based deskew — using whole-image line detection.");
+                    return TryDeskewViaHough(src, result);
                 }
-            }
 
-            return TryDeskewViaHough(src, result);
+                var lineAngles = new List<(double Y, double Slope, double AngleDeg)>();
+                foreach (var line in lines)
+                {
+                    var samples = SampleLineEdge(binary, line, topEdge: true);
+                    if (samples.Count < 8) continue;
+                    var fit = WeightedPolyFit(samples.Select(s => (s.X, s.Y, 1.0)).ToList(), degree: 1);
+                    if (fit == null) continue;
+                    var slope = fit[1]; // dy/dx
+                    lineAngles.Add((line.Y + line.Height / 2.0, slope, Math.Atan2(slope, 1.0) * 180.0 / Math.PI));
+                }
+
+                if (lineAngles.Count < 3)
+                {
+                    result.Warnings.Add("Not enough reliable text-line angle fits — using whole-image line detection for deskew.");
+                    return TryDeskewViaHough(src, result);
+                }
+
+                var sortedAngles = lineAngles.Select(p => p.AngleDeg).OrderBy(a => a).ToList();
+                var medianAngle = sortedAngles[sortedAngles.Count / 2];
+                var iqr = sortedAngles[(int)(sortedAngles.Count * 0.75)] - sortedAngles[(int)(sortedAngles.Count * 0.25)];
+                var iqrOk = iqr <= MaxDeskewAngleIqrDegrees;
+
+                // Trustworthy, consistent angle evidence with a real rotation to apply — the
+                // simple, cheap, well-tested case.
+                if (iqrOk && Math.Abs(medianAngle) >= 0.1)
+                    return ApplyDeskewAngle(src, medianAngle, result, "text-line");
+
+                if (!iqrOk)
+                    result.Warnings.Add($"Text-line angles inconsistent (IQR {iqr:F1}°) — checking for a per-line rotation trend before falling back.");
+
+                // Inconsistent (or individually negligible) per-line angles don't rule out a
+                // real defect a single global angle is structurally blind to: each line
+                // rotated by its own amount that varies with vertical position (confirmed on a
+                // real photo, Trapezoid_Image001's right half — individual lines were still
+                // visibly tilted, by a *different* amount near the top than near the bottom,
+                // even after separately fixing the page's own boundary shape and the block's
+                // cross-line margin position). Try the broader rotation-field fit first, then
+                // re-check for a residual margin shear on its result — the two correct
+                // different things (orientation vs. position) and can coexist.
+                var working = TryDeskewRotationField(src, lineAngles, result) ?? src;
+
+                var (binary2, lines2) = DetectTextLineBlobs(working);
+                using (binary2)
+                {
+                    if (TryDeskewShear(working, lines2, result) is { } sheared)
+                        working = sheared;
+                }
+
+                if (!ReferenceEquals(working, src))
+                    return working;
+
+                if (!iqrOk)
+                {
+                    result.Warnings.Add("No confident rotation-field or margin-shear correction either — using whole-image line detection for deskew.");
+                    return TryDeskewViaHough(src, result);
+                }
+
+                // IQR was trustworthy and reported no net rotation; neither of the other two
+                // signals found anything either. Nothing to correct — not a fallback case.
+                return src;
+            }
         }
         catch (Exception ex)
         {
@@ -2441,6 +3240,191 @@ public class ImageProcessor
         result.WasDeskewed = true;
         result.AppliedCorrectionDegrees = angle;
         return rotated;
+    }
+
+    /// <summary>Detects and corrects a margin shear: each text line's own left edge drifting
+    /// sideways as a near-linear function of its vertical position, distinct from both global
+    /// rotation (<see cref="ApplyDeskewAngle"/>) and book-curve dewarp's per-line horizontal
+    /// bulge. Fits the trend via Theil-Sen (median of pairwise slopes) rather than ordinary
+    /// least squares — robust against indented paragraph-opening lines, which would otherwise
+    /// bias a direct regression. Returns null (never corrects) unless enough lines actually
+    /// follow the fitted trend; a shear this method invents from noise would be worse than
+    /// leaving the page alone.</summary>
+    private Mat? TryDeskewShear(Mat src, List<Rect> lines, ProcessingResult result)
+    {
+        if (lines.Count < MinShearLines) return null;
+
+        var points = lines.Select(r => (Y: r.Y + r.Height / 2.0, X: (double)r.X)).ToList();
+        var minYGap = src.Rows * 0.02;
+
+        var slopes = new List<double>();
+        for (var i = 0; i < points.Count; i++)
+            for (var j = i + 1; j < points.Count; j++)
+            {
+                var dy = points[j].Y - points[i].Y;
+                if (Math.Abs(dy) < minYGap) continue;
+                slopes.Add((points[j].X - points[i].X) / dy);
+            }
+        if (slopes.Count == 0) return null;
+
+        slopes.Sort();
+        var k = slopes[slopes.Count / 2];
+
+        var intercepts = points.Select(p => p.X - k * p.Y).OrderBy(v => v).ToList();
+        var a = intercepts[intercepts.Count / 2];
+
+        var inliers = points.Count(p => Math.Abs(p.X - (a + k * p.Y)) <= ShearInlierPx);
+        var inlierFraction = inliers / (double)points.Count;
+        if (inlierFraction < MinShearInlierFraction) return null;
+
+        var angleDeg = Math.Atan(k) * 180.0 / Math.PI;
+        result.OriginalSkewDegrees = angleDeg;
+        if (Math.Abs(angleDeg) > MaxShearCorrectionDegrees)
+        {
+            result.Warnings.Add($"Margin shear too large ({angleDeg:F2}°, {inliers}/{points.Count} lines fit) — not auto-correcting.");
+            return null;
+        }
+        if (Math.Abs(angleDeg) < MinShearCorrectionDegrees) return null;
+
+        // Pivot at the single best-fit line (smallest residual to the trend), not the page's
+        // geometric center. A shear is one straight-line correction, so the pivot choice
+        // doesn't change whether it flattens the margin (it always does) — it only decides
+        // which part of the page keeps its original position, shifting the rest. The already-
+        // cropped page boundary is a real rectangle, and this content shear necessarily
+        // disagrees with it somewhere; anchoring at the line the fit is most confident about
+        // keeps that disagreement away from a line that may already have been fine (confirmed
+        // on a real photo: pivoting at the center visibly tilted an already-flat top margin to
+        // average against a genuinely drifting bottom one — anchoring at the best-supported
+        // line instead of an arbitrary midpoint avoids guessing which end of the page is
+        // "correct").
+        var pivotY = points.MinBy(p => Math.Abs(p.X - (a + k * p.Y))).Y;
+
+        var corrected = ApplyMarginShear(src, k, pivotY);
+        result.WasDeskewed = true;
+        result.AppliedCorrectionDegrees = angleDeg;
+        result.Warnings.Add($"Margin shear corrected ({angleDeg:F2}°, {inliers}/{points.Count} text lines fit the trend).");
+        return corrected;
+    }
+
+    /// <summary>Applies a horizontal shear that grows linearly with distance from
+    /// <paramref name="yCenter"/> — removes a margin drift of <paramref name="k"/> pixels of X
+    /// per pixel of Y, pivoted at the page's own vertical center (matching
+    /// <see cref="ApplyDeskewAngle"/>'s rotation pivot) rather than at one edge, so the page
+    /// stays centered instead of sliding sideways.</summary>
+    private static Mat ApplyMarginShear(Mat src, double k, double yCenter)
+    {
+        var width = src.Cols;
+        var height = src.Rows;
+        var mapXData = new float[height * width];
+        var mapYData = new float[height * width];
+        for (var y = 0; y < height; y++)
+        {
+            var shift = (float)(k * (y - yCenter));
+            var row = y * width;
+            for (var x = 0; x < width; x++)
+            {
+                mapXData[row + x] = x + shift;
+                mapYData[row + x] = y;
+            }
+        }
+
+        using var mapX = new Mat(height, width, MatType.CV_32FC1);
+        using var mapY = new Mat(height, width, MatType.CV_32FC1);
+        mapX.SetArray(mapXData);
+        mapY.SetArray(mapYData);
+
+        var warped = new Mat();
+        Cv2.Remap(src, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Constant, Scalar.White);
+        return warped;
+    }
+
+    /// <summary>Detects and corrects a rotation *field*: each text line's own orientation
+    /// (not just its position) drifting as a near-linear function of vertical position — the
+    /// defect a single global angle (<see cref="ApplyDeskewAngle"/>) and a margin shear
+    /// (<see cref="TryDeskewShear"/>) are each structurally blind to, since neither ever makes
+    /// a line's own content rotate: a global angle applies the *same* rotation everywhere, and
+    /// a shear only ever moves X as a function of Y, never Y as a function of X — which is what
+    /// an actual rotated line requires. Fits the trend via Theil-Sen (median of pairwise slope
+    /// deltas) for the same reason <see cref="TryDeskewShear"/> does: robust against individual
+    /// noisy per-line fits (short lines, glyph irregularity) that would bias a direct
+    /// regression. Returns null unless enough lines actually follow the fitted trend.</summary>
+    private Mat? TryDeskewRotationField(Mat src, List<(double Y, double Slope, double AngleDeg)> lineAngles, ProcessingResult result)
+    {
+        if (lineAngles.Count < MinRotationFieldLines) return null;
+
+        var minYGap = src.Rows * 0.02;
+        var slopeTrendCandidates = new List<double>();
+        for (var i = 0; i < lineAngles.Count; i++)
+            for (var j = i + 1; j < lineAngles.Count; j++)
+            {
+                var dy = lineAngles[j].Y - lineAngles[i].Y;
+                if (Math.Abs(dy) < minYGap) continue;
+                slopeTrendCandidates.Add((lineAngles[j].Slope - lineAngles[i].Slope) / dy);
+            }
+        if (slopeTrendCandidates.Count == 0) return null;
+
+        slopeTrendCandidates.Sort();
+        var b = slopeTrendCandidates[slopeTrendCandidates.Count / 2]; // d(slope)/dY
+
+        var intercepts = lineAngles.Select(p => p.Slope - b * p.Y).OrderBy(v => v).ToList();
+        var a = intercepts[intercepts.Count / 2]; // slope at Y=0
+
+        var inliers = lineAngles.Count(p => Math.Abs(p.Slope - (a + b * p.Y)) <= RotationFieldInlierSlope);
+        var inlierFraction = inliers / (double)lineAngles.Count;
+        if (inlierFraction < MinRotationFieldInlierFraction) return null;
+
+        var topY = lineAngles.Min(p => p.Y);
+        var bottomY = lineAngles.Max(p => p.Y);
+        var slopeAtTopDeg = Math.Atan(a + b * topY) * 180.0 / Math.PI;
+        var slopeAtBottomDeg = Math.Atan(a + b * bottomY) * 180.0 / Math.PI;
+        var rangeDeg = Math.Abs(slopeAtBottomDeg - slopeAtTopDeg);
+        if (rangeDeg > MaxRotationFieldRangeDegrees)
+        {
+            result.Warnings.Add($"Rotation-field trend too large ({rangeDeg:F2}° span, {inliers}/{lineAngles.Count} lines fit) — not auto-correcting.");
+            return null;
+        }
+        if (rangeDeg < MinRotationFieldRangeDegrees) return null;
+
+        var xPivot = src.Cols / 2.0;
+        var corrected = ApplyRotationField(src, a, b, xPivot);
+        result.WasDeskewed = true;
+        result.AppliedCorrectionDegrees = rangeDeg;
+        result.Warnings.Add($"Per-line rotation trend corrected ({rangeDeg:F2}° span top-to-bottom, {inliers}/{lineAngles.Count} lines fit).");
+        return corrected;
+    }
+
+    /// <summary>Applies a rotation whose angle varies linearly with row (<paramref name="a"/> +
+    /// <paramref name="b"/> * y, both in dy/dx slope units), pivoted at
+    /// <paramref name="xPivot"/> so the column that stays put is the page's own center —
+    /// matching <see cref="ApplyDeskewAngle"/>'s rotation pivot — rather than one edge. Each
+    /// row's own local slope is evaluated at its *output* Y as a first-order approximation
+    /// (exact for a true small-angle field, which is what this is gated to via
+    /// <see cref="MaxRotationFieldRangeDegrees"/>).</summary>
+    private static Mat ApplyRotationField(Mat src, double a, double b, double xPivot)
+    {
+        var width = src.Cols;
+        var height = src.Rows;
+        var mapXData = new float[height * width];
+        var mapYData = new float[height * width];
+        for (var y = 0; y < height; y++)
+        {
+            var localSlope = a + b * y;
+            var row = y * width;
+            for (var x = 0; x < width; x++)
+            {
+                mapXData[row + x] = x;
+                mapYData[row + x] = (float)(y + localSlope * (x - xPivot));
+            }
+        }
+
+        using var mapX = new Mat(height, width, MatType.CV_32FC1);
+        using var mapY = new Mat(height, width, MatType.CV_32FC1);
+        mapX.SetArray(mapXData);
+        mapY.SetArray(mapYData);
+
+        var warped = new Mat();
+        Cv2.Remap(src, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Constant, Scalar.White);
+        return warped;
     }
 
     // ───────────── ENHANCEMENT ─────────────
