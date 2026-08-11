@@ -39,6 +39,10 @@ switch (args[0])
         return RunPoints(args);
     case "mesh":
         return RunMesh(args);
+    case "finger":
+        return RunFinger(args);
+    case "bleed":
+        return RunBleed(args);
     default:
         PrintUsage();
         return 1;
@@ -56,6 +60,8 @@ static void PrintUsage()
     Console.WriteLine("  rotfield <image-or-dir>");
     Console.WriteLine("  points <image> [pointsPerEdge]");
     Console.WriteLine("  mesh <image-or-dir>");
+    Console.WriteLine("  finger <image-or-dir> [--apply <out-dir>]");
+    Console.WriteLine("  bleed <image-or-dir> [--apply <out-dir>]");
 }
 
 static int RunProcess(string[] args)
@@ -324,6 +330,93 @@ static int RunMesh(string[] args)
         Console.WriteLine($"=== {Path.GetFileName(path)} ===");
         var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
         Console.WriteLine(processor.DebugLineMesh(bytes));
+    }
+    return 0;
+}
+
+static int RunFinger(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    var applyIdx = Array.IndexOf(args, "--apply");
+    var outDir = applyIdx >= 0 && args.Length > applyIdx + 1 ? args[applyIdx + 1] : null;
+    if (outDir != null) Directory.CreateDirectory(outDir);
+
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugFingerRemoval(bytes));
+
+        if (outDir != null)
+        {
+            var cleaned = processor.RemoveFingersFromBytes(bytes);
+            if (cleaned != null)
+            {
+                var outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(path) + "_defingered.png");
+                File.WriteAllBytes(outPath, cleaned);
+                Console.WriteLine($"  -> {outPath}");
+            }
+            else
+            {
+                Console.WriteLine("  -> no change (nothing qualified)");
+            }
+        }
+    }
+    return 0;
+}
+
+static int RunBleed(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    var applyIdx = Array.IndexOf(args, "--apply");
+    var outDir = applyIdx >= 0 && args.Length > applyIdx + 1 ? args[applyIdx + 1] : null;
+    if (outDir != null) Directory.CreateDirectory(outDir);
+
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugBleedthrough(bytes));
+
+        if (outDir != null)
+        {
+            var cleaned = processor.ApplyBleedthroughSuppressionFromBytes(bytes);
+            var outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(path) + "_debled.png");
+            File.WriteAllBytes(outPath, cleaned);
+            Console.WriteLine($"  -> {outPath}");
+        }
     }
     return 0;
 }

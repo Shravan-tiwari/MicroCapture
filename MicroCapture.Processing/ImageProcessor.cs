@@ -246,6 +246,75 @@ public class ImageProcessor
     // curvature this late in the pipeline (after boundary rectification and the coarse dewarp
     // curve have already run) — decline the whole mesh rather than trust it.
     public double MeshMaxDisplacementFraction { get; set; } = 0.06;
+    // Phase-2 item from the user's original three-item request, deferred until the auto-split
+    // and keystone/curve work above was done and reviewed: automatic finger/hand removal via
+    // inpainting. Reuses SkinCrLow/High, SkinCbLow/High (above) for color classification — same
+    // physical skin-tone range boundary detection already uses, just consumed directly instead
+    // of dilated-and-inverted. See TryRemoveFingers for why a candidate must touch the page's
+    // own outer edge: a printed photo of a person (e.g. a real fixture — a magazine spread with
+    // a photo of swimmers) is skin-toned but fully interior, never touching the crop boundary,
+    // while a real finger holding the book physically enters the frame from outside it. Area-
+    // gated on both ends: too small is noise, too large is more likely a mis-classified skin-
+    // toned interior photo/cover than a real finger.
+    public double FingerMinAreaFraction { get; set; } = 0.0015;
+    public double FingerMaxAreaFraction { get; set; } = 0.05;
+    // How close a candidate blob's bounding rect must sit to the page's own outer edge to count
+    // as "entering from outside" rather than an interior skin-toned false positive. Small and
+    // exact on purpose — a real leftover finger sliver directly abuts the crop boundary; a
+    // generous margin here would start admitting interior content again.
+    public int FingerEdgeTouchMarginPx { get; set; } = 4;
+    // Grown a little past the raw skin-color boundary before inpainting — real fingers have a
+    // soft, sometimes motion-blurred edge in a real photo, and the classifier's own boundary
+    // rides right at the color transition rather than past it.
+    public int FingerMaskDilatePx { get; set; } = 6;
+    // Cv2.Inpaint's own neighborhood radius (px) — the standard default for Telea inpainting on
+    // a several-thousand-pixel-wide document photo; a document's background is locally flat
+    // (blank margin/page color) right where a finger typically intrudes, so inpainting doesn't
+    // need to reconstruct fine texture, just extend the surrounding flat tone inward.
+    public double FingerInpaintRadiusPx { get; set; } = 8.0;
+    // Second half of the same deferred Phase-2 request: bleedthrough/show-through suppression —
+    // faint mirrored content from the reverse side of a thin page ghosting through, confirmed on
+    // two real fixtures (Trapezoid_Image002.JPG, a magazine spread; IMG_0022.JPG). Unlike the
+    // geometric fixes above, this is a genuinely lossy, judgment-call content change (it can
+    // erase legitimately faint real content — a light watermark, pencil annotation, faded
+    // historical ink — not just ghosting), so unlike auto-crop/dewarp/mesh/finger-removal it is
+    // gated behind an explicit opt-in flag (bleedthroughEnabled, mirroring binarizeEnabled's own
+    // pattern) rather than always attempted. Algorithm: estimate each pixel's local background
+    // via a wide Gaussian blur (same "illumination normalization" idea already used in
+    // FindDocumentContourPasses, just reused for the opposite purpose — here the blur radius is
+    // deliberately wide enough to treat individual letter strokes as foreground, not background),
+    // then soft-threshold each pixel's depth below that background: shallow depth (typical of
+    // bleedthrough, which is heavily attenuated by the paper's own opacity) gets pulled back
+    // toward the background/erased, deep depth (real ink) is left alone. A soft (linear ramp)
+    // threshold, not a hard cutoff, so borderline pixels degrade gently instead of a visible
+    // hard edge appearing where the classification flips.
+    //
+    // Confirmed effective on real grayscale text bleed-through (IMG_0022.JPG right half, a
+    // mirrored ghost of the reverse page's own printed text/diagram): visibly fainter after,
+    // real ink alongside it unchanged. Confirmed NOT effective on Trapezoid_Image002.JPG's
+    // colored graphic bleed-through (a compass/map image showing through glossy magazine
+    // stock) — that's a different physical phenomenon (translucent color transfer through the
+    // sheet, not localized ink absorption), sits at a shallower, more uniform depth this
+    // per-pixel local-contrast technique doesn't isolate well. This method addresses text/ink
+    // show-through specifically, not colored-image ghosting — a real, known gap, not yet solved.
+    public double BleedthroughBlurSigmaFraction { get; set; } = 0.03;
+    public double BleedthroughBlurSigmaMinPx { get; set; } = 25.0;
+    // Depth (0-255 gray levels) below which content is treated as pure bleedthrough/noise and
+    // fully suppressed. Deliberately conservative (low) — this runs on every pixel of every page
+    // when enabled, so a value too high would start eating legitimately faint real content;
+    // real bleedthrough measured on the confirmed fixtures above sits well under this.
+    // Retuned from an initial (10/35) guess against real measured depth data: on a confirmed
+    // real fixture (IMG_0022.JPG right half), the ghost region's own depth distribution (median
+    // 6.8, 90th percentile 21.8) and a real-ink text region's (median 18.4, 75th percentile
+    // 68.8) overlap substantially at the low end — thin/anti-aliased stroke-edge pixels read at
+    // similar depth to bleedthrough — so no threshold here fully separates them. These values
+    // suppress most of the confirmed ghost's mass while leaving the *bulk* of real ink (which
+    // sits far higher, 68+) untouched; some thinning of real text's own edge pixels is an
+    // accepted, visible trade-off, not eliminated.
+    public double BleedthroughSuppressLowDepth { get; set; } = 15.0;
+    // Depth above which content is certainly real ink and is left fully unchanged. Between low
+    // and high, suppression ramps linearly rather than cutting sharply.
+    public double BleedthroughSuppressHighDepth { get; set; } = 45.0;
     // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
     // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
     // read as crisper edges/text, low enough to avoid visible halos on a document scan.
@@ -318,7 +387,7 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -435,7 +504,7 @@ public class ImageProcessor
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
                 WriteTiff(outLeft, leftResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outLeft);
@@ -443,7 +512,7 @@ public class ImageProcessor
 
                 // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
                 WriteTiff(outRight, rightResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outRight);
@@ -461,7 +530,7 @@ public class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
                 manualCrop?.Dispose();
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
@@ -528,7 +597,7 @@ public class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -571,7 +640,7 @@ public class ImageProcessor
                     (int)Math.Round(frames[i].Width), (int)Math.Round(frames[i].Height)), src.Cols, src.Rows);
 
                 var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect);
+                using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect, bleedthroughEnabled: bleedthroughEnabled);
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
@@ -937,7 +1006,7 @@ public class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null, bool bleedthroughEnabled = false)
     {
         var working = input.Clone();
 
@@ -955,6 +1024,10 @@ public class ImageProcessor
         // on the user's own annotated Trapezoid_Image001 screenshot, which has no book
         // curvature at all. See TryApplyLineMesh's own doc comment.
         working = TryApplyLineMesh(working, result) ?? working;
+        working = TryRemoveFingers(working, result) ?? working;
+        // Before enhancement/sharpen so a sharpen pass doesn't crisp up leftover ghosting, and
+        // before binarization so Sauvola's own local threshold isn't skewed by it either.
+        working = TryRemoveBleedthrough(working, result, bleedthroughEnabled);
 
         working = ApplyEnhancement(working);
         working = Sharpen(working);
@@ -1207,20 +1280,30 @@ public class ImageProcessor
         return totalVariance > 0 ? Math.Clamp(betweenClassVariance / totalVariance, 0, 1) : 0;
     }
 
-    /// <summary>Marks likely hand/skin pixels via a YCrCb chrominance range (Cr/Cb held stable
-    /// across a hand moving between lit and shadowed parts of the same real photo, unlike HSV's
-    /// saturation/value channels) — 255 = keep (not skin), 0 = exclude (skin), so the result can
-    /// be <see cref="Cv2.BitwiseAnd(Mat, Mat, Mat)"/>ed directly against a foreground mask. The
-    /// skin mask is dilated before exclusion — deliberately generous, since this only needs to
-    /// keep the detected page quad's shape sane where a hand overlaps its edge, not achieve
+    /// <summary>Raw per-pixel skin classification via a YCrCb chrominance range (Cr/Cb held
+    /// stable across a hand moving between lit and shadowed parts of the same real photo, unlike
+    /// HSV's saturation/value channels) — 255 = classified as skin, 0 = not. Shared by
+    /// <see cref="SkinExclusionMask"/> (boundary detection: dilated and inverted, generously) and
+    /// <see cref="TryRemoveFingers"/> (inpainting: used directly, since erasing real page content
+    /// by mistake is a worse failure than boundary detection's own generous exclusion).</summary>
+    private static Mat RawSkinMask(Mat src, double crLow, double crHigh, double cbLow, double cbHigh)
+    {
+        using var ycrcb = new Mat();
+        Cv2.CvtColor(src, ycrcb, ColorConversionCodes.BGR2YCrCb);
+        var skin = new Mat();
+        Cv2.InRange(ycrcb, new Scalar(0, crLow, cbLow), new Scalar(255, crHigh, cbHigh), skin);
+        return skin;
+    }
+
+    /// <summary>255 = keep (not skin), 0 = exclude (skin), so the result can be
+    /// <see cref="Cv2.BitwiseAnd(Mat, Mat, Mat)"/>ed directly against a foreground mask. The skin
+    /// mask is dilated before exclusion — deliberately generous, since this only needs to keep
+    /// the detected page quad's shape sane where a hand overlaps its edge, not achieve
     /// pixel-perfect hand removal; any resulting bite out of the true edge is what
     /// <see cref="RefineQuadCorners"/> is for.</summary>
     private static Mat SkinExclusionMask(Mat src, double crLow, double crHigh, double cbLow, double cbHigh)
     {
-        using var ycrcb = new Mat();
-        Cv2.CvtColor(src, ycrcb, ColorConversionCodes.BGR2YCrCb);
-        using var skin = new Mat();
-        Cv2.InRange(ycrcb, new Scalar(0, crLow, cbLow), new Scalar(255, crHigh, cbHigh), skin);
+        using var skin = RawSkinMask(src, crLow, crHigh, cbLow, cbHigh);
 
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(9, 9));
         var dilatedSkin = new Mat();
@@ -3425,6 +3508,259 @@ public class ImageProcessor
         var warped = new Mat();
         Cv2.Remap(src, warped, mapX, mapY, InterpolationFlags.Cubic, BorderTypes.Constant, Scalar.White);
         return warped;
+    }
+
+    // ───────────── FINGER / HAND REMOVAL ─────────────
+
+    /// <summary>Automatically detects and inpaints away a finger/hand intruding on the page from
+    /// outside the frame — the first half of the Phase-2 item deferred from the user's original
+    /// three-item request (finger/hand removal + bleedthrough correction), started only now that
+    /// the auto-split and keystone/curve work ahead of it has been done and reviewed.
+    ///
+    /// Runs after every geometric correction (crop, deskew, dewarp, text-line mesh) so it
+    /// inpaints the final page geometry, not something that then gets warped again; runs before
+    /// enhancement/sharpen so the inpainted patch doesn't pick up an unsharp halo, and before QC
+    /// so blur/exposure scoring sees the cleaned page.
+    ///
+    /// The hard problem here isn't detecting skin color — it's not destroying real page content
+    /// that happens to be skin-toned (a printed photo of a person is extremely common in real
+    /// scanned material; one of this project's own real fixtures is a magazine page with a photo
+    /// of swimmers). The single gate that separates the two reliably: a real finger physically
+    /// enters the frame from *outside* the true page, so any leftover sliver of it in the final
+    /// cropped output must still sit directly against that crop's own outer edge. A skin-toned
+    /// region fully surrounded by real page content, however plausible its color, is never a
+    /// finger — it's rejected here regardless of how finger-shaped it looks.
+    ///
+    /// Returns null (never throws, never partially applies) whenever there's no qualifying
+    /// candidate — callers should keep the input unchanged in that case.</summary>
+    private Mat? TryRemoveFingers(Mat src, ProcessingResult result)
+    {
+        try
+        {
+            using var skin = RawSkinMask(src, SkinCrLow, SkinCrHigh, SkinCbLow, SkinCbHigh);
+            Cv2.FindContours(skin, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+            if (contours.Length == 0) return null;
+
+            var imageArea = src.Rows * (double)src.Cols;
+            var minArea = imageArea * FingerMinAreaFraction;
+            var maxArea = imageArea * FingerMaxAreaFraction;
+
+            using var combinedMask = new Mat(src.Rows, src.Cols, MatType.CV_8UC1, Scalar.Black);
+            var qualifying = 0;
+            double totalArea = 0;
+            foreach (var c in contours)
+            {
+                var area = Cv2.ContourArea(c);
+                if (area < minArea || area > maxArea) continue;
+
+                var rect = Cv2.BoundingRect(c);
+                var touchesEdge = rect.X <= FingerEdgeTouchMarginPx
+                    || rect.Y <= FingerEdgeTouchMarginPx
+                    || rect.Right >= src.Cols - FingerEdgeTouchMarginPx
+                    || rect.Bottom >= src.Rows - FingerEdgeTouchMarginPx;
+                if (!touchesEdge) continue;
+
+                Cv2.DrawContours(combinedMask, new[] { c }, -1, Scalar.White, thickness: -1);
+                qualifying++;
+                totalArea += area;
+            }
+            if (qualifying == 0) return null;
+
+            // An aggregate check on top of the per-blob max: several separately-qualifying
+            // regions could each pass individually while together implying an implausible
+            // fraction of the page is skin — decline entirely rather than trust a majority-skin
+            // page (more likely a systematic misclassification, e.g. very warm lighting, than
+            // several real fingers).
+            if (totalArea > maxArea)
+            {
+                result.Warnings.Add($"Finger/hand candidates cover too much of the frame ({totalArea / imageArea:P1}) — declining, likely a false detection.");
+                return null;
+            }
+
+            using var dilateKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(FingerMaskDilatePx * 2 + 1, FingerMaskDilatePx * 2 + 1));
+            using var dilatedMask = new Mat();
+            Cv2.Dilate(combinedMask, dilatedMask, dilateKernel);
+
+            var inpainted = new Mat();
+            Cv2.Inpaint(src, dilatedMask, inpainted, FingerInpaintRadiusPx, InpaintMethod.Telea);
+            result.Warnings.Add($"Removed {qualifying} finger/hand region(s) touching the page edge ({totalArea / imageArea:P2} of frame).");
+            return inpainted;
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Finger/hand removal failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Byte-decoded entry point into <see cref="TryRemoveFingers"/> alone — for
+    /// SmokeTest and manual diagnostics to check the finger-removal step's own pixel output in
+    /// isolation, same pattern as <see cref="ApplyLineMeshFromBytes"/>.</summary>
+    public byte[]? RemoveFingersFromBytes(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return null;
+        var result = new ProcessingResult();
+        using var cleaned = TryRemoveFingers(mat, result);
+        if (cleaned == null) return null;
+        Cv2.ImEncode(".png", cleaned, out var bytes);
+        return bytes;
+    }
+
+    /// <summary>Reports what <see cref="TryRemoveFingers"/> would do to a page — every skin-color
+    /// candidate blob's area and whether it qualifies (area range + edge-touching), without
+    /// needing to run the full pipeline or actually inpaint anything.</summary>
+    public string DebugFingerRemoval(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+
+        using var skin = RawSkinMask(mat, SkinCrLow, SkinCrHigh, SkinCbLow, SkinCbHigh);
+        Cv2.FindContours(skin, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        sb.AppendLine($"Skin-color candidate blobs: {contours.Length}");
+
+        var imageArea = mat.Rows * (double)mat.Cols;
+        var minArea = imageArea * FingerMinAreaFraction;
+        var maxArea = imageArea * FingerMaxAreaFraction;
+        var qualifying = 0;
+        double totalArea = 0;
+        foreach (var c in contours.OrderByDescending(c => Cv2.ContourArea(c)))
+        {
+            var area = Cv2.ContourArea(c);
+            var rect = Cv2.BoundingRect(c);
+            var touchesEdge = rect.X <= FingerEdgeTouchMarginPx
+                || rect.Y <= FingerEdgeTouchMarginPx
+                || rect.Right >= mat.Cols - FingerEdgeTouchMarginPx
+                || rect.Bottom >= mat.Rows - FingerEdgeTouchMarginPx;
+            var inAreaRange = area >= minArea && area <= maxArea;
+            var qualifies = inAreaRange && touchesEdge;
+            if (qualifies) { qualifying++; totalArea += area; }
+            sb.AppendLine($"  rect=({rect.X},{rect.Y},{rect.Width}x{rect.Height}) area={area:F0} ({area / imageArea:P2}) touchesEdge={touchesEdge} inAreaRange={inAreaRange} -> {(qualifies ? "QUALIFIES" : "skipped")}");
+        }
+        sb.AppendLine($"Qualifying regions: {qualifying}, total area {totalArea / imageArea:P2} (max allowed {maxArea / imageArea:P2})");
+        sb.AppendLine(qualifying > 0 && totalArea <= maxArea ? "Would REMOVE via inpainting." : "Would leave the page unchanged.");
+        return sb.ToString();
+    }
+
+    // ───────────── BLEEDTHROUGH SUPPRESSION ─────────────
+
+    /// <summary>Gates <see cref="ApplyBleedthroughSuppression"/> behind the explicit opt-in flag
+    /// — see the tunables' own doc comment for why this, unlike every other Phase-1/2 correction
+    /// in this file, is not attempted automatically.</summary>
+    private Mat TryRemoveBleedthrough(Mat src, ProcessingResult result, bool bleedthroughEnabled)
+    {
+        if (!bleedthroughEnabled) return src;
+        try
+        {
+            var cleaned = ApplyBleedthroughSuppression(src, BleedthroughBlurSigmaFraction, BleedthroughBlurSigmaMinPx, BleedthroughSuppressLowDepth, BleedthroughSuppressHighDepth);
+            result.Warnings.Add("Bleedthrough/show-through suppression applied.");
+            return cleaned;
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Bleedthrough suppression failed: {ex.Message}");
+            return src;
+        }
+    }
+
+    /// <summary>Suppresses faint reverse-side ghosting while leaving real ink alone, via a local
+    /// background estimate and a soft per-pixel depth threshold — see the tunables' own doc
+    /// comment (<see cref="BleedthroughBlurSigmaFraction"/> etc.) for the full rationale. Works
+    /// identically per color channel (no separate luminance step): the local-background blur
+    /// already runs per-channel, and real ink is dark in every channel while paper-color
+    /// bleedthrough is shallow in every channel, so treating channels independently doesn't
+    /// introduce any color cast.</summary>
+    private static Mat ApplyBleedthroughSuppression(Mat src, double blurSigmaFraction, double blurSigmaMinPx, double lowDepth, double highDepth)
+    {
+        var sigma = Math.Max(blurSigmaMinPx, Math.Min(src.Cols, src.Rows) * blurSigmaFraction);
+        using var background = new Mat();
+        Cv2.GaussianBlur(src, background, new Size(0, 0), sigmaX: sigma);
+
+        // Mat.GetArray(out byte[]) only accepts single-channel Mats — reshape to a
+        // single-channel (height, width*channels) view first, same pattern WriteTiff already
+        // uses for a 3-channel BGR Mat (a metadata-only reinterpretation of the same row-major
+        // buffer, so operating on it per-byte is still correct per-channel).
+        using var srcFlat = src.Reshape(1, src.Rows);
+        using var bgFlat = background.Reshape(1, src.Rows);
+        srcFlat.GetArray(out byte[] srcPixels);
+        bgFlat.GetArray(out byte[] bgPixels);
+        var outPixels = new byte[srcPixels.Length];
+        var range = highDepth - lowDepth;
+
+        for (var i = 0; i < srcPixels.Length; i++)
+        {
+            var bg = bgPixels[i];
+            var depth = bg - srcPixels[i]; // positive where darker than local background (real content); negative/zero left untouched
+            if (depth <= 0)
+            {
+                outPixels[i] = srcPixels[i];
+                continue;
+            }
+
+            var ramp = range > 0 ? Math.Clamp((depth - lowDepth) / range, 0.0, 1.0) : (depth >= highDepth ? 1.0 : 0.0);
+            var suppressedDepth = depth * ramp;
+            outPixels[i] = (byte)Math.Clamp(bg - suppressedDepth, 0, 255);
+        }
+
+        var result = new Mat(src.Rows, src.Cols, src.Type());
+        using (var resultFlat = result.Reshape(1, src.Rows))
+            resultFlat.SetArray(outPixels);
+        return result;
+    }
+
+    /// <summary>Byte-decoded entry point into <see cref="ApplyBleedthroughSuppression"/> alone —
+    /// for SmokeTest and manual diagnostics, same pattern as <see cref="ApplyLineMeshFromBytes"/>
+    /// and <see cref="RemoveFingersFromBytes"/>. Always applies (bypasses the opt-in gate) since
+    /// the point of this entry point is to inspect the algorithm itself.</summary>
+    public byte[] ApplyBleedthroughSuppressionFromBytes(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        using var cleaned = ApplyBleedthroughSuppression(mat, BleedthroughBlurSigmaFraction, BleedthroughBlurSigmaMinPx, BleedthroughSuppressLowDepth, BleedthroughSuppressHighDepth);
+        Cv2.ImEncode(".png", cleaned, out var bytes);
+        return bytes;
+    }
+
+    /// <summary>Reports the local-background/depth statistics <see cref="ApplyBleedthroughSuppression"/>
+    /// would act on for a page — depth histogram bucketed against the low/high thresholds — for
+    /// judging whether the current tunables are conservative enough on a real photo without
+    /// having to eyeball a full-resolution diff.</summary>
+    public string DebugBleedthrough(byte[] encodedImage)
+    {
+        using var mat = Cv2.ImDecode(encodedImage, ImreadModes.Color);
+        if (mat.Empty()) return "decode failed";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
+
+        var sigma = Math.Max(BleedthroughBlurSigmaMinPx, Math.Min(mat.Cols, mat.Rows) * BleedthroughBlurSigmaFraction);
+        sb.AppendLine($"Background blur sigma: {sigma:F1}px");
+        using var background = new Mat();
+        Cv2.GaussianBlur(mat, background, new Size(0, 0), sigmaX: sigma);
+
+        using var srcFlat = mat.Reshape(1, mat.Rows);
+        using var bgFlat = background.Reshape(1, mat.Rows);
+        srcFlat.GetArray(out byte[] srcPixels);
+        bgFlat.GetArray(out byte[] bgPixels);
+
+        long belowLow = 0, ramped = 0, aboveHigh = 0, noDepth = 0;
+        double suppressedTotal = 0;
+        for (var i = 0; i < srcPixels.Length; i++)
+        {
+            var depth = bgPixels[i] - srcPixels[i];
+            if (depth <= 0) { noDepth++; continue; }
+            if (depth < BleedthroughSuppressLowDepth) belowLow++;
+            else if (depth > BleedthroughSuppressHighDepth) aboveHigh++;
+            else ramped++;
+            suppressedTotal += Math.Max(0, Math.Min(1, (depth - BleedthroughSuppressLowDepth) / (BleedthroughSuppressHighDepth - BleedthroughSuppressLowDepth))) * depth;
+        }
+        var total = srcPixels.Length;
+        sb.AppendLine($"No depth (>= background): {noDepth} ({100.0 * noDepth / total:F1}%)");
+        sb.AppendLine($"Fully suppressed (depth < {BleedthroughSuppressLowDepth}): {belowLow} ({100.0 * belowLow / total:F1}%)");
+        sb.AppendLine($"Ramped (partial suppression): {ramped} ({100.0 * ramped / total:F1}%)");
+        sb.AppendLine($"Untouched real ink (depth > {BleedthroughSuppressHighDepth}): {aboveHigh} ({100.0 * aboveHigh / total:F1}%)");
+        sb.AppendLine($"Average suppressed depth per touched byte: {(suppressedTotal / Math.Max(1, belowLow + ramped)):F2}");
+        return sb.ToString();
     }
 
     // ───────────── ENHANCEMENT ─────────────

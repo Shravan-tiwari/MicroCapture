@@ -70,6 +70,9 @@ TestTiffDisplayDecodeRoundTrip();
 TestDewarpControlPointsStayWithinPageBounds();
 TestLineMeshFlattensSharedPageWideBow();
 TestLineMeshDeclinesOnPlainUniformPage();
+TestFingerRemovalCleansEdgeTouchingSkinBlob();
+TestFingerRemovalLeavesInteriorSkinToneAlone();
+TestBleedthroughSuppressesFaintGhostPreservesRealInk();
 TestWriteTiffPreservesLargeColorImagePixelData();
 await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
@@ -378,6 +381,58 @@ string WriteCurvedBarTestImage(string path, int imageWidth, int imageHeight, int
             canvas.DrawRect(new SKRect(x, (float)y, x + 2, (float)(y + barThickness)), paint);
         }
     }
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A plain page background with a few black text-like bars, plus one skin-toned blob at
+/// <paramref name="skinRect"/> — for exercising <see cref="ImageProcessor.TryRemoveFingers"/>.
+/// The color (RGB 224,172,120) lands inside the default YCrCb skin range
+/// (<see cref="ImageProcessor.SkinCrLow"/>/High, SkinCbLow/High) the same way real skin does.</summary>
+string WriteSkinBlobTestImage(string path, int imageWidth, int imageHeight, SKRectI skinRect)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(SKColors.White);
+    using var textPaint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
+    for (var y = imageHeight / 4; y < imageHeight - imageHeight / 4; y += 40)
+        canvas.DrawRect(new SKRect(imageWidth / 10, y, imageWidth - imageWidth / 10, y + 12), textPaint);
+    using var skinPaint = new SKPaint { Color = new SKColor(224, 172, 120), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(skinRect.Left, skinRect.Top, skinRect.Right, skinRect.Bottom), skinPaint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A white page with solid black "real ink" bars plus a set of thin light-gray
+/// "bleedthrough ghost" strokes — for exercising
+/// <see cref="ImageProcessor.ApplyBleedthroughSuppressionFromBytes"/>. The ghost strokes are
+/// deliberately thin (like real bleed-through text), not one solid block: the algorithm's local-
+/// background estimate is a wide blur that needs to "see past" foreground content to the true
+/// surrounding background on both sides, exactly like it does for real, thin text strokes — a
+/// large solid block wider than the blur radius would just become its own local background and
+/// never register as having any "depth" at all, which isn't representative of real bleedthrough.
+/// The ghost color (230,230,230 on white) sits at a shallow local depth, the same order of
+/// magnitude as real bleedthrough measured on a confirmed real fixture (IMG_0022.JPG); the ink
+/// bars sit far deeper (near-black), matching that same fixture's real text.</summary>
+string WriteBleedthroughTestImage(string path, int imageWidth, int imageHeight, SKRectI[] inkBars, SKRectI ghostArea, int ghostStrokeThickness, int ghostStrokeGap)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(SKColors.White);
+    using var ghostPaint = new SKPaint { Color = new SKColor(230, 230, 230), Style = SKPaintStyle.Fill, IsAntialias = false };
+    for (var y = ghostArea.Top; y < ghostArea.Bottom; y += ghostStrokeThickness + ghostStrokeGap)
+        canvas.DrawRect(new SKRect(ghostArea.Left, y, ghostArea.Right, y + ghostStrokeThickness), ghostPaint);
+    using var inkPaint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
+    foreach (var bar in inkBars)
+        canvas.DrawRect(new SKRect(bar.Left, bar.Top, bar.Right, bar.Bottom), inkPaint);
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -1360,6 +1415,86 @@ void TestLineMeshDeclinesOnPlainUniformPage()
 
     var result = new ImageProcessor().ApplyLineMeshFromBytes(bytes);
     Check("No lines detected -> declines rather than inventing a correction", result == null);
+}
+
+void TestFingerRemovalCleansEdgeTouchingSkinBlob()
+{
+    Console.WriteLine("\n-- Finger removal inpaints a skin-toned blob touching the page edge (positive case) --");
+    var workDir = TempWorkDir();
+    const int width = 800, height = 1000;
+    // Touches the top edge (Y=0) and sits at ~1.9% of frame area — comfortably inside
+    // FingerMinAreaFraction..FingerMaxAreaFraction — mirrors a real finger sliver that survived
+    // auto-crop right at the page's own boundary (confirmed against the real
+    // Trapezoid_Image001.JPG raw capture, which has two thumbs in exactly this position).
+    var skinRect = new SKRectI(300, 0, 450, 100);
+    var path = WriteSkinBlobTestImage(Path.Combine(workDir, "finger_edge.png"), width, height, skinRect);
+    var bytes = File.ReadAllBytes(path);
+
+    var cleanedBytes = new ImageProcessor().RemoveFingersFromBytes(bytes);
+    Check("Edge-touching skin blob qualifies and gets inpainted", cleanedBytes != null);
+    if (cleanedBytes == null) return;
+
+    using var cleaned = Cv2.ImDecode(cleanedBytes, ImreadModes.Color);
+    // Sample well inside the blob's own footprint (avoiding its dilated border) — should now
+    // read close to the surrounding white background, not the original skin tone (~172 avg).
+    using var region = new Mat(cleaned, new OpenCvSharp.Rect(320, 15, 110, 70));
+    Cv2.MeanStdDev(region, out var mean, out _);
+    var avgChannel = (mean.Val0 + mean.Val1 + mean.Val2) / 3.0;
+    Check($"Inpainted region reads background-bright, not skin-toned (avg channel {avgChannel:F0}, expect > 200)", avgChannel > 200);
+}
+
+void TestFingerRemovalLeavesInteriorSkinToneAlone()
+{
+    Console.WriteLine("\n-- Finger removal leaves interior skin-toned content alone (false-positive safety) --");
+    var workDir = TempWorkDir();
+    const int width = 800, height = 1000;
+    // Same skin color and similar size as the positive case above, but fully surrounded by page
+    // background on all four sides — stands in for a real printed photo of a person (confirmed
+    // against the real Trapezoid_Image002.JPG fixture, a magazine spread with a photo of
+    // swimmers, which correctly produces zero qualifying regions).
+    var skinRect = new SKRectI(300, 400, 450, 500);
+    var path = WriteSkinBlobTestImage(Path.Combine(workDir, "finger_interior.png"), width, height, skinRect);
+    var bytes = File.ReadAllBytes(path);
+
+    var result = new ImageProcessor().RemoveFingersFromBytes(bytes);
+    Check("Interior skin-toned content (never touching the frame edge) is left unchanged", result == null);
+}
+
+void TestBleedthroughSuppressesFaintGhostPreservesRealInk()
+{
+    Console.WriteLine("\n-- Bleedthrough suppression fades a faint ghost while leaving real ink untouched --");
+    var workDir = TempWorkDir();
+    const int width = 900, height = 700;
+    var inkBars = new[]
+    {
+        new SKRectI(100, 100, 800, 130),
+        new SKRectI(100, 160, 800, 190),
+        new SKRectI(100, 220, 800, 250),
+    };
+    var ghostArea = new SKRectI(100, 400, 500, 600);
+    var path = WriteBleedthroughTestImage(Path.Combine(workDir, "bleedthrough.png"), width, height, inkBars, ghostArea, ghostStrokeThickness: 6, ghostStrokeGap: 10);
+    var bytes = File.ReadAllBytes(path);
+
+    var cleanedBytes = new ImageProcessor().ApplyBleedthroughSuppressionFromBytes(bytes);
+    using var original = Cv2.ImDecode(bytes, ImreadModes.Color);
+    using var cleaned = Cv2.ImDecode(cleanedBytes, ImreadModes.Color);
+
+    var ghostSampleRect = new OpenCvSharp.Rect(150, 450, 300, 100);
+    using var ghostRegionBefore = new Mat(original, ghostSampleRect);
+    using var ghostRegionAfter = new Mat(cleaned, ghostSampleRect);
+    Cv2.MeanStdDev(ghostRegionBefore, out var ghostMeanBefore, out _);
+    Cv2.MeanStdDev(ghostRegionAfter, out var ghostMeanAfter, out _);
+    var ghostAvgBefore = (ghostMeanBefore.Val0 + ghostMeanBefore.Val1 + ghostMeanBefore.Val2) / 3.0;
+    var ghostAvgAfter = (ghostMeanAfter.Val0 + ghostMeanAfter.Val1 + ghostMeanAfter.Val2) / 3.0;
+    // Compared against its own "before" value, not a hardcoded absolute — the sampled region is
+    // a realistic mix of thin ghost strokes and the white paper between them, same as sampling a
+    // real bleed-through text region, so its starting average isn't pure ghost color.
+    Check($"Faint ghost strokes fade measurably toward the white background (before {ghostAvgBefore:F1}, after {ghostAvgAfter:F1}, expect a real increase)", ghostAvgAfter > ghostAvgBefore + 3);
+
+    using var inkRegion = new Mat(cleaned, new OpenCvSharp.Rect(150, 105, 600, 20));
+    Cv2.MeanStdDev(inkRegion, out var inkMean, out _);
+    var inkAvg = (inkMean.Val0 + inkMean.Val1 + inkMean.Val2) / 3.0;
+    Check($"Real ink stays dark, essentially unchanged (avg {inkAvg:F0}, started at 0, expect < 10)", inkAvg < 10);
 }
 
 void TestWriteTiffPreservesLargeColorImagePixelData()
