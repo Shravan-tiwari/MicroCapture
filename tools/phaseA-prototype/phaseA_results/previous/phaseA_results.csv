@@ -1,0 +1,10 @@
+image,top_status,bottom_status,left_status,right_status,gutter_status,topology_status,overall_status,is_primary_difficult_case
+IMG_0021.JPG,OK,FLAG,OK,OK,OK,OK,FLAG,False
+IMG_0022.JPG,OK,OK,OK,FLAG,OK,OK,FLAG,True
+IMG_0027.JPG,OK,OK,OK,OK,OK,OK,PASS,False
+IMG_0028.JPG,OK,OK,OK,OK,OK,OK,PASS,False
+Trapezoid_Image001.JPG,FLAG,OK,OK,OK,OK,OK,FLAG,False
+Trapezoid_Image002.JPG,FLAG,FLAG,OK,OK,OK,OK,FLAG,False
+Trapezoid_Image003.JPG,FLAG,FLAG,OK,FLAG,NONE,N/A,FLAG,False
+Trapezoid_Image004.JPG,OK,OK,FLAG,OK,NONE,N/A,FLAG,False
+curve.jpeg,OK,OK,OK,OK,OK,OK,PASS,False
