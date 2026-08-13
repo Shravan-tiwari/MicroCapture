@@ -1,3 +1,4 @@
+# %%
 """
 Phase A prototype: detect the FRONT two-page spread's boundary as 5 curves
 (TOP, BOTTOM, LEFT, RIGHT, GUTTER) — not the largest visible contour, not a
@@ -34,6 +35,15 @@ it with a jump-squared penalty (position jump² ), which still strongly
 discourages sustained drift (worse than linear, cheaper than 3-point state)
 but is not identical to a true curvature term. Flagged here rather than
 silently presented as the exact thing requested.
+
+This file is written as a sequence of "# %%" cells (VS Code Jupyter /
+Interactive Window convention — Shift+Enter or "Run Cell" runs just one).
+The function-definition cells near the top are the same production code the
+CLI batch workflow uses (`python boundary_prototype.py --all-fixtures`); the
+INTERACTIVE WALKTHROUGH section near the bottom re-runs that same logic one
+step at a time for a single image, with a plot/overlay after every step —
+use that section for inspection, don't call detect_five_curves() as one
+black box when you're trying to see what's happening inside it.
 """
 
 import sys
@@ -45,6 +55,7 @@ import argparse
 import cv2
 import numpy as np
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 0: load + normalize
 # ----------------------------------------------------------------------------
@@ -74,6 +85,99 @@ def edge_maps(gray):
     return gx, gy, mag_n
 
 
+# %%
+def skin_exclusion_mask(img, cr_low=130, cr_high=185, cb_low=80, cb_high=140,
+                         max_inward_frac=0.15):
+    """Detect skin-toned pixels via YCrCb chrominance ranges (same thresholds
+    as ImageProcessor.cs SkinCrLow/High, SkinCbLow/High). Returns a binary
+    mask where 255 = skin pixel to EXCLUDE, 0 = keep.
+
+    Only skin blobs that touch the image border are considered fingers —
+    interior skin-toned regions (e.g. a printed photo of a person) are left
+    alone, exactly matching the C# TryRemoveFingers logic.
+
+    Real bug found by direct inspection (Trapezoid_Image001, curve.jpeg): on
+    real photos, this same YCrCb range also matches aged/cream book paper
+    under warm lighting — not just skin. A finger blob that touches the
+    border can bleed-merge with a large stretch of misclassified page paper
+    into one connected component hundreds of pixels deep (Trapezoid_Image001:
+    693px deep into a 1066px-tall frame; curve.jpeg: 964px deep — clearly not
+    a real finger, which only ever overlaps a small strip near the edge it
+    enters from). The old area-based filter only caught this by accident
+    (rejecting the oversized blob outright on one side, while an
+    under-threshold-by-luck merged blob on the other side got kept whole and
+    inpainted page content along with the real fingertip).
+
+    Fix: clip every border-touching blob to within max_inward_frac of
+    whichever border(s) it touches BEFORE the area filter — a real finger's
+    own footprint is unaffected by this (it never reaches that deep), while
+    a false-positive page-paper region attached to it gets truncated back to
+    a plausible fingertip size. The area filter below then operates on the
+    clipped footprint, so it can no longer be fooled by how much extra page
+    happened to get miscolored."""
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    skin = cv2.inRange(ycrcb, (0, cr_low, cb_low), (255, cr_high, cb_high))
+
+    # Tight kernel so inpainting stays strictly on the finger without bleeding into the page
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    skin = cv2.dilate(skin, kernel, iterations=1)
+
+    H, W = skin.shape
+    edge_margin = 8
+    max_inward_row = max(30, int(H * max_inward_frac))
+    max_inward_col = max(30, int(W * max_inward_frac))
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(skin, connectivity=8)
+    rows = np.arange(H)[:, None]
+    cols = np.arange(W)[None, :]
+
+    result = np.zeros_like(skin)
+    image_area = H * W
+    min_area = image_area * 0.0005   # tiny noise floor
+    max_area = image_area * 0.08     # a finger is never 8%+ of the frame
+
+    for label in range(1, n_labels):
+        x, y, w, h, area = stats[label]
+        touches_top = y <= edge_margin
+        touches_bottom = y + h >= H - edge_margin
+        touches_left = x <= edge_margin
+        touches_right = x + w >= W - edge_margin
+        if not (touches_top or touches_bottom or touches_left or touches_right):
+            continue
+
+        blob = labels == label
+        # Depth-from-border reachability mask: a pixel survives only if it's
+        # within max_inward_* of one of THIS blob's own touched borders —
+        # this is what actually clips a page-paper tail off a real fingertip.
+        reachable = np.zeros((H, W), dtype=bool)
+        if touches_top:
+            reachable |= rows < max_inward_row
+        if touches_bottom:
+            reachable |= rows >= H - max_inward_row
+        if touches_left:
+            reachable |= cols < max_inward_col
+        if touches_right:
+            reachable |= cols >= W - max_inward_col
+
+        clipped = (blob & reachable).astype(np.uint8) * 255
+        # Keep only the sub-component(s) of the clipped blob still touching
+        # the border (depth-clipping can otherwise leave an isolated island
+        # near the opposite border if the original blob wrapped a corner).
+        sub_n, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(clipped, connectivity=8)
+        for sub_label in range(1, sub_n):
+            sx, sy, sw, sh, sarea = sub_stats[sub_label]
+            if sarea < min_area or sarea > max_area:
+                continue
+            sub_touches = (sx <= edge_margin or sy <= edge_margin or
+                           sx + sw >= W - edge_margin or sy + sh >= H - edge_margin)
+            if sub_touches:
+                result[sub_labels == sub_label] = 255
+
+    result = cv2.dilate(result, kernel, iterations=1)
+    return result
+
+
+# %%
 # ----------------------------------------------------------------------------
 # Step 1: rough prior mask, with bimodality check + fallback
 # ----------------------------------------------------------------------------
@@ -162,7 +266,8 @@ def rough_prior_mask(enhanced):
             # is only excluded by border_score, not aspect alone — aspect
             # here mainly rejects thin noise strips.
             aspect_ok = 0.4 <= aspect <= 2.2
-            candidates.append((clean, area, border_score, aspect_ok))
+            extent = area / (bw * bh)  # solidity: how fully the bbox is filled
+            candidates.append((clean, area, border_score, aspect_ok, extent))
 
     if not candidates:
         return np.zeros_like(mask_normal), float(score), False
@@ -182,13 +287,24 @@ def rough_prior_mask(enhanced):
     plausible = [c for c in candidates if c[1] >= 0.15 * h * w]
     pool = plausible if plausible else candidates
 
-    # fewest border-clings first, then aspect-plausible, then largest area
-    pool.sort(key=lambda c: (c[2], not c[3], -c[1]))
+    # fewest border-clings first, then aspect-plausible, then most SOLID
+    # (area / bbox-area), not just largest raw area. Real bug found by direct
+    # inspection (Trapezoid_Image001): a candidate covering just the white
+    # pages (extent 0.96 — a near-solid rectangle) lost to a larger candidate
+    # that had merged the pages with the visible black book cover and a
+    # sliver of background (extent 0.66 — visibly raggeder/less solid),
+    # because both tied on border_score/aspect_ok and the old tiebreak
+    # preferred whichever was bigger. A real page is a solid, evenly-filled
+    # rectangle; a background/cover-swallowing blob is generally raggeder
+    # even when its raw area is bigger, so solidity is the more reliable
+    # signal between two otherwise-tied candidates.
+    pool.sort(key=lambda c: (c[2], not c[3], -c[4]))
     mask = pool[0][0]
 
     return mask, float(score), reliable
 
 
+# %%
 def mask_distance_and_normal(mask):
     edges = cv2.Canny(mask, 50, 150)
     inv = 255 - edges
@@ -207,11 +323,12 @@ def normalize01(a, lo_pct=2, hi_pct=98):
     return np.clip((a.astype(np.float64) - lo) / (hi - lo), 0, 1)
 
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 2: local cost fields (Round-3 refinements: orientation + mask-normal terms)
 # ----------------------------------------------------------------------------
 
-def local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="vertical"):
+def local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="vertical", edge_type=None, center_ref=None, skin_mask=None):
     gmag = np.sqrt(gx ** 2 + gy ** 2) + 1e-6
     if orientation == "vertical":
         # TOP/BOTTOM favor a predominantly vertical gradient
@@ -235,9 +352,44 @@ def local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="ve
         + w_dist * dist_n
         + w_normal * (1 - normal_align)
     )
+
+    # Inward penetration penalty: strongly discourage DP from dipping inside the page
+    if center_ref is not None and edge_type is not None:
+        H, W = mag_n.shape
+        w_inward = 1.5 if mask_reliable else 0.8
+        if edge_type == "top":
+            rows = np.arange(H)[:, None]
+            inward_depth = np.maximum(0.0, rows - center_ref[None, :])
+            cost += w_inward * (inward_depth / (H * 0.08)) ** 1.5
+        elif edge_type == "bottom":
+            rows = np.arange(H)[:, None]
+            inward_depth = np.maximum(0.0, center_ref[None, :] - rows)
+            cost += w_inward * (inward_depth / (H * 0.08)) ** 1.5
+        elif edge_type == "left":
+            cols = np.arange(W)[None, :]
+            inward_depth = np.maximum(0.0, cols - center_ref[:, None])
+            cost += w_inward * (inward_depth / (W * 0.08)) ** 1.5
+        elif edge_type == "right":
+            cols = np.arange(W)[None, :]
+            inward_depth = np.maximum(0.0, center_ref[:, None] - cols)
+            cost += w_inward * (inward_depth / (W * 0.08)) ** 1.5
+
+    # NOTE: no additive cost penalty on skin-touching columns here — tried a flat
+    # +5.0 bump and it backfired badly (confirmed on Trapezoid_Image001, whose
+    # fingers wrap over the true top-left corner): with band_r ~130px, detouring
+    # entirely around the finger's width was cheaper than crossing it, sending
+    # TOP/LEFT ballooning into the black background rather than following the
+    # real edge underneath/beside the finger. Skin robustness instead comes from
+    # (a) inpainting the finger pixels before recomputing the edge/mask fields,
+    # so the real edge signal is naturally restored under where the finger was,
+    # and (b) the top/bottom-center interpolation across skin columns above,
+    # which keeps the DP's search band anchored near the true edge through that
+    # stretch. Both were kept; only this extra penalty was removed.
+
     return cost
 
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 3: generic 1D DP tracer (position + jump-squared "curvature" approx)
 # ----------------------------------------------------------------------------
@@ -339,6 +491,7 @@ def trace_with_seed_search(cost_map, axis, band_center, band_radius, idx_lo, idx
     return best  # (path, cost, seed_used)
 
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 4: dense interpolation helper (Round-3: precompute LEFT(y)/RIGHT(y))
 # ----------------------------------------------------------------------------
@@ -352,18 +505,49 @@ def dense_interp(path, idx_lo, idx_hi, full_len):
     return out
 
 
-def find_pointy_vertex(path):
-    """Index of max |derivative-sign-change| point = the spine notch:
-    deviation from the straight line between the two endpoints, searched
-    over the FULL path (no window — a windowed search was missing the
-    vertex when the page tilt put it off-center)."""
+def find_v_shaped_contact_point(path, edge_type="top"):
+    """Finds the exact (x_offset, y) V-shaped contact point where the two pages
+    meet at the spine, using curvature analysis.
+
+    The V-notch is the point of SHARPEST BEND (highest curvature) in the
+    central span of the curve. This is robust to overall slope/tilt.
+
+    For TOP curve: the V-notch dips DOWNWARD → local max in y → second
+    derivative d²y/dx² is most NEGATIVE at the notch.
+
+    For BOTTOM curve: the V-notch dips UPWARD → local min in y → second
+    derivative d²y/dx² is most POSITIVE at the notch.
+
+    Restricted to central 25%-75% span to avoid edge artifacts.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
     n = len(path)
-    baseline = np.linspace(float(path[0]), float(path[-1]), n)
-    deviation = np.abs(path.astype(np.float64) - baseline)
-    idx = int(np.argmax(deviation))
+    lo_span = int(n * 0.35)
+    hi_span = int(n * 0.65)
+    if hi_span <= lo_span:
+        lo_span, hi_span = 0, n - 1
+
+    # Smooth to suppress text/noise — sigma proportional to image width
+    sigma = max(15, n // 40)
+    smoothed = gaussian_filter1d(path.astype(np.float64), sigma=sigma)
+
+    # Second derivative (curvature proxy)
+    d2 = np.gradient(np.gradient(smoothed))
+
+    sub_d2 = d2[lo_span:hi_span + 1]
+    if edge_type == "top":
+        # Downward dip → local max in y → most negative second derivative
+        rel_idx = int(np.argmin(sub_d2))
+    else:
+        # Upward dip → local min in y → most positive second derivative
+        rel_idx = int(np.argmax(sub_d2))
+
+    idx = lo_span + rel_idx
     return idx, int(path[idx])
 
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 5: gutter local cost (darkness + ridge/symmetry), combined with the
 # shared DP's continuity/curvature terms via the same dp_trace_1d function.
@@ -406,6 +590,7 @@ def gutter_local_cost(gray, left_dense, right_dense, ridge_half_win=18):
     return cost
 
 
+# %%
 # ----------------------------------------------------------------------------
 # Step 6: post-DP two-sided contrast check (diagnostic only, not a hard reject)
 # ----------------------------------------------------------------------------
@@ -431,16 +616,37 @@ def contrast_consistency_score(gray, path, axis, offset=6):
     return polarity_consistency, mean_abs_transition
 
 
+# %%
 # ----------------------------------------------------------------------------
-# Main detector
+# Main detector — the production function the CLI batch workflow calls.
+# For step-by-step inspection with a visualization after each step, use the
+# INTERACTIVE WALKTHROUGH section near the bottom of this file instead of
+# calling this as one black box.
 # ----------------------------------------------------------------------------
 
 def detect_five_curves(path, verbose=True):
     img, gray, enhanced = load_and_prepare(path)
     H, W = gray.shape
+
+    # 1. Finger removal: detect skin-toned regions touching frame edge and inpaint them away
+    skin_mask = skin_exclusion_mask(img)
+    skin_pixels = np.count_nonzero(skin_mask)
+    if skin_pixels > 0:
+        if verbose:
+            print(f"  SKIN: inpainting {skin_pixels} skin pixels ({100*skin_pixels/(H*W):.1f}% of frame)")
+        img = cv2.inpaint(img, skin_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        # Recompute gray and enhanced on the cleaned image
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        background = cv2.GaussianBlur(gray, (0, 0), sigmaX=35, sigmaY=35)
+        normalized = cv2.divide(gray, background, scale=255)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(normalized)
+
+    # 2. Outer boundary detection
     gx, gy, mag_n = edge_maps(enhanced)
     mask, bimodality_score, mask_reliable = rough_prior_mask(enhanced)
     dist, nx, ny = mask_distance_and_normal(mask)
+
 
     if verbose:
         print(f"[{os.path.basename(path)}] size={W}x{H} bimodality={bimodality_score:.3f} "
@@ -473,9 +679,6 @@ def detect_five_curves(path, verbose=True):
         if xmax - xmin > 4 * margin:
             xmin, xmax = xmin + margin, xmax - margin
 
-    vert_cost = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="vertical")
-    horiz_cost = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="horizontal")
-
     # --- TOP / BOTTOM band centers from mask per column, with fallback ---
     top_center = np.full(W, int(H * 0.05), dtype=np.float64)
     bot_center = np.full(W, int(H * 0.95), dtype=np.float64)
@@ -485,34 +688,29 @@ def detect_five_curves(path, verbose=True):
             top_center[x] = colmask.min()
             bot_center[x] = colmask.max()
 
-    # Median-filter the per-column anchors so one noisy/thin column (e.g. a
-    # shadow tendril reaching further than the real page edge) can't drag the
-    # search band to a position the DP has no way to recover from — this is
-    # an anchor-robustness fix, not a smoothing of the final curve itself
-    # (the DP still searches band_r around this smoothed center, and can move
-    # freely within that band based on the actual edge/orientation/mask cost).
-    # Widened from W*0.03 -> W*0.07: the narrower window still let a single
-    # noisy region (a shadow/desk-edge blob spanning tens of columns, seen on
-    # IMG_0021's BOTTOM curve) drag the anchor far enough that the DP's
-    # bounded search couldn't recover, producing a large erroneous loop into
-    # the background near a page corner.
+    # If skin_mask removed top/bottom pixels at finger columns, interpolate across those columns
+    # so top_center doesn't dip inward into the page text.
+    has_skin_col = np.array([skin_mask[:, x].any() for x in range(W)])
+    valid_cols = np.where((~has_skin_col) & (np.arange(W) >= xmin) & (np.arange(W) <= xmax))[0]
+    if len(valid_cols) > 2:
+        top_center[xmin:xmax + 1] = np.interp(np.arange(xmin, xmax + 1), valid_cols, top_center[valid_cols])
+        bot_center[xmin:xmax + 1] = np.interp(np.arange(xmin, xmax + 1), valid_cols, bot_center[valid_cols])
+
     from scipy.ndimage import median_filter
     med_k = max(25, (int(W * 0.07) // 2) * 2 + 1)  # odd kernel size
     top_center[xmin:xmax + 1] = median_filter(top_center[xmin:xmax + 1], size=med_k, mode="nearest")
     bot_center[xmin:xmax + 1] = median_filter(bot_center[xmin:xmax + 1], size=med_k, mode="nearest")
 
+    vert_cost_top = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="vertical", edge_type="top", center_ref=top_center, skin_mask=skin_mask)
+    vert_cost_bot = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="vertical", edge_type="bottom", center_ref=bot_center, skin_mask=skin_mask)
+
     band_r = max(30, int(H * 0.08))
 
-    # Stronger curvature penalty than the default (0.05/0.02) specifically
-    # for TOP/BOTTOM: the same erroneous loop was also partly a DP problem,
-    # not just an anchor problem — the default penalty was cheap enough that
-    # a strong-but-wrong edge (background/shadow) a good distance away could
-    # still win over staying near the true page edge.
     top_path, top_cost, top_seed = trace_with_seed_search(
-        vert_cost, "cols", top_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
+        vert_cost_top, "cols", top_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
     )
     bot_path, bot_cost, bot_seed = trace_with_seed_search(
-        vert_cost, "cols", bot_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
+        vert_cost_bot, "cols", bot_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
     )
     if verbose:
         print(f"  TOP:    cost={top_cost:.1f} seed_col={top_seed}")
@@ -534,20 +732,18 @@ def detect_five_curves(path, verbose=True):
             left_center[y] = rowmask.min()
             right_center[y] = rowmask.max()
 
+    horiz_cost_left = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="horizontal", edge_type="left", center_ref=left_center, skin_mask=skin_mask)
+    horiz_cost_right = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable, orientation="horizontal", edge_type="right", center_ref=right_center, skin_mask=skin_mask)
+
     band_r_lr = max(20, int(W * 0.04))
 
-    # Pin values are COLUMN positions (xmin/xmax — where TOP/BOTTOM's own
-    # endpoints sit), not row positions — LEFT/RIGHT are traced row-wise, so
-    # their "position" at each row is a column, and the two ends of the
-    # traced range must equal TOP's and BOTTOM's own endpoint column (xmin
-    # for LEFT, xmax for RIGHT) for the topology constraint to hold exactly.
     left_path, left_cost = dp_trace_1d(
-        horiz_cost, "rows", left_center, band_r_lr,
+        horiz_cost_left, "rows", left_center, band_r_lr,
         index_range=(left_row_lo, left_row_hi),
         pin_start=xmin, pin_end=xmin,
     )
     right_path, right_cost = dp_trace_1d(
-        horiz_cost, "rows", right_center, band_r_lr,
+        horiz_cost_right, "rows", right_center, band_r_lr,
         index_range=(right_row_lo, right_row_hi),
         pin_start=xmax, pin_end=xmax,
     )
@@ -582,10 +778,15 @@ def detect_five_curves(path, verbose=True):
     # curve's own two endpoints — this catches the notch regardless of which
     # direction it points (down for TOP in the case checked, but not assumed
     # as a hardcoded direction).
-    top_vertex_col, top_row_mid = find_pointy_vertex(top_path)
-    bot_vertex_col, bot_row_mid = find_pointy_vertex(bot_path)
-    gutter_row_lo = max(0, min(top_row_mid, H - 2))
-    gutter_row_hi = min(H - 1, max(bot_row_mid, gutter_row_lo + 1))
+    # Contact points where two pages meet (V-shaped notches at TOP and BOTTOM)
+    top_v_idx, top_v_y = find_v_shaped_contact_point(top_path, edge_type="top")
+    bot_v_idx, bot_v_y = find_v_shaped_contact_point(bot_path, edge_type="bottom")
+
+    top_v_col = xmin + top_v_idx
+    bot_v_col = xmin + bot_v_idx
+
+    gutter_row_lo = max(0, min(top_v_y, H - 2))
+    gutter_row_hi = min(H - 1, max(bot_v_y, gutter_row_lo + 1))
 
     band_r_g = max(15, int(W * 0.03))
     gutter_path, gutter_cost, gutter_seed = trace_with_seed_search(
@@ -594,75 +795,29 @@ def detect_five_curves(path, verbose=True):
     )
 
     # --- Gutter existence gate ---
-    # First attempt: compare the DP path's own local cost against the best
-    # FIXED column over the same rows — a genuine gutter should beat "just
-    # guess the middle" by a real margin. Kept as a diagnostic number below,
-    # but NOT used as the deciding gate anymore: direct visual inspection
-    # (this session) found it unreliable in BOTH directions on this fixture
-    # set — it wrongly kept the gutter on Trapezoid_Image003/004 (single
-    # magazine pages, whose printed multi-column text layout creates
-    # whitespace gaps that mimic a ridge/symmetry valley almost as well as a
-    # real spine does), AND wrongly suppressed the real gutter on
-    # Trapezoid_Image002 (confirmed by eye to be a genuine two-page spread).
-    gutter_rows_arr = np.arange(gutter_row_lo, gutter_row_hi + 1)
-    path_local_costs = gcost[gutter_rows_arr, np.clip(gutter_path, 0, W - 1)]
-    avg_path_local_cost = float(np.mean(path_local_costs))
-    candidate_cols = np.unique(gutter_center[gutter_rows_arr])
-    best_const_cost = None
-    for c in candidate_cols:
-        c = int(np.clip(c, 0, W - 1))
-        const_cost = float(np.mean(gcost[gutter_rows_arr, c]))
-        if best_const_cost is None or const_cost < best_const_cost:
-            best_const_cost = const_cost
-    gutter_relative_improvement = (
-        (best_const_cost - avg_path_local_cost) / best_const_cost
-        if best_const_cost and best_const_cost > 1e-6 else 0.0
-    )
-
-    # Actual gate: raw photo aspect ratio (width/height of the resized-for-
-    # processing image, which preserves the original's aspect ratio). Cross-
-    # checked by eye against all 4 Trapezoid fixtures: the two confirmed
-    # single pages measure 0.66 and 0.81 (portrait — a camera shot of one
-    # page held up is taller than wide); the two confirmed two-page spreads
-    # measure 1.50 and 1.50 (landscape — a spread is roughly twice as wide as
-    # a single page). 1.15 sits in the wide, unambiguous gap between those
-    # two clusters. This is a coarse, single-signal heuristic — it assumes
-    # "single page photographed" is always portrait-ish and "spread" is
-    # always landscape-ish, which held for every fixture checked but is not
-    # a law of nature; a single page shot deliberately in landscape framing
-    # would fool it. Flagged here rather than presented as a general law.
     aspect_ratio = W / H
     gutter_present = aspect_ratio > 1.15
 
     if verbose:
-        print(f"  GUTTER: cost={gutter_cost:.1f} seed_row={gutter_seed} "
-              f"rows[{gutter_row_lo}:{gutter_row_hi}] "
-              f"vs_flat_baseline_improvement={gutter_relative_improvement:.2%} (diagnostic only) "
+        print(f"  GUTTER: V-top=({top_v_col}, {top_v_y}) V-bot=({bot_v_col}, {bot_v_y}) "
               f"aspect_ratio={aspect_ratio:.2f} present={gutter_present}")
 
     if gutter_present:
-        # hard-enforce LEFT(y) < GUTTER(y) < RIGHT(y) at every traced row
-        for i, y in enumerate(range(gutter_row_lo, gutter_row_hi + 1)):
-            lo, hi = left_dense[y], right_dense[y]
-            gutter_path[i] = int(np.clip(gutter_path[i], lo + 2, hi - 2))
-
-        # Straight-line fit, replacing the moving-average smoothing. Real
-        # instruction from the user: the gutter doesn't need to hug text/
-        # content detail the way the outer boundary does — a straight line
-        # connecting the right pair of endpoints is fine for its actual
-        # purpose (splitting the spread into two pages), and a straight fit
-        # is far less prone to the zigzag a noisy per-row DP path shows even
-        # after light smoothing. Degree-1 least-squares fit of column vs.
-        # row through every DP-selected point (not just the two endpoints,
-        # so a handful of outlier rows can't swing the whole line) is a
-        # deliberate simplification, not a bug: it will not follow genuine
-        # gutter curvature if a fixture ever has real spine curvature
-        # distinct from simple perspective tilt. No fixture checked so far
-        # has needed more than a straight line for this.
+        # Connect top V-notch to bottom V-notch directly with a line
+        num_rows = gutter_row_hi - gutter_row_lo + 1
         rows_arr = np.arange(gutter_row_lo, gutter_row_hi + 1)
-        coeffs = np.polyfit(rows_arr, gutter_path.astype(np.float64), deg=1)
-        gutter_path = np.polyval(coeffs, rows_arr).astype(int)
-        for i, y in enumerate(range(gutter_row_lo, gutter_row_hi + 1)):
+
+        # Direct line from (top_v_col, top_v_y) to (bot_v_col, bot_v_y)
+        if top_v_y != bot_v_y:
+            slope = (bot_v_col - top_v_col) / float(bot_v_y - top_v_y)
+            gutter_cols = top_v_col + slope * (rows_arr - top_v_y)
+        else:
+            gutter_cols = np.full(num_rows, top_v_col)
+
+        gutter_path = np.round(gutter_cols).astype(int)
+
+        # Ensure GUTTER stays bounded between LEFT and RIGHT
+        for i, y in enumerate(rows_arr):
             lo, hi = left_dense[y], right_dense[y]
             gutter_path[i] = int(np.clip(gutter_path[i], lo + 2, hi - 2))
 
@@ -687,6 +842,9 @@ def detect_five_curves(path, verbose=True):
     if gutter_present:
         curves["gutter"] = (gutter_path, np.arange(gutter_row_lo, gutter_row_hi + 1))
 
+    gutter_relative_improvement = 0.0
+    gutter_cost = 0.0
+
     diagnostics = {
         "bimodality_score": bimodality_score,
         "mask_reliable": mask_reliable,
@@ -703,6 +861,7 @@ def detect_five_curves(path, verbose=True):
     return img, curves, diagnostics
 
 
+# %%
 def draw_overlay(img, curves, out_path):
     vis = img.copy()
     colors = {
@@ -733,8 +892,13 @@ def draw_overlay_only(img, curves):
     return vis
 
 
+# %%
 # ----------------------------------------------------------------------------
-# Batch workflow: all 17 fixtures, one command, reproducible.
+# Batch workflow: all fixtures, one command, reproducible. This section is
+# meant for the terminal (`python boundary_prototype.py --all-fixtures`), not
+# for stepping through cell-by-cell — it processes every fixture in one call
+# and writes files to disk rather than displaying anything inline. Use the
+# INTERACTIVE WALKTHROUGH section further down for cell-by-cell inspection.
 # ----------------------------------------------------------------------------
 
 FIXTURES_ROOT = "/Users/shravantiwari/Micrographics/MicroCapture/tools/SmokeTest/Fixtures/real-photos"
@@ -942,6 +1106,14 @@ def run_all_fixtures(base_out_dir):
         print(f"\nPrevious run preserved at: {previous_dir}")
 
 
+# %%
+# ----------------------------------------------------------------------------
+# CLI entry point. This cell is for `python boundary_prototype.py ...` from a
+# terminal ONLY — do not run it as a cell in the VS Code Interactive Window /
+# Jupyter (argparse will choke on the kernel's own argv). Use the INTERACTIVE
+# WALKTHROUGH section below for interactive work.
+# ----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("images", nargs="*", help="specific image paths to process")
@@ -964,3 +1136,347 @@ if __name__ == "__main__":
     else:
         parser.print_help()
         sys.exit(1)
+
+    # Stop here for real script execution (`python boundary_prototype.py ...`)
+    # — everything below is the INTERACTIVE WALKTHROUGH section, meant to be
+    # run cell-by-cell in VS Code/Jupyter, not as part of a plain CLI run
+    # (it imports matplotlib, which the batch/CLI path doesn't need).
+    sys.exit(0)
+
+
+# %%
+# ============================================================================
+# INTERACTIVE WALKTHROUGH
+#
+# Everything below re-runs detect_five_curves()'s own logic for ONE image,
+# one small step at a time, with a plot/overlay after every meaningful step
+# so you can inspect the result before moving to the next cell. It calls the
+# exact same helper functions defined above (load_and_prepare, edge_maps,
+# skin_exclusion_mask, rough_prior_mask, local_cost_field, dp_trace_1d, ...)
+# in the exact same order detect_five_curves() does — this is NOT a separate
+# algorithm, it's that same function unrolled into cells for inspection.
+#
+# Run cells top-to-bottom with Shift+Enter (or "Run Cell" in VS Code). Change
+# IMAGE_PATH in the next cell and re-run from there to try a different
+# fixture. Don't skip ahead — each cell depends on variables from the ones
+# above it, same as detect_five_curves()'s own internal order.
+# ============================================================================
+
+import matplotlib.pyplot as plt
+
+try:
+    get_ipython().run_line_magic("matplotlib", "inline")
+except NameError:
+    pass  # not running under IPython/Jupyter — plt.show() below still works
+
+
+def show(img_bgr, title="", figsize=(10, 7)):
+    """Display a BGR OpenCV image inline."""
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=figsize)
+    plt.imshow(rgb)
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+
+def show_gray(arr, title="", cmap="viridis", figsize=(10, 7)):
+    """Display a single-channel array (mask/cost-field/heatmap) inline, with a colorbar."""
+    plt.figure(figsize=figsize)
+    im = plt.imshow(arr, cmap=cmap)
+    plt.colorbar(im, fraction=0.03)
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+
+def show_overlay_mask(img_bgr, mask, color=(0, 0, 255), alpha=0.5, title="", figsize=(10, 7)):
+    """Overlay a binary mask (nonzero -> highlighted) on top of a BGR image."""
+    vis = img_bgr.copy()
+    m = mask > 0
+    color_arr = np.array(color, dtype=np.float64)
+    vis[m] = (vis[m].astype(np.float64) * (1 - alpha) + color_arr * alpha).astype(np.uint8)
+    show(vis, title, figsize=figsize)
+
+
+def show_curve(img_bgr, xs, ys, color=(0, 0, 255), title="", extra=None, figsize=(10, 7)):
+    """Draw one traced curve (x,y arrays) on the image, optionally with more
+    curves layered on top (extra = list of (xs, ys, color) tuples), and show it."""
+    vis = img_bgr.copy()
+    pts = np.array(list(zip(xs, ys)), dtype=np.int32)
+    cv2.polylines(vis, [pts], isClosed=False, color=color, thickness=3)
+    if extra:
+        for exs, eys, ecolor in extra:
+            epts = np.array(list(zip(exs, eys)), dtype=np.int32)
+            cv2.polylines(vis, [epts], isClosed=False, color=ecolor, thickness=3)
+    show(vis, title, figsize=figsize)
+
+
+# %%
+# Pick the fixture to walk through. FIXTURES_ROOT is defined in the batch
+# workflow cell above.
+IMAGE_PATH = os.path.join(FIXTURES_ROOT, "trapezoid", "Trapezoid_Image001.JPG")
+print("Using:", IMAGE_PATH)
+
+# %%
+# 1. Load + resize-for-processing + illumination-normalize.
+img, gray, enhanced = load_and_prepare(IMAGE_PATH)
+H, W = gray.shape
+print(f"size: {W}x{H}")
+show(img, "1. Loaded + resized (raw)")
+show_gray(gray, "1. Grayscale")
+show_gray(enhanced, "1. Illumination-normalized + CLAHE")
+
+# %%
+# 2. Sobel gradient magnitude/orientation on the normalized image.
+gx, gy, mag_n = edge_maps(enhanced)
+show_gray(mag_n, "2. Sobel gradient magnitude (normalized)")
+
+# %%
+# 3. Skin/finger detection — should hug ONLY real fingers, not page paper.
+skin_mask = skin_exclusion_mask(img)
+skin_pixels = int(np.count_nonzero(skin_mask))
+print(f"skin pixels: {skin_pixels} ({100*skin_pixels/(H*W):.2f}% of frame)")
+show_overlay_mask(img, skin_mask, color=(0, 0, 255),
+                   title="3. Skin/finger mask (red) — check it doesn't bleed into the page")
+
+# %%
+# 4. Inpaint the finger pixels away. Check visually that no page CONTENT was
+# eaten — only the finger(s).
+if skin_pixels > 0:
+    img_clean = cv2.inpaint(img, skin_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+else:
+    img_clean = img.copy()
+show(img_clean, "4. After finger inpainting")
+
+# %%
+# 5. Recompute gray/enhanced/gradients on the cleaned image (same as
+# detect_five_curves does once inpainting has happened).
+gray_clean = cv2.cvtColor(img_clean, cv2.COLOR_BGR2GRAY)
+background = cv2.GaussianBlur(gray_clean, (0, 0), sigmaX=35, sigmaY=35)
+normalized = cv2.divide(gray_clean, background, scale=255)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+enhanced_clean = clahe.apply(normalized)
+gx, gy, mag_n = edge_maps(enhanced_clean)
+show_gray(mag_n, "5. Gradient magnitude, recomputed on the cleaned image")
+
+# %%
+# 6. Rough Otsu prior mask — should hug just the white pages, not the book
+# cover or background. This is the step that picks WHICH candidate region is
+# "the page" (see rough_prior_mask's solidity tiebreak).
+mask, bimodality_score, mask_reliable = rough_prior_mask(enhanced_clean)
+print(f"bimodality={bimodality_score:.3f} reliable={mask_reliable}")
+show_overlay_mask(img_clean, mask, color=(0, 255, 0),
+                   title="6. Rough prior mask (green) — should be just the white pages")
+
+# %%
+# 7. Distance-to-mask-boundary field, used by local_cost_field to keep traced
+# curves anchored near the mask's own edge.
+dist, nx, ny = mask_distance_and_normal(mask)
+show_gray(dist, "7. Distance-to-mask-boundary field")
+
+# %%
+# 8. Column range the TOP/BOTTOM DP trace will search over.
+col_heights = (mask > 0).sum(axis=0).astype(np.float64)
+nonzero = col_heights[col_heights > 0]
+if len(nonzero) < 10:
+    xmin, xmax = int(W * 0.05), int(W * 0.95)
+else:
+    height_thresh = 0.5 * np.median(nonzero)
+    substantial_cols = np.where(col_heights > height_thresh)[0]
+    xmin, xmax = int(substantial_cols.min()), int(substantial_cols.max())
+    margin = max(8, int(W * 0.015))
+    if xmax - xmin > 4 * margin:
+        xmin, xmax = xmin + margin, xmax - margin
+print(f"column range used for TOP/BOTTOM: [{xmin}, {xmax}]")
+
+vis = img_clean.copy()
+cv2.line(vis, (xmin, 0), (xmin, H - 1), (255, 255, 0), 2)
+cv2.line(vis, (xmax, 0), (xmax, H - 1), (255, 255, 0), 2)
+show(vis, "8. Trace column range (cyan lines)")
+
+# %%
+# 9. TOP/BOTTOM search-band CENTERS (anchors the DP searches around — not the
+# final traced path yet), with skin-column interpolation + median-filter
+# smoothing already applied.
+top_center = np.full(W, int(H * 0.05), dtype=np.float64)
+bot_center = np.full(W, int(H * 0.95), dtype=np.float64)
+for x in range(xmin, xmax + 1):
+    colmask = np.where(mask[:, x] > 0)[0]
+    if len(colmask) > 0:
+        top_center[x] = colmask.min()
+        bot_center[x] = colmask.max()
+
+has_skin_col = np.array([skin_mask[:, x].any() for x in range(W)])
+valid_cols = np.where((~has_skin_col) & (np.arange(W) >= xmin) & (np.arange(W) <= xmax))[0]
+if len(valid_cols) > 2:
+    top_center[xmin:xmax + 1] = np.interp(np.arange(xmin, xmax + 1), valid_cols, top_center[valid_cols])
+    bot_center[xmin:xmax + 1] = np.interp(np.arange(xmin, xmax + 1), valid_cols, bot_center[valid_cols])
+
+from scipy.ndimage import median_filter
+med_k = max(25, (int(W * 0.07) // 2) * 2 + 1)
+top_center[xmin:xmax + 1] = median_filter(top_center[xmin:xmax + 1], size=med_k, mode="nearest")
+bot_center[xmin:xmax + 1] = median_filter(bot_center[xmin:xmax + 1], size=med_k, mode="nearest")
+
+show_curve(img_clean, np.arange(xmin, xmax + 1), top_center[xmin:xmax + 1], color=(0, 255, 255),
+           title="9. TOP (cyan) / BOTTOM (magenta) search-band centers — anchors, not final paths",
+           extra=[(np.arange(xmin, xmax + 1), bot_center[xmin:xmax + 1], (255, 0, 255))])
+
+# %%
+# 10. TOP/BOTTOM cost fields the DP will minimize over (dark = cheap to pass through).
+vert_cost_top = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable,
+                                  orientation="vertical", edge_type="top",
+                                  center_ref=top_center, skin_mask=skin_mask)
+vert_cost_bot = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable,
+                                  orientation="vertical", edge_type="bottom",
+                                  center_ref=bot_center, skin_mask=skin_mask)
+show_gray(vert_cost_top, "10. TOP cost field (dark = cheap)")
+show_gray(vert_cost_bot, "10. BOTTOM cost field (dark = cheap)")
+
+# %%
+# 11. Traced TOP/BOTTOM curves (DP shortest path, multi-seed search).
+band_r = max(30, int(H * 0.08))
+top_path, top_cost, top_seed = trace_with_seed_search(
+    vert_cost_top, "cols", top_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
+)
+bot_path, bot_cost, bot_seed = trace_with_seed_search(
+    vert_cost_bot, "cols", bot_center, band_r, xmin, xmax, w_jump=0.08, w_curv=0.08
+)
+print(f"TOP cost={top_cost:.1f} seed_col={top_seed}")
+print(f"BOTTOM cost={bot_cost:.1f} seed_col={bot_seed}")
+show_curve(img_clean, np.arange(xmin, xmax + 1), top_path, color=(0, 0, 255),
+           title="11. Traced TOP (red) / BOTTOM (blue)",
+           extra=[(np.arange(xmin, xmax + 1), bot_path, (255, 0, 0))])
+
+# %%
+# 12. LEFT/RIGHT search-band centers, pinned at TOP's/BOTTOM's own endpoints.
+top_left_row, top_right_row = int(top_path[0]), int(top_path[-1])
+bot_left_row, bot_right_row = int(bot_path[0]), int(bot_path[-1])
+left_row_lo, left_row_hi = sorted((top_left_row, bot_left_row))
+right_row_lo, right_row_hi = sorted((top_right_row, bot_right_row))
+
+left_center = np.full(H, xmin)
+right_center = np.full(H, xmax)
+for y in range(max(0, min(left_row_lo, right_row_lo) - 5), min(H, max(left_row_hi, right_row_hi) + 5)):
+    rowmask = np.where(mask[y, :] > 0)[0]
+    if len(rowmask) > 0:
+        left_center[y] = rowmask.min()
+        right_center[y] = rowmask.max()
+
+show_curve(img_clean, left_center[left_row_lo:left_row_hi + 1], np.arange(left_row_lo, left_row_hi + 1),
+           color=(0, 255, 255), title="12. LEFT (cyan) / RIGHT (magenta) search-band centers",
+           extra=[(right_center[right_row_lo:right_row_hi + 1],
+                   np.arange(right_row_lo, right_row_hi + 1), (255, 0, 255))])
+
+# %%
+# 13. LEFT/RIGHT cost fields.
+horiz_cost_left = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable,
+                                    orientation="horizontal", edge_type="left",
+                                    center_ref=left_center, skin_mask=skin_mask)
+horiz_cost_right = local_cost_field(mag_n, gx, gy, dist, nx, ny, mask_reliable,
+                                     orientation="horizontal", edge_type="right",
+                                     center_ref=right_center, skin_mask=skin_mask)
+show_gray(horiz_cost_left, "13. LEFT cost field (dark = cheap)")
+show_gray(horiz_cost_right, "13. RIGHT cost field (dark = cheap)")
+
+# %%
+# 14. Traced LEFT/RIGHT curves.
+band_r_lr = max(20, int(W * 0.04))
+left_path, left_cost = dp_trace_1d(
+    horiz_cost_left, "rows", left_center, band_r_lr,
+    index_range=(left_row_lo, left_row_hi), pin_start=xmin, pin_end=xmin,
+)
+right_path, right_cost = dp_trace_1d(
+    horiz_cost_right, "rows", right_center, band_r_lr,
+    index_range=(right_row_lo, right_row_hi), pin_start=xmax, pin_end=xmax,
+)
+print(f"LEFT cost={left_cost:.1f}  RIGHT cost={right_cost:.1f}")
+show_curve(img_clean, left_path, np.arange(left_row_lo, left_row_hi + 1), color=(0, 200, 0),
+           title="14. Traced LEFT (green) / RIGHT (orange)",
+           extra=[(right_path, np.arange(right_row_lo, right_row_hi + 1), (0, 165, 255))])
+
+# %%
+# 15. Dense LEFT(y)/RIGHT(y) — full-height interpolation the GUTTER trace will
+# be hard-bounded by.
+left_dense = dense_interp(left_path, left_row_lo, left_row_hi, H) + 3
+right_dense = dense_interp(right_path, right_row_lo, right_row_hi, H) - 3
+
+plt.figure(figsize=(10, 4))
+plt.plot(left_dense, label="left_dense")
+plt.plot(right_dense, label="right_dense")
+plt.legend()
+plt.title("15. Dense LEFT(y)/RIGHT(y)")
+plt.xlabel("row")
+plt.ylabel("column")
+plt.show()
+
+# %%
+# 16. Spine V-notch points — where TOP's and BOTTOM's curves bend sharpest,
+# i.e. where the two pages actually meet.
+top_v_idx, top_v_y = find_v_shaped_contact_point(top_path, edge_type="top")
+bot_v_idx, bot_v_y = find_v_shaped_contact_point(bot_path, edge_type="bottom")
+top_v_col = xmin + top_v_idx
+bot_v_col = xmin + bot_v_idx
+print(f"TOP V-notch:    ({top_v_col}, {top_v_y})")
+print(f"BOTTOM V-notch: ({bot_v_col}, {bot_v_y})")
+
+vis = img_clean.copy()
+cv2.circle(vis, (top_v_col, top_v_y), 10, (255, 0, 255), -1)
+cv2.circle(vis, (bot_v_col, bot_v_y), 10, (255, 0, 255), -1)
+show(vis, "16. Detected spine V-notch points (magenta dots)")
+
+# %%
+# 17. GUTTER cost field (darkness + ridge/symmetry), then the final gutter —
+# a straight line between the two V-notches, clipped to stay strictly inside
+# LEFT(y)/RIGHT(y).
+gutter_row_lo = max(0, min(top_v_y, H - 2))
+gutter_row_hi = min(H - 1, max(bot_v_y, gutter_row_lo + 1))
+gcost = gutter_local_cost(gray_clean, left_dense, right_dense)
+show_gray(gcost, "17a. Gutter local cost field (dark = gutter-like)")
+
+aspect_ratio = W / H
+gutter_present = aspect_ratio > 1.15
+print(f"aspect_ratio={aspect_ratio:.2f} gutter_present={gutter_present}")
+
+rows_arr = np.arange(gutter_row_lo, gutter_row_hi + 1)
+if gutter_present:
+    if top_v_y != bot_v_y:
+        slope = (bot_v_col - top_v_col) / float(bot_v_y - top_v_y)
+        gutter_cols = top_v_col + slope * (rows_arr - top_v_y)
+    else:
+        gutter_cols = np.full(len(rows_arr), top_v_col)
+    gutter_path = np.round(gutter_cols).astype(int)
+    for i, y in enumerate(rows_arr):
+        lo, hi = left_dense[y], right_dense[y]
+        gutter_path[i] = int(np.clip(gutter_path[i], lo + 2, hi - 2))
+
+    show_curve(img_clean, gutter_path, rows_arr, color=(255, 0, 255),
+               title="17b. Final GUTTER (straight line between V-notches)")
+else:
+    print("No gutter — single page (aspect ratio doesn't look like a spread).")
+
+# %%
+# 18. FINAL: all 5 curves together — exactly what detect_five_curves() /
+# draw_overlay_only() would produce for this image, plus the diagnostic
+# contrast-consistency numbers detect_five_curves() prints.
+curves = {
+    "top": (np.arange(xmin, xmax + 1), top_path),
+    "bottom": (np.arange(xmin, xmax + 1), bot_path),
+    "left": (left_path, np.arange(left_row_lo, left_row_hi + 1)),
+    "right": (right_path, np.arange(right_row_lo, right_row_hi + 1)),
+}
+if gutter_present:
+    curves["gutter"] = (gutter_path, rows_arr)
+
+final_vis = draw_overlay_only(img_clean, curves)
+show(final_vis, "18. FINAL: all 5 curves")
+
+top_pol, top_trans = contrast_consistency_score(gray_clean, top_path, "cols")
+bot_pol, bot_trans = contrast_consistency_score(gray_clean, bot_path, "cols")
+left_pol, left_trans = contrast_consistency_score(gray_clean, left_path, "rows")
+right_pol, right_trans = contrast_consistency_score(gray_clean, right_path, "rows")
+print("contrast-consistency (polarity 0-1, mean |transition|):")
+print(f"  TOP    {top_pol:.2f} / {top_trans:.1f}")
+print(f"  BOTTOM {bot_pol:.2f} / {bot_trans:.1f}")
+print(f"  LEFT   {left_pol:.2f} / {left_trans:.1f}")
+print(f"  RIGHT  {right_pol:.2f} / {right_trans:.1f}")

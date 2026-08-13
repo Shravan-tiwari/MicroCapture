@@ -20,6 +20,10 @@ EdsImage.dll
 # macOS metadata
 .DS_Store
 
+# Python
+__pycache__/
+*.pyc
+
 # Temporary Image Dumps
 /Temp/
 /Thumbnails/
