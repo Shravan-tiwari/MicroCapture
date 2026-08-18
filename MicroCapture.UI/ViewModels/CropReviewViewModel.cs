@@ -22,6 +22,11 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private readonly AppDbContext _dbContext;
     private readonly CaptureQueueService _queueService;
     private readonly string _imagePath;
+    private string _batchId = string.Empty;
+    // Job IDs the "Apply adjustments to selected" filmstrip action opened this window for, if
+    // any — when non-empty, Save's bulk-apply path targets exactly this set instead of the
+    // whole batch. Empty for the ordinary single-page open (click a thumbnail).
+    private readonly IReadOnlyList<string> _selectionForBulkApply;
 
     // Cached so Reset can re-apply the smart-detected starting point instead of falling back
     // to an unhelpful full-frame box or an unconditioned 50/50 split.
@@ -117,6 +122,85 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     partial void OnDewarpTopPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
     partial void OnDewarpBottomPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
 
+    // ───────────── ADJUST MODE (rotate/flip/tone/color/sharpen) ─────────────
+
+    [ObservableProperty] private bool _isAdjustMode;
+    [ObservableProperty] private int _rotationDegrees;
+    [ObservableProperty] private bool _flipHorizontal;
+    [ObservableProperty] private bool _flipVertical;
+    [ObservableProperty] private double _brightness;
+    [ObservableProperty] private double _contrast;
+    [ObservableProperty] private double _saturation;
+    [ObservableProperty] private double _sharpness;
+    [ObservableProperty] private double _whiteBalance;
+
+    // Cached so Reset (in Adjust mode) can restore exactly what was loaded/saved, same pattern
+    // as _detectedCorners for crop mode.
+    private bool _loadedHasManualAdjustments;
+    private int _loadedRotationDegrees;
+    private bool _loadedFlipHorizontal;
+    private bool _loadedFlipVertical;
+    private double _loadedBrightness;
+    private double _loadedContrast;
+    private double _loadedSaturation;
+    private double _loadedSharpness;
+    private double _loadedWhiteBalance;
+
+    public string AdjustEditButtonLabel => IsAdjustMode ? "Done Adjusting" : "Adjust";
+
+    partial void OnIsAdjustModeChanged(bool value)
+    {
+        OnPropertyChanged(nameof(AdjustEditButtonLabel));
+        SchedulePreviewUpdate();
+    }
+
+    partial void OnRotationDegreesChanged(int value) => SchedulePreviewUpdate();
+    partial void OnFlipHorizontalChanged(bool value) => SchedulePreviewUpdate();
+    partial void OnFlipVerticalChanged(bool value) => SchedulePreviewUpdate();
+    partial void OnBrightnessChanged(double value) => SchedulePreviewUpdate();
+    partial void OnContrastChanged(double value) => SchedulePreviewUpdate();
+    partial void OnSaturationChanged(double value) => SchedulePreviewUpdate();
+    partial void OnSharpnessChanged(double value) => SchedulePreviewUpdate();
+    partial void OnWhiteBalanceChanged(double value) => SchedulePreviewUpdate();
+
+    [RelayCommand]
+    private void RotateClockwise() => RotationDegrees = AdjustmentGeometry.NormalizeRotation(RotationDegrees + 90);
+
+    [RelayCommand]
+    private void RotateCounterclockwise() => RotationDegrees = AdjustmentGeometry.NormalizeRotation(RotationDegrees - 90);
+
+    [RelayCommand]
+    private void ToggleFlipHorizontal() => FlipHorizontal = !FlipHorizontal;
+
+    [RelayCommand]
+    private void ToggleFlipVertical() => FlipVertical = !FlipVertical;
+
+    [RelayCommand]
+    private void ApplyPresetDocument() => ApplyPreset(AdjustmentGeometry.Document);
+
+    [RelayCommand]
+    private void ApplyPresetPhoto() => ApplyPreset(AdjustmentGeometry.Photo);
+
+    [RelayCommand]
+    private void ApplyPresetGrayscale() => ApplyPreset(AdjustmentGeometry.Grayscale);
+
+    [RelayCommand]
+    private void ApplyPresetBlackAndWhite() => ApplyPreset(AdjustmentGeometry.BlackAndWhite);
+
+    /// <summary>Seeds the sliders from a named preset — the operator can still nudge them
+    /// afterward, this is a starting point, not a locked action. Rotation/flip are untouched:
+    /// presets are a tone/color concept, geometry is independent.</summary>
+    private void ApplyPreset(AdjustmentPreset preset)
+    {
+        Brightness = preset.Brightness;
+        Contrast = preset.Contrast;
+        Saturation = preset.Saturation;
+    }
+
+    private bool HasNonDefaultAdjustments =>
+        RotationDegrees != 0 || FlipHorizontal || FlipVertical || Brightness != 0 ||
+        Contrast != 0 || Saturation != 0 || Sharpness != 0 || WhiteBalance != 0;
+
     // Live preview of the corrected image as it's edited. Split mode uses both (left/right);
     // single-page mode uses only PreviewImage.
     [ObservableProperty] private Bitmap? _previewImage;
@@ -129,15 +213,17 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     {
         // Design-time constructor.
         _jobId = ""; _dbContext = null!; _queueService = null!; _imagePath = "";
+        _selectionForBulkApply = Array.Empty<string>();
         _previewTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
     }
 
-    public CropReviewViewModel(string jobId, AppDbContext dbContext, CaptureQueueService queueService)
+    public CropReviewViewModel(string jobId, AppDbContext dbContext, CaptureQueueService queueService, IReadOnlyList<string>? selectionForBulkApply = null)
     {
         _jobId = jobId;
         _dbContext = dbContext;
         _queueService = queueService;
         _imagePath = string.Empty;
+        _selectionForBulkApply = selectionForBulkApply ?? Array.Empty<string>();
 
         _previewTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
         _previewTimer.Tick += (_, _) =>
@@ -151,6 +237,24 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             return;
 
         _imagePath = job.OriginalFilePath;
+        _batchId = job.BatchId;
+        _loadedHasManualAdjustments = job.HasManualAdjustments;
+        _loadedRotationDegrees = job.RotationDegrees;
+        _loadedFlipHorizontal = job.FlipHorizontal;
+        _loadedFlipVertical = job.FlipVertical;
+        _loadedBrightness = job.Brightness;
+        _loadedContrast = job.Contrast;
+        _loadedSaturation = job.Saturation;
+        _loadedSharpness = job.Sharpness;
+        _loadedWhiteBalance = job.WhiteBalance;
+        RotationDegrees = job.RotationDegrees;
+        FlipHorizontal = job.FlipHorizontal;
+        FlipVertical = job.FlipVertical;
+        Brightness = job.Brightness;
+        Contrast = job.Contrast;
+        Saturation = job.Saturation;
+        Sharpness = job.Sharpness;
+        WhiteBalance = job.WhiteBalance;
 
         // Load the image and run detection on a background thread to avoid blocking the UI
         // when opening the dialog.
@@ -473,6 +577,13 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     {
         if (_previewRenderer == null) return;
 
+        if (IsAdjustMode)
+        {
+            RenderPreviewInto(CurrentPrimaryCorners(), isPrimary: true);
+            SecondaryPreviewImage = null;
+            return;
+        }
+
         if (IsDewarpMode)
         {
             RenderPreviewInto(CurrentPrimaryCorners(), isPrimary: true);
@@ -503,15 +614,25 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         var renderer = _previewRenderer;
         if (renderer == null) return;
 
-        // Snapshot under IsDewarpMode's current value, not re-read inside the background task —
-        // the operator could toggle modes again before this frame finishes rendering.
+        // Snapshot under IsDewarpMode/IsAdjustMode's current values, not re-read inside the
+        // background task — the operator could toggle modes or drag a slider again before this
+        // frame finishes rendering.
         DewarpModel? dewarpSnapshot = IsDewarpMode
             ? new DewarpModel((CropPoint[])DewarpTopPoints.Clone(), (CropPoint[])DewarpBottomPoints.Clone())
             : null;
+        var adjustSnapshot = IsAdjustMode
+            ? (RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance)
+            : ((int, bool, bool, double, double, double, double, double)?)null;
 
         Task.Run(() =>
         {
-            var bytes = dewarpSnapshot is { } d ? renderer.RenderPreviewWithDewarp(corners, d) : renderer.RenderPreview(corners);
+            byte[]? bytes;
+            if (adjustSnapshot is { } a)
+                bytes = renderer.RenderPreviewWithAdjustments(corners, a.Item1, a.Item2, a.Item3, a.Item4, a.Item5, a.Item6, a.Item7, a.Item8);
+            else if (dewarpSnapshot is { } d)
+                bytes = renderer.RenderPreviewWithDewarp(corners, d);
+            else
+                bytes = renderer.RenderPreview(corners);
             if (bytes == null) return;
             Dispatcher.UIThread.Post(() =>
             {
@@ -548,6 +669,23 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private void Reset()
     {
         if (Image == null) return;
+
+        if (IsAdjustMode)
+        {
+            // Restores whatever was loaded/last-saved for this job, not necessarily zero —
+            // matches the crop/dewarp Reset's own behavior of returning to the last-known-good
+            // state rather than an arbitrary default.
+            RotationDegrees = _loadedRotationDegrees;
+            FlipHorizontal = _loadedFlipHorizontal;
+            FlipVertical = _loadedFlipVertical;
+            Brightness = _loadedBrightness;
+            Contrast = _loadedContrast;
+            Saturation = _loadedSaturation;
+            Sharpness = _loadedSharpness;
+            WhiteBalance = _loadedWhiteBalance;
+            SchedulePreviewUpdate();
+            return;
+        }
 
         if (IsSplitBookPages && IsTwoQuadSplit)
         {
@@ -601,6 +739,16 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
 
             job.ManualOverrideApplied = true;
 
+            job.RotationDegrees = RotationDegrees;
+            job.FlipHorizontal = FlipHorizontal;
+            job.FlipVertical = FlipVertical;
+            job.Brightness = Brightness;
+            job.Contrast = Contrast;
+            job.Saturation = Saturation;
+            job.Sharpness = Sharpness;
+            job.WhiteBalance = WhiteBalance;
+            job.HasManualAdjustments = _loadedHasManualAdjustments || HasNonDefaultAdjustments;
+
             // Dewarp control points live in the crop-preview renderer's downscaled pixel space
             // (see SeedDewarpPoints) — convert back to full-resolution coordinates, matching
             // what the pipeline applies against the actual cropped page.
@@ -639,6 +787,67 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         window?.Close();
     }
 
+    /// <summary>True only when this window was opened for a real multi-selection (via the
+    /// filmstrip's "Apply adjustments to selected" action) — gates whether Apply-to-Selection
+    /// is offered at all, distinct from Apply-to-All which is always available once a batch is
+    /// known.</summary>
+    public bool HasSelectionForBulkApply => _selectionForBulkApply.Count > 0;
+
+    /// <summary>Raised when a bulk action (Apply to All/Selection) needs the operator to
+    /// confirm scope + count before committing — per the UX research, silently applying to a
+    /// wide, unreviewed set of pages is the most damaging failure mode in a production tool.
+    /// The window subscribes and shows a confirm dialog, then calls back with the answer.</summary>
+    public event EventHandler<BulkApplyConfirmRequest>? ConfirmBulkApplyRequested;
+
+    [RelayCommand]
+    private void ApplyToAll()
+    {
+        if (string.IsNullOrEmpty(_batchId)) return;
+        var count = _dbContext.CaptureJobs.Count(j => j.BatchId == _batchId && j.Id != _jobId);
+        if (count == 0) return;
+        ConfirmBulkApplyRequested?.Invoke(this, new BulkApplyConfirmRequest(
+            $"Apply these adjustments to {count} other page{(count == 1 ? "" : "s")} in this batch?",
+            confirmed => { if (confirmed) BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => j.BatchId == _batchId && j.Id != _jobId)); }));
+    }
+
+    [RelayCommand]
+    private void ApplyToSelection()
+    {
+        if (_selectionForBulkApply.Count == 0) return;
+        var targetIds = _selectionForBulkApply.Where(id => id != _jobId).ToList();
+        if (targetIds.Count == 0) return;
+        ConfirmBulkApplyRequested?.Invoke(this, new BulkApplyConfirmRequest(
+            $"Apply these adjustments to {targetIds.Count} selected page{(targetIds.Count == 1 ? "" : "s")}?",
+            confirmed => { if (confirmed) BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => targetIds.Contains(j.Id))); }));
+    }
+
+    /// <summary>Bulk-sets the current slider values onto every targeted job and re-queues them
+    /// for processing — the same "reset ProcessingStatus to Pending, let the background worker
+    /// pick it back up" mechanism Save already uses for one page, just applied to N rows in one
+    /// transaction. Does not touch crop/dewarp fields — this only ever applies the tone/color/
+    /// geometry adjustment stack, never someone else's crop shape.</summary>
+    private void BulkApplyToJobs(IQueryable<CaptureJob> targets)
+    {
+        foreach (var target in targets)
+        {
+            target.RotationDegrees = RotationDegrees;
+            target.FlipHorizontal = FlipHorizontal;
+            target.FlipVertical = FlipVertical;
+            target.Brightness = Brightness;
+            target.Contrast = Contrast;
+            target.Saturation = Saturation;
+            target.Sharpness = Sharpness;
+            target.WhiteBalance = WhiteBalance;
+            target.HasManualAdjustments = true;
+            target.ProcessingStatus = "Pending";
+            target.QcStatus = "Pending";
+            target.OcrStatus = "Pending";
+            target.ExportStatus = "Pending";
+        }
+        _dbContext.SaveChanges();
+        Saved?.Invoke(this, EventArgs.Empty);
+    }
+
     // Explicit invariant-culture formatting: the delimiter is a comma, and several Windows
     // locales use ',' as the decimal separator — culture-sensitive formatting here would
     // silently corrupt every saved crop on those systems.
@@ -653,5 +862,20 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         _previewTimer.Stop();
         _previewRenderer?.Dispose();
         _previewRenderer = null;
+    }
+}
+
+/// <summary>A bulk-apply confirmation prompt raised by <see cref="CropReviewViewModel"/> for
+/// the window to display — <see cref="OnAnswered"/> must be called exactly once with the
+/// operator's answer for the bulk action to actually run (or be abandoned).</summary>
+public sealed class BulkApplyConfirmRequest
+{
+    public string Message { get; }
+    public Action<bool> OnAnswered { get; }
+
+    public BulkApplyConfirmRequest(string message, Action<bool> onAnswered)
+    {
+        Message = message;
+        OnAnswered = onAnswered;
     }
 }

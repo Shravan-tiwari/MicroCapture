@@ -40,6 +40,7 @@
 
             <!-- Live Preview -->
             <Border Grid.Column="1" Classes="panel" Margin="0,14,14,14" Padding="14">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
                 <StackPanel Spacing="12">
                     <TextBlock Text="LIVE PREVIEW" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
                     <Image Source="{Binding PreviewImage}" Stretch="Uniform"
@@ -58,7 +59,69 @@
                             </Border>
                         </StackPanel>
                     </StackPanel>
+
+                    <!-- Adjust mode: rotate/flip/tone/color/sharpen controls, grouped -->
+                    <StackPanel Spacing="16" IsVisible="{Binding IsAdjustMode}" Margin="0,8,0,0">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="PRESETS" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <WrapPanel>
+                                <Button Content="Document" Command="{Binding ApplyPresetDocumentCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
+                                <Button Content="Photo" Command="{Binding ApplyPresetPhotoCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
+                                <Button Content="Grayscale" Command="{Binding ApplyPresetGrayscaleCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
+                                <Button Content="B&amp;W" Command="{Binding ApplyPresetBlackAndWhiteCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
+                            </WrapPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="GEOMETRY" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="↺ Rotate" Command="{Binding RotateCounterclockwiseCommand}" Classes="secondary" ToolTip.Tip="Rotate counterclockwise 90°"/>
+                                <Button Content="↻ Rotate" Command="{Binding RotateClockwiseCommand}" Classes="secondary" ToolTip.Tip="Rotate clockwise 90°"/>
+                                <TextBlock Text="{Binding RotationDegrees, StringFormat='{}{0}°'}" VerticalAlignment="Center" Foreground="{StaticResource InkMutedBrush}"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <ToggleButton Content="Flip H" IsChecked="{Binding FlipHorizontal}" Classes="secondary"/>
+                                <ToggleButton Content="Flip V" IsChecked="{Binding FlipVertical}" Classes="secondary"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="LIGHT &amp; COLOR" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Brightness" Classes="caption"/>
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Brightness}"/>
+                            </StackPanel>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Contrast" Classes="caption"/>
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Contrast}"/>
+                            </StackPanel>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Saturation" Classes="caption"/>
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Saturation}"/>
+                            </StackPanel>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="White Balance" Classes="caption"/>
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding WhiteBalance}"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="DETAIL" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Sharpness" Classes="caption"/>
+                                <Slider Minimum="0" Maximum="1" Value="{Binding Sharpness}"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="BATCH" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <Button Content="Apply to All in Batch" Command="{Binding ApplyToAllCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
+                            <Button Content="Apply to Selected" Command="{Binding ApplyToSelectionCommand}" Classes="secondary"
+                                    HorizontalAlignment="Stretch" IsVisible="{Binding HasSelectionForBulkApply}"/>
+                        </StackPanel>
+                    </StackPanel>
                 </StackPanel>
+                </ScrollViewer>
             </Border>
         </Grid>
 
@@ -85,6 +148,9 @@
                             IsVisible="{Binding IsQuadSplitMode}" Classes="accentGhost"/>
                     <Button Content="{Binding DewarpEditButtonLabel}" Command="{Binding ToggleDewarpEditModeCommand}"
                             ToolTip.Tip="Manually trace this page's actual top/bottom curve when auto-detection isn't confident enough"
+                            Classes="accentGhost"/>
+                    <Button Content="{Binding AdjustEditButtonLabel}" Command="{Binding ToggleAdjustModeCommand}"
+                            ToolTip.Tip="Rotate, flip, and adjust brightness/contrast/saturation/sharpness/white balance"
                             Classes="accentGhost"/>
                 </StackPanel>
 

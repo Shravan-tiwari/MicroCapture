@@ -78,6 +78,14 @@ await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
 await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
+TestManualAdjustmentsAreNoOpAtDefaults();
+TestManualAdjustmentsRotateAndFlip();
+TestManualAdjustmentsBrightnessContrastDirection();
+TestManualAdjustmentsSaturationDirection();
+TestManualAdjustmentsWhiteBalanceDirection();
+TestManualAdjustmentsSharpnessIncreasesEdgeContrast();
+TestAdjustmentGeometryClamping();
+TestAdjustmentPresetsWithinRange();
 
 Console.WriteLine(failures == 0 ? "\nAll checks passed." : $"\n{failures} check(s) FAILED.");
 return failures == 0 ? 0 : 1;
@@ -1822,4 +1830,192 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
     }
 
     await RunPumped(() => vm.ShutdownAsync());
+}
+
+// ---------- manual adjustments (rotate/flip/tone/color/sharpen) ----------
+
+void TestManualAdjustmentsAreNoOpAtDefaults()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments at all-default values is a byte-identical no-op --");
+    using var src = new Mat(200, 300, MatType.CV_8UC3, new Scalar(100, 120, 140));
+    using var result = ImageProcessor.ApplyManualAdjustments(src, rotationDegrees: 0, flipHorizontal: false, flipVertical: false,
+        brightness: 0, contrast: 0, saturation: 0, sharpness: 0, whiteBalance: 0);
+    Check("Same dimensions", result.Cols == src.Cols && result.Rows == src.Rows);
+    using var diff = new Mat();
+    Cv2.Absdiff(src, result, diff);
+    Check("Every pixel is byte-identical to the source", Cv2.CountNonZero(diff.Reshape(1)) == 0);
+}
+
+void TestManualAdjustmentsRotateAndFlip()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments rotate/flip produce the expected orientation --");
+    // An asymmetric marker (bright block in the top-left only) makes every rotation/flip
+    // combination distinguishable by where the bright block lands.
+    using var src = new Mat(100, 160, MatType.CV_8UC3, new Scalar(0, 0, 0));
+    src[new OpenCvSharp.Rect(0, 0, 40, 25)].SetTo(new Scalar(255, 255, 255));
+
+    bool BrightAt(Mat m, int x, int y) => m.At<Vec3b>(y, x).Item0 > 200;
+
+    using (var r90 = ImageProcessor.ApplyManualAdjustments(src, 90, false, false, 0, 0, 0, 0, 0))
+    {
+        Check("Rotate 90 changes dimensions (width/height swap)", r90.Cols == src.Rows && r90.Rows == src.Cols);
+        // Clockwise 90: original top-left content moves to top-right.
+        Check("Rotate 90 clockwise moves the marker to the top-right", BrightAt(r90, r90.Cols - 5, 5));
+    }
+    using (var r180 = ImageProcessor.ApplyManualAdjustments(src, 180, false, false, 0, 0, 0, 0, 0))
+    {
+        Check("Rotate 180 keeps dimensions", r180.Cols == src.Cols && r180.Rows == src.Rows);
+        Check("Rotate 180 moves the marker to the bottom-right", BrightAt(r180, r180.Cols - 5, r180.Rows - 5));
+    }
+    using (var flipH = ImageProcessor.ApplyManualAdjustments(src, 0, true, false, 0, 0, 0, 0, 0))
+    {
+        Check("Horizontal flip moves the marker to the top-right", BrightAt(flipH, flipH.Cols - 5, 5));
+    }
+    using (var flipV = ImageProcessor.ApplyManualAdjustments(src, 0, false, true, 0, 0, 0, 0, 0))
+    {
+        Check("Vertical flip moves the marker to the bottom-left", BrightAt(flipV, 5, flipV.Rows - 5));
+    }
+}
+
+void TestManualAdjustmentsBrightnessContrastDirection()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments brightness/contrast move mean luminance in the expected direction --");
+    using var src = new Mat(120, 120, MatType.CV_8UC3, new Scalar(110, 110, 110));
+
+    double MeanGray(Mat m)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(m, gray, ColorConversionCodes.BGR2GRAY);
+        return Cv2.Mean(gray).Val0;
+    }
+
+    var baseline = MeanGray(src);
+    using (var brighter = ImageProcessor.ApplyManualAdjustments(src, 0, false, false, brightness: 0.5, contrast: 0, saturation: 0, sharpness: 0, whiteBalance: 0))
+        Check($"Positive brightness raises mean luminance (baseline {baseline:F0}, after {MeanGray(brighter):F0})", MeanGray(brighter) > baseline);
+    using (var darker = ImageProcessor.ApplyManualAdjustments(src, 0, false, false, brightness: -0.5, contrast: 0, saturation: 0, sharpness: 0, whiteBalance: 0))
+        Check($"Negative brightness lowers mean luminance (baseline {baseline:F0}, after {MeanGray(darker):F0})", MeanGray(darker) < baseline);
+
+    // Contrast on a flat mid-gray field shouldn't move the mean much (it scales around the
+    // pivot), but should visibly spread values on a two-tone image.
+    using var twoTone = new Mat(120, 120, MatType.CV_8UC3, new Scalar(80, 80, 80));
+    twoTone[new OpenCvSharp.Rect(0, 0, 60, 120)].SetTo(new Scalar(170, 170, 170));
+    double StdDevGray(Mat m)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(m, gray, ColorConversionCodes.BGR2GRAY);
+        Cv2.MeanStdDev(gray, out _, out var stddev);
+        return stddev.Val0;
+    }
+    var baselineStd = StdDevGray(twoTone);
+    using var moreContrast = ImageProcessor.ApplyManualAdjustments(twoTone, 0, false, false, brightness: 0, contrast: 0.6, saturation: 0, sharpness: 0, whiteBalance: 0);
+    Check($"Positive contrast increases spread between the two tones (baseline std {baselineStd:F1}, after {StdDevGray(moreContrast):F1})",
+        StdDevGray(moreContrast) > baselineStd);
+}
+
+void TestManualAdjustmentsSaturationDirection()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments saturation=-1 collapses a colored image toward grayscale --");
+    using var src = new Mat(100, 100, MatType.CV_8UC3, new Scalar(30, 60, 200)); // strongly red-orange in BGR
+
+    double SaturationSpread(Mat m)
+    {
+        using var hsv = new Mat();
+        Cv2.CvtColor(m, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.Split(hsv, out var channels);
+        var mean = Cv2.Mean(channels[1]).Val0;
+        foreach (var c in channels) c.Dispose();
+        return mean;
+    }
+
+    var baseline = SaturationSpread(src);
+    using var desaturated = ImageProcessor.ApplyManualAdjustments(src, 0, false, false, brightness: 0, contrast: 0, saturation: -1, sharpness: 0, whiteBalance: 0);
+    Check($"Saturation -1 drives the HSV saturation channel toward zero (baseline {baseline:F0}, after {SaturationSpread(desaturated):F0})",
+        SaturationSpread(desaturated) < baseline * 0.15);
+}
+
+void TestManualAdjustmentsWhiteBalanceDirection()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments white balance shifts the R/B channel ratio in the expected direction --");
+    using var src = new Mat(100, 100, MatType.CV_8UC3, new Scalar(120, 120, 120));
+
+    (double blueMean, double redMean) ChannelMeans(Mat m)
+    {
+        Cv2.Split(m, out var channels);
+        var b = Cv2.Mean(channels[0]).Val0;
+        var r = Cv2.Mean(channels[2]).Val0;
+        foreach (var c in channels) c.Dispose();
+        return (b, r);
+    }
+
+    using var warm = ImageProcessor.ApplyManualAdjustments(src, 0, false, false, brightness: 0, contrast: 0, saturation: 0, sharpness: 0, whiteBalance: 1.0);
+    var (warmBlue, warmRed) = ChannelMeans(warm);
+    Check($"Warm white balance boosts red over blue (R {warmRed:F0} vs B {warmBlue:F0})", warmRed > warmBlue);
+
+    using var cool = ImageProcessor.ApplyManualAdjustments(src, 0, false, false, brightness: 0, contrast: 0, saturation: 0, sharpness: 0, whiteBalance: -1.0);
+    var (coolBlue, coolRed) = ChannelMeans(cool);
+    Check($"Cool white balance boosts blue over red (B {coolBlue:F0} vs R {coolRed:F0})", coolBlue > coolRed);
+}
+
+void TestManualAdjustmentsSharpnessIncreasesEdgeContrast()
+{
+    Console.WriteLine("\n-- ApplyManualAdjustments sharpness increases edge contrast on a soft edge --");
+    using var src = new Mat(150, 150, MatType.CV_8UC3, new Scalar(40, 40, 40));
+    using var blurredEdge = new Mat(150, 150, MatType.CV_8UC3, new Scalar(40, 40, 40));
+    blurredEdge[new OpenCvSharp.Rect(75, 0, 75, 150)].SetTo(new Scalar(200, 200, 200));
+    Cv2.GaussianBlur(blurredEdge, blurredEdge, new OpenCvSharp.Size(0, 0), 6.0); // soften the edge before sharpening
+
+    double LaplacianVariance(Mat m)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(m, gray, ColorConversionCodes.BGR2GRAY);
+        using var lap = new Mat();
+        Cv2.Laplacian(gray, lap, MatType.CV_64F);
+        Cv2.MeanStdDev(lap, out _, out var stddev);
+        return stddev.Val0 * stddev.Val0;
+    }
+
+    var baseline = LaplacianVariance(blurredEdge);
+    using var sharpened = ImageProcessor.ApplyManualAdjustments(blurredEdge, 0, false, false, brightness: 0, contrast: 0, saturation: 0, sharpness: 1.0, whiteBalance: 0);
+    Check($"Sharpness increases Laplacian variance (baseline {baseline:F0}, after {LaplacianVariance(sharpened):F0})",
+        LaplacianVariance(sharpened) > baseline);
+}
+
+void TestAdjustmentGeometryClamping()
+{
+    Console.WriteLine("\n-- AdjustmentGeometry clamps tone/sharpness values and normalizes rotation --");
+    Check("ClampTone clamps above range", AdjustmentGeometry.ClampTone(5.0) == 1.0);
+    Check("ClampTone clamps below range", AdjustmentGeometry.ClampTone(-5.0) == -1.0);
+    Check("ClampTone passes through in-range values", AdjustmentGeometry.ClampTone(0.3) == 0.3);
+    Check("ClampSharpness clamps above range", AdjustmentGeometry.ClampSharpness(2.0) == 1.0);
+    Check("ClampSharpness clamps below zero", AdjustmentGeometry.ClampSharpness(-1.0) == 0.0);
+    Check("NormalizeRotation leaves 90 unchanged", AdjustmentGeometry.NormalizeRotation(90) == 90);
+    Check("NormalizeRotation wraps 360 to 0", AdjustmentGeometry.NormalizeRotation(360) == 0);
+    Check("NormalizeRotation wraps 450 to 90", AdjustmentGeometry.NormalizeRotation(450) == 90);
+    Check("NormalizeRotation wraps -90 to 270", AdjustmentGeometry.NormalizeRotation(-90) == 270);
+}
+
+void TestAdjustmentPresetsWithinRange()
+{
+    Console.WriteLine("\n-- Adjustment presets stay within the valid clamp range and desaturate as expected --");
+    AdjustmentPreset[] presets = { AdjustmentGeometry.Document, AdjustmentGeometry.Photo, AdjustmentGeometry.Grayscale, AdjustmentGeometry.BlackAndWhite };
+    foreach (var preset in presets)
+    {
+        Check($"Preset brightness {preset.Brightness} is within [-1, 1]", preset.Brightness is >= -1.0 and <= 1.0);
+        Check($"Preset contrast {preset.Contrast} is within [-1, 1]", preset.Contrast is >= -1.0 and <= 1.0);
+        Check($"Preset saturation {preset.Saturation} is within [-1, 1]", preset.Saturation is >= -1.0 and <= 1.0);
+    }
+    Check("Grayscale preset fully desaturates", AdjustmentGeometry.Grayscale.Saturation == -1.0);
+    Check("B&W preset fully desaturates", AdjustmentGeometry.BlackAndWhite.Saturation == -1.0);
+
+    // Independently verify the Grayscale preset actually collapses a colored synthetic image,
+    // exercising the same real pipeline call the UI would make with these exact values.
+    using var src = new Mat(100, 100, MatType.CV_8UC3, new Scalar(30, 60, 200));
+    using var applied = ImageProcessor.ApplyManualAdjustments(src, 0, false, false,
+        AdjustmentGeometry.Grayscale.Brightness, AdjustmentGeometry.Grayscale.Contrast, AdjustmentGeometry.Grayscale.Saturation, 0, 0);
+    using var hsv = new Mat();
+    Cv2.CvtColor(applied, hsv, ColorConversionCodes.BGR2HSV);
+    Cv2.Split(hsv, out var channels);
+    var satMean = Cv2.Mean(channels[1]).Val0;
+    foreach (var c in channels) c.Dispose();
+    Check($"Applying the Grayscale preset produces a near-zero saturation image (mean S {satMean:F0})", satMean < 15);
 }

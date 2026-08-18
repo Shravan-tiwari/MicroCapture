@@ -75,7 +75,7 @@ public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Wi
 /// Core image processing pipeline: auto-crop, deskew, perspective correction,
 /// enhancement, and QC scoring. All operations preserve the original file.
 /// </summary>
-public class ImageProcessor
+public partial class ImageProcessor
 {
     // --- Configuration ---
     public double CropConfidenceThreshold { get; set; } = 0.5;
@@ -387,7 +387,7 @@ public class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool useAltPipeline = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -421,6 +421,30 @@ public class ImageProcessor
             // distortion baked into the raw capture.
             using var undistorted = lensCalibration is { } calib ? SafeUndistort(rawSrc, calib, result) : null;
             var src = undistorted ?? rawSrc;
+
+            // Alt pipeline (see AltBoundaryPipeline.cs): a self-contained alternative to
+            // everything below (DetectGutter split-decision, TryAutoCrop, TryDeskew,
+            // TryApplyDewarp, TryApplyLineMesh) — it runs its own edge trace directly on the
+            // whole frame and decides split-vs-single-page from its own gutter-notch detection,
+            // which is a superset of what DetectGutter's brightness-band pre-check does. Kept as
+            // a fully separate branch (not interleaved into the legacy sequence below) so a
+            // batch that doesn't opt in gets byte-identical output to before this toggle existed.
+            if (useAltPipeline)
+            {
+                var altSpread = AltFlattenSpread(src);
+                using (altSpread.Left.Flattened) using (altSpread.Right.Flattened)
+                {
+                    var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
+                    WriteTiff(outLeft, altSpread.Left.Flattened, meta, false);
+                    result.OutputFilePaths.Add(outLeft);
+
+                    var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
+                    WriteTiff(outRight, altSpread.Right.Flattened, meta, false);
+                    result.OutputFilePaths.Add(outRight);
+                }
+                result.Success = true;
+                return result;
+            }
 
             // Automatic (non-manual) captures never got a chance to route through the split
             // path unless an operator remembered to check Batch.SplitBookPages up front — in
@@ -504,7 +528,7 @@ public class ImageProcessor
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
                 var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
                 WriteTiff(outLeft, leftResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outLeft);
@@ -512,7 +536,7 @@ public class ImageProcessor
 
                 // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
                 var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
                 WriteTiff(outRight, rightResult, meta, result.WasBinarized);
                 result.OutputFilePaths.Add(outRight);
@@ -530,7 +554,7 @@ public class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, bleedthroughEnabled: bleedthroughEnabled);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
                 manualCrop?.Dispose();
 
                 var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
@@ -597,7 +621,7 @@ public class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool useAltPipeline = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -639,18 +663,36 @@ public class ImageProcessor
                     (int)Math.Round(frames[i].X), (int)Math.Round(frames[i].Y),
                     (int)Math.Round(frames[i].Width), (int)Math.Round(frames[i].Height)), src.Cols, src.Rows);
 
-                var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect, bleedthroughEnabled: bleedthroughEnabled);
-
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, meta, frameResult.WasBinarized);
-                result.OutputFilePaths.Add(outPath);
 
-                result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
-                result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
-                result.BlurScore = frameResult.BlurScore;
-                result.ExposureScore = frameResult.ExposureScore;
+                if (useAltPipeline)
+                {
+                    // Same padded-search-region convention as the legacy searchRegion path
+                    // (FixedFrameSearchPadFraction) — the calibrated rectangle may not exactly
+                    // match the real page edge, so the alt trace needs margin to find it.
+                    var padded = ClampRectToBounds(new Rect(
+                        (int)Math.Round(rect.X - rect.Width * FixedFrameSearchPadFraction),
+                        (int)Math.Round(rect.Y - rect.Height * FixedFrameSearchPadFraction),
+                        (int)Math.Round(rect.Width * (1 + 2 * FixedFrameSearchPadFraction)),
+                        (int)Math.Round(rect.Height * (1 + 2 * FixedFrameSearchPadFraction))), src.Cols, src.Rows);
+                    using var sub = new Mat(src, padded);
+                    using var altResult = AltFlattenSinglePage(sub).Flattened;
+                    WriteTiff(outPath, altResult, meta, false);
+                    result.OutputFilePaths.Add(outPath);
+                }
+                else
+                {
+                    var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
+                    using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
+                    WriteTiff(outPath, processed, meta, frameResult.WasBinarized);
+                    result.OutputFilePaths.Add(outPath);
+
+                    result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
+                    result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
+                    result.BlurScore = frameResult.BlurScore;
+                    result.ExposureScore = frameResult.ExposureScore;
+                }
             }
 
             result.Success = true;
@@ -1006,7 +1048,7 @@ public class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null, bool bleedthroughEnabled = false)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var working = input.Clone();
 
@@ -1031,6 +1073,17 @@ public class ImageProcessor
 
         working = ApplyEnhancement(working);
         working = Sharpen(working);
+        // Manual (operator-driven) adjustments layer on top of the automatic CLAHE
+        // enhancement/sharpen above rather than replacing them — see
+        // ApplyManualAdjustments's own doc comment for the fixed operation order. Skipped
+        // entirely (not just a no-op call) when the job was never touched in the Adjust UI,
+        // so untouched pages are provably unaffected by this feature's existence.
+        if (hasManualAdjustments)
+        {
+            var adjusted = ApplyManualAdjustments(working, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+            working.Dispose();
+            working = adjusted;
+        }
         // Quality checks must see the real (color/grayscale) capture, not a bilevel result —
         // blur/exposure scores are meaningless once thresholded to pure black-and-white, so
         // binarization runs last, after QC rather than before it.
@@ -3794,6 +3847,130 @@ public class ImageProcessor
         var sharpened = new Mat();
         Cv2.AddWeighted(src, 1 + SharpenAmount, blurred, -SharpenAmount, 0, sharpened);
         return sharpened;
+    }
+
+    // ───────────── MANUAL ADJUSTMENTS ─────────────
+
+    /// <summary>Applies the operator-driven post-capture edit stack (Crop Review's Adjust
+    /// mode) — rotate, flip, white balance, brightness/contrast, saturation, sharpness, in
+    /// that fixed order. Runs after the automatic pipeline (crop/dewarp/CLAHE
+    /// enhancement/unsharp-mask) and before the final TIFF write, so it corrects the
+    /// pipeline's own output rather than feeding a different image into detection/QC. Order is
+    /// deliberate and must not change: rotate/flip first since every later step assumes the
+    /// final orientation; white balance before tone so a color cast doesn't skew the
+    /// brightness/contrast read; saturation after tone since it's evaluated in the corrected
+    /// image's own HSV space; sharpness last so it sharpens the final tonal result rather than
+    /// being partially undone by a later contrast pass.</summary>
+    public static Mat ApplyManualAdjustments(Mat src, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
+    {
+        var working = src.Clone();
+
+        var normalizedRotation = AdjustmentGeometry.NormalizeRotation(rotationDegrees);
+        if (normalizedRotation != 0)
+        {
+            var flag = normalizedRotation switch
+            {
+                90 => RotateFlags.Rotate90Clockwise,
+                180 => RotateFlags.Rotate180,
+                270 => RotateFlags.Rotate90Counterclockwise,
+                _ => (RotateFlags?)null
+            };
+            if (flag.HasValue)
+            {
+                var rotated = new Mat();
+                Cv2.Rotate(working, rotated, flag.Value);
+                working.Dispose();
+                working = rotated;
+            }
+        }
+
+        if (flipHorizontal || flipVertical)
+        {
+            var flipMode = (flipHorizontal, flipVertical) switch
+            {
+                (true, true) => FlipMode.XY,
+                (true, false) => FlipMode.Y,
+                (false, true) => FlipMode.X,
+                _ => (FlipMode?)null
+            };
+            if (flipMode.HasValue)
+            {
+                var flipped = new Mat();
+                Cv2.Flip(working, flipped, flipMode.Value);
+                working.Dispose();
+                working = flipped;
+            }
+        }
+
+        var clampedWhiteBalance = AdjustmentGeometry.ClampTone(whiteBalance);
+        if (clampedWhiteBalance != 0)
+        {
+            // Simple global per-channel gain: warm (+1) boosts red/cuts blue, cool (-1) the
+            // reverse. Split/scale/merge rather than a matrix — clearer, and this is a 3-
+            // channel BGR Mat throughout this pipeline, never single-channel here.
+            Cv2.Split(working, out var wbChannels);
+            var redGain = 1.0 + clampedWhiteBalance * 0.3;
+            var blueGain = 1.0 - clampedWhiteBalance * 0.3;
+            wbChannels[2].ConvertTo(wbChannels[2], -1, redGain, 0); // R channel (BGR index 2)
+            wbChannels[0].ConvertTo(wbChannels[0], -1, blueGain, 0); // B channel (BGR index 0)
+            using var wbMerged = new Mat();
+            Cv2.Merge(wbChannels, wbMerged);
+            foreach (var ch in wbChannels) ch.Dispose();
+            working.Dispose();
+            working = wbMerged.Clone();
+        }
+
+        var clampedBrightness = AdjustmentGeometry.ClampTone(brightness);
+        var clampedContrast = AdjustmentGeometry.ClampTone(contrast);
+        if (clampedBrightness != 0 || clampedContrast != 0)
+        {
+            // Contrast scales around the mid-gray pivot (128), not a naive multiply from zero
+            // — output = (input - 128) * contrastFactor + 128 + brightnessOffset, expressed as
+            // ConvertTo's alpha/beta affine form. contrastFactor ranges roughly 0.5x..2x across
+            // the [-1, 1] slider range; brightnessOffset is scaled to typical byte range.
+            var contrastFactor = 1.0 + clampedContrast;
+            var brightnessOffset = clampedBrightness * 80.0;
+            var beta = 128.0 * (1.0 - contrastFactor) + brightnessOffset;
+            var toned = new Mat();
+            working.ConvertTo(toned, -1, contrastFactor, beta);
+            working.Dispose();
+            working = toned;
+        }
+
+        var clampedSaturation = AdjustmentGeometry.ClampTone(saturation);
+        if (clampedSaturation != 0)
+        {
+            // Hue-safe saturation: scale the S channel in HSV space rather than scaling RGB
+            // channels independently, which shifts hue — the difference between amateur and
+            // correct-feeling saturation for a slider like this.
+            using var hsv = new Mat();
+            Cv2.CvtColor(working, hsv, ColorConversionCodes.BGR2HSV);
+            Cv2.Split(hsv, out var hsvChannels);
+            var satFactor = 1.0 + clampedSaturation; // -1 -> 0 (grayscale), +1 -> 2x
+            hsvChannels[1].ConvertTo(hsvChannels[1], -1, satFactor, 0);
+            using var hsvMerged = new Mat();
+            Cv2.Merge(hsvChannels, hsvMerged);
+            foreach (var ch in hsvChannels) ch.Dispose();
+            var saturated = new Mat();
+            Cv2.CvtColor(hsvMerged, saturated, ColorConversionCodes.HSV2BGR);
+            working.Dispose();
+            working = saturated;
+        }
+
+        var clampedSharpness = AdjustmentGeometry.ClampSharpness(sharpness);
+        if (clampedSharpness > 0)
+        {
+            // Same unsharp-mask technique as the pipeline's own fixed-strength Sharpen(), here
+            // exposed as a variable-strength user slider instead of a fixed constant.
+            using var blurred = new Mat();
+            Cv2.GaussianBlur(working, blurred, new Size(0, 0), 2.0);
+            var sharpened = new Mat();
+            Cv2.AddWeighted(working, 1 + clampedSharpness, blurred, -clampedSharpness, 0, sharpened);
+            working.Dispose();
+            working = sharpened;
+        }
+
+        return working;
     }
 
     // ───────────── QUALITY CONTROL ─────────────

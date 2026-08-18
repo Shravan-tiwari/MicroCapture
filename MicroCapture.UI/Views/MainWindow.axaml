@@ -52,6 +52,9 @@
                     <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (B&amp;W)"
                               ToolTip.Tip="Thresholds every processed page to pure black-and-white (Sauvola local threshold) and writes it as a true 1-bit CCITT G4 TIFF — much smaller files and crisper OCR input, but loses all color/grayscale content. Not reversible after export."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
+                    <CheckBox IsChecked="{Binding UseAltBoundaryPipeline}" Content="Alt Boundary Pipeline (Beta)"
+                              ToolTip.Tip="Uses an alternative edge-detection and page-flatten algorithm instead of the default one. Detects its own two-page splits automatically. Not compatible with Fixed Frames."
+                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
                               Width="90" ToolTip.Tip="Default export format for the next batch"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
@@ -244,7 +247,23 @@
 
         <!-- ═══════════════ THUMBNAIL STRIP ═══════════════ -->
         <Border Grid.Row="2" Classes="panel" Margin="10,5,10,5" Padding="10">
-            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <Grid RowDefinitions="Auto, *">
+                <!-- Batch action bar: appears only while at least one thumbnail is selected
+                     (ctrl/shift-click). Kept inside the same fixed-height row as the filmstrip
+                     itself, not a new row, so it doesn't grow/shrink the overall layout. -->
+                <Border Grid.Row="0" IsVisible="{Binding HasSelection}" Margin="0,0,0,6"
+                        Background="{StaticResource Surface2Brush}" CornerRadius="6" Padding="10,6">
+                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                        <TextBlock Text="{Binding SelectedCount, StringFormat='{}{0} selected'}"
+                                   Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="12"/>
+                        <Button Content="Apply Adjustments…" Command="{Binding ApplyAdjustmentsToSelectedCommand}" Classes="accentGhost"/>
+                        <Button Content="Delete Selected" Command="{Binding DeleteSelectedAsyncCommand}"
+                                CommandParameter="{Binding $parent[Window]}" Classes="iconDanger"/>
+                        <Button Content="Clear Selection" Click="OnClearSelectionClick" Classes="secondary"/>
+                    </StackPanel>
+                </Border>
+
+            <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -257,7 +276,8 @@
                                 <Button Background="{StaticResource Surface2Brush}"
                                         BorderBrush="{Binding BorderColor, TargetNullValue={StaticResource HairlineBrush}}"
                                         BorderThickness="2" CornerRadius="8" Padding="6"
-                                        ToolTip.Tip="Open crop review"
+                                        ToolTip.Tip="Click to open crop review — ctrl/shift-click to select for batch actions"
+                                        PointerPressed="OnThumbnailPointerPressed"
                                         Click="OnThumbnailClick"
                                         Tag="{Binding JobId}">
                                     <StackPanel Spacing="6">
@@ -275,6 +295,10 @@
                                                    HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                                     </StackPanel>
                                 </Button>
+                                <Border IsVisible="{Binding IsSelected}" CornerRadius="8" BorderBrush="{StaticResource PrimaryHoverBrush}"
+                                        BorderThickness="3" IsHitTestVisible="False"/>
+                                <Ellipse IsVisible="{Binding IsSelected}" Width="16" Height="16" Fill="{StaticResource PrimaryHoverBrush}"
+                                         HorizontalAlignment="Left" VerticalAlignment="Top" Margin="4,4,0,0" IsHitTestVisible="False"/>
                                 <Button Content="✕" Width="20" Height="20" Padding="0" FontSize="10" Classes="iconDanger"
                                         HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-4,-4,0"
                                         ToolTip.Tip="Delete this capture (excludes it from processing and export)"
@@ -284,6 +308,7 @@
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
             </ScrollViewer>
+            </Grid>
         </Border>
 
         <!-- ═══════════════ STATUS BAR ═══════════════ -->

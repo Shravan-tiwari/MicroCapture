@@ -27,5 +27,20 @@ public class CaptureJob
     public bool DewarpManualOverrideApplied { get; set; } = false;
     public string? DewarpCurve { get; set; }
 
+    // Manual post-capture adjustments (rotate/flip/tone/color/sharpen) — applied after the
+    // rest of the automatic pipeline (crop, dewarp, CLAHE enhancement), immediately before the
+    // final TIFF write. See ImageProcessor.ApplyManualAdjustments/AdjustmentGeometry.
+    // HasManualAdjustments distinguishes "never touched" from "explicitly reset to defaults",
+    // which matters for batch-apply eligibility and for proving untouched pages are unaffected.
+    public bool HasManualAdjustments { get; set; } = false;
+    public int RotationDegrees { get; set; } = 0; // 0, 90, 180, 270 — applied clockwise
+    public bool FlipHorizontal { get; set; } = false;
+    public bool FlipVertical { get; set; } = false;
+    public double Brightness { get; set; } = 0.0; // -1.0..+1.0
+    public double Contrast { get; set; } = 0.0; // -1.0..+1.0
+    public double Saturation { get; set; } = 0.0; // -1.0..+1.0
+    public double Sharpness { get; set; } = 0.0; // 0.0..+1.0, unsharp-mask strength
+    public double WhiteBalance { get; set; } = 0.0; // -1.0 (cool/blue) .. +1.0 (warm/amber)
+
     public Batch? Batch { get; set; }
 }

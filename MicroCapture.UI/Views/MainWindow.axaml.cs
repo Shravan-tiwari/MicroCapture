@@ -152,12 +152,31 @@ public partial class MainWindow : Window
         catch (Exception ex) { Console.WriteLine($"ExportFormat click failed: {ex}"); }
     }
 
+    // Set by OnThumbnailPointerPressed (which does receive KeyModifiers) just before the
+    // Button's own Click fires, so OnThumbnailClick below can tell a plain click from a
+    // ctrl/shift-click without RoutedEventArgs carrying modifier state itself.
+    private bool _nextThumbnailClickIsSelectToggle;
+
+    private void OnThumbnailPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        _nextThumbnailClickIsSelectToggle = (e.KeyModifiers & (KeyModifiers.Control | KeyModifiers.Meta | KeyModifiers.Shift)) != 0;
+    }
+
     private void OnThumbnailClick(object? sender, RoutedEventArgs e)
     {
         try
         {
             if (sender is Button btn)
             {
+                var isSelectToggle = _nextThumbnailClickIsSelectToggle;
+                _nextThumbnailClickIsSelectToggle = false;
+                if (isSelectToggle && btn.DataContext is global::MicroCapture.UI.ViewModels.ThumbnailItem selectItem
+                    && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel selectVm)
+                {
+                    selectVm.ToggleThumbnailSelection(selectItem);
+                    return;
+                }
+
                 var jobId = btn.Tag as string ?? (btn.DataContext as global::MicroCapture.UI.ViewModels.ThumbnailItem)?.JobId;
                 if (!string.IsNullOrEmpty(jobId) && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
                 {
@@ -220,6 +239,12 @@ public partial class MainWindow : Window
         {
             Console.WriteLine($"[Thumbnail] OnDeleteThumbnailClick failed: {ex}");
         }
+    }
+
+    private void OnClearSelectionClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
+            vm.ClearSelection();
     }
 
     protected override async void OnClosed(EventArgs e)

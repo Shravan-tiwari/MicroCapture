@@ -51,10 +51,15 @@ public partial class CropReviewWindow : Window
                     or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages)
                     or nameof(vm.LeftQuad) or nameof(vm.RightQuad) or nameof(vm.IsTwoQuadSplit)
                     or nameof(vm.IsDewarpMode) or nameof(vm.DewarpTopPoints) or nameof(vm.DewarpBottomPoints)
-                    or nameof(vm.DewarpBackdropImage))
+                    or nameof(vm.DewarpBackdropImage) or nameof(vm.IsAdjustMode))
                 {
                     RenderOverlay();
                 }
+            };
+            vm.ConfirmBulkApplyRequested += async (s, request) =>
+            {
+                var confirmed = await ConfirmDialog.AskAsync(this, request.Message, "Apply Adjustments");
+                request.OnAnswered(confirmed);
             };
         }
     }
@@ -62,7 +67,7 @@ public partial class CropReviewWindow : Window
     protected override void OnPointerPressed(PointerPressedEventArgs e)
     {
         base.OnPointerPressed(e);
-        if (DataContext is not CropReviewViewModel vm || vm.Image == null) return;
+        if (DataContext is not CropReviewViewModel vm || vm.Image == null || vm.IsAdjustMode) return;
 
         var canvas = this.FindControl<Canvas>("OverlayCanvas");
         if (canvas == null) return;
@@ -256,6 +261,8 @@ public partial class CropReviewWindow : Window
         if (canvas == null || DataContext is not CropReviewViewModel vm) return;
 
         canvas.Children.Clear();
+
+        if (vm.IsAdjustMode) return; // no draggable geometry in Adjust mode — sliders only
 
         var (imgRect, scale) = GetDisplayedImageRect();
         if (scale <= 0) return;

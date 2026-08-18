@@ -79,6 +79,15 @@ public partial class MainWindowViewModel : ViewModelBase
     // color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
     [ObservableProperty] private bool _binarizeEnabled = false;
 
+    // Selects the alternative boundary-detection/split/flatten pipeline (see
+    // ImageProcessor.AltBoundaryPipeline.cs / Batch.UseAltBoundaryPipeline) in place of the
+    // original contour/confidence-based one. Fixed per batch, like the other processing toggles.
+    // Applies to both the spread-detection path and fixed-frame captures (ProcessFixedFrames'
+    // own useAltPipeline branch flattens within each calibrated rectangle instead of a plain
+    // crop) — orthogonal to UseFixedFrames, not exclusive with it. Mutually exclusive with
+    // SplitBookPages, since the alt pipeline decides split-vs-single-page itself.
+    [ObservableProperty] private bool _useAltBoundaryPipeline = false;
+
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
     // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
@@ -92,6 +101,11 @@ public partial class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(CalibrateButtonLabel));
     }
     partial void OnSplitBookPagesChanged(bool value) { if (value) UseFixedFrames = false; }
+    // UseAltBoundaryPipeline is orthogonal to UseFixedFrames (it applies to both the
+    // spread-detection path and, via ProcessFixedFrames' own useAltPipeline branch, the
+    // fixed-frame path too — see the property's own doc comment above) but still mutually
+    // exclusive with SplitBookPages, since the alt pipeline runs its own split decision.
+    partial void OnUseAltBoundaryPipelineChanged(bool value) { if (value) SplitBookPages = false; }
     partial void OnIsFixedFrameBatchChanged(bool value)
     {
         OnPropertyChanged(nameof(IsAutoCaptureAvailable));
@@ -132,6 +146,28 @@ public partial class MainWindowViewModel : ViewModelBase
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
     public ObservableCollection<CameraControlItem> CameraControls { get; } = new();
+
+    // Filmstrip multi-select (ctrl/shift-click) — drives the batch action bar's visibility and
+    // targets (Delete Selected, Apply Adjustments to Selected).
+    public int SelectedCount => RecentCaptures.Count(t => t.IsSelected);
+    public bool HasSelection => SelectedCount > 0;
+
+    /// <summary>Called from MainWindow.axaml.cs's ctrl/shift-click handling on a thumbnail —
+    /// toggles that thumbnail's selection and refreshes the computed selection properties the
+    /// action bar binds to.</summary>
+    public void ToggleThumbnailSelection(ThumbnailItem item)
+    {
+        item.IsSelected = !item.IsSelected;
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(HasSelection));
+    }
+
+    public void ClearSelection()
+    {
+        foreach (var t in RecentCaptures) t.IsSelected = false;
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(HasSelection));
+    }
 
     public MainWindowViewModel()
     {
@@ -456,6 +492,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 SelectedDpi = batch.Dpi;
                 DewarpEnabled = batch.DewarpEnabled;
                 BinarizeEnabled = batch.BinarizeEnabled;
+                UseAltBoundaryPipeline = batch.UseAltBoundaryPipeline;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -471,7 +508,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     PreferredExportFormat = DefaultExportFormat,
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
-                    BinarizeEnabled = BinarizeEnabled
+                    BinarizeEnabled = BinarizeEnabled,
+                    UseAltBoundaryPipeline = UseAltBoundaryPipeline
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();
@@ -957,19 +995,66 @@ public partial class MainWindowViewModel : ViewModelBase
     // ---------- Helpers ----------
 
     [RelayCommand]
-    private void ReviewCrop(string jobId)
+    private void ReviewCrop(string jobId) => OpenCropReview(jobId, selectionForBulkApply: null);
+
+    /// <summary>The filmstrip batch action bar's "Apply Adjustments to Selected" button — opens
+    /// Crop Review on the first selected page in Adjust mode, with the rest of the selection
+    /// passed through so its own Apply-to-Selection command knows the target set. Reuses the
+    /// single-page adjust UI (with its live preview) to define the values, rather than a second
+    /// "pick values blind" surface.</summary>
+    [RelayCommand]
+    private void ApplyAdjustmentsToSelected()
+    {
+        var selectedIds = RecentCaptures.Where(t => t.IsSelected).Select(t => t.JobId).Distinct().ToList();
+        if (selectedIds.Count == 0) return;
+        OpenCropReview(selectedIds[0], selectionForBulkApply: selectedIds, openInAdjustMode: true);
+    }
+
+    /// <summary>The filmstrip batch action bar's "Delete Selected" button — confirms, then
+    /// removes every selected capture the same way the per-thumbnail delete already does
+    /// (mark-superseded via CaptureQueueService, not a hard delete), one at a time so each gets
+    /// its existing derivative-cleanup/page-count/thumbnail-removal handling.</summary>
+    [RelayCommand]
+    private async Task DeleteSelectedAsync(Avalonia.Controls.Window? owner)
+    {
+        var selected = RecentCaptures.Where(t => t.IsSelected).ToList();
+        if (selected.Count == 0) return;
+
+        if (owner != null)
+        {
+            var confirmed = await MicroCapture.UI.Views.ConfirmDialog.AskAsync(owner,
+                $"Delete {selected.Count} selected page{(selected.Count == 1 ? "" : "s")}? This excludes them from processing and export.",
+                "Delete Selected");
+            if (!confirmed) return;
+        }
+
+        foreach (var item in selected)
+        {
+            // DeleteCaptureAsync already removes every sibling thumbnail sharing this JobId
+            // (fixed-frame captures), so re-checking IsSelected per iteration avoids acting on
+            // an item RecentCaptures no longer contains.
+            if (RecentCaptures.Contains(item))
+                await DeleteCaptureAsync(item);
+        }
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(HasSelection));
+    }
+
+    private void OpenCropReview(string jobId, IReadOnlyList<string>? selectionForBulkApply, bool openInAdjustMode = false)
     {
         if (string.IsNullOrEmpty(jobId)) { Console.WriteLine($"[ReviewCrop] JobId is empty"); return; }
         Console.WriteLine($"[ReviewCrop] Opening crop review for {jobId}");
         var cropWindow = new CropReviewWindow();
         Console.WriteLine($"[ReviewCrop] CropReviewWindow created");
-        var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService);
+        var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
+        if (openInAdjustMode) cropReviewViewModel.IsAdjustMode = true;
         // Give the thumbnail immediate feedback on save instead of leaving it looking
         // unchanged for the ~1s the background worker takes to actually pick the job back up.
         cropReviewViewModel.Saved += (_, _) =>
         {
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
             if (thumbnail != null) thumbnail.Status = "Reprocessing…";
+            ClearSelection();
         };
         cropWindow.DataContext = cropReviewViewModel;
         Console.WriteLine($"[ReviewCrop] CropReviewViewModel set as DataContext");
@@ -1185,6 +1270,11 @@ public partial class ThumbnailItem : ObservableObject
     // Non-null only for fixed-frame captures — colors the thumbnail's border to match its
     // on-canvas frame. Null for ordinary captures, which keep the default neutral border.
     [ObservableProperty] private Avalonia.Media.IBrush? _borderColor;
+
+    // Multi-select state for the batch action bar (Delete Selected / Apply Adjustments to
+    // Selected) — toggled via ctrl/shift-click, independent of the plain-click "open Crop
+    // Review" action.
+    [ObservableProperty] private bool _isSelected;
 }
 
 public partial class CameraControlItem : ObservableObject

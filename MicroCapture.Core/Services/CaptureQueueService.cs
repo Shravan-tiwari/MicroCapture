@@ -65,6 +65,15 @@ public class CaptureQueueService
         EnsureCameraCalibrationsTable();
         EnsureColumn("Batches", "CameraCalibrationId", "TEXT NULL");
         EnsureColumn("Batches", "UseAltBoundaryPipeline", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "HasManualAdjustments", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "RotationDegrees", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "FlipHorizontal", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "FlipVertical", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "Brightness", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "Contrast", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "Saturation", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "Sharpness", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn("CaptureJobs", "WhiteBalance", "REAL NOT NULL DEFAULT 0");
     }
 
     private void EnsureCameraCalibrationsTable()

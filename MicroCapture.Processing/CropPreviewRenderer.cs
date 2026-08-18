@@ -111,5 +111,29 @@ public sealed class CropPreviewRenderer : IDisposable
         }
     }
 
+    /// <summary>Same as <see cref="RenderPreview"/>, but also applies the manual adjustment
+    /// stack (rotate/flip/tone/color/sharpen) — used by Crop Review's Adjust mode so its live
+    /// preview reflects both the crop and the in-progress adjustment edit, via the exact same
+    /// <see cref="ImageProcessor.ApplyManualAdjustments"/> the real pipeline uses.</summary>
+    public byte[]? RenderPreviewWithAdjustments(CropPoint[] corners, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
+    {
+        if (corners.Length != 4) return null;
+        try
+        {
+            var scaled = new Point2f[4];
+            for (var i = 0; i < 4; i++)
+                scaled[i] = new Point2f((float)(corners[i].X * _scale), (float)(corners[i].Y * _scale));
+
+            using var warped = ImageProcessor.WarpQuad(_downscaled, scaled);
+            using var adjusted = ImageProcessor.ApplyManualAdjustments(warped, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+            Cv2.ImEncode(".jpg", adjusted, out var bytes);
+            return bytes;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public void Dispose() => _downscaled.Dispose();
 }
