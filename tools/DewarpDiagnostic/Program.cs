@@ -31,6 +31,10 @@ switch (args[0])
         return RunSpread(args);
     case "boundary":
         return RunBoundary(args);
+    case "altboundary":
+        return RunAltBoundary(args);
+    case "altflatten":
+        return RunAltFlatten(args);
     case "corners":
         return RunCorners(args);
     case "rotfield":
@@ -56,6 +60,8 @@ static void PrintUsage()
     Console.WriteLine("  dewarp-lines <cropped-page-image>");
     Console.WriteLine("  spread <image-or-dir>");
     Console.WriteLine("  boundary <image-or-dir>");
+    Console.WriteLine("  altboundary <image-or-dir> [--out <out-dir>]");
+    Console.WriteLine("  altflatten <image-or-dir> <out-dir>");
     Console.WriteLine("  corners <image-or-dir>");
     Console.WriteLine("  rotfield <image-or-dir>");
     Console.WriteLine("  points <image> [pointsPerEdge]");
@@ -246,6 +252,95 @@ static int RunBoundary(string[] args)
         // through the same helper the UI uses to display a TIFF ImageProcessor itself wrote.
         var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
         Console.WriteLine(processor.DebugBoundaryDetection(bytes));
+    }
+    return 0;
+}
+
+static int RunAltBoundary(string[] args)
+{
+    if (args.Length < 2) { PrintUsage(); return 1; }
+    var target = args[1];
+    var outIdx = Array.IndexOf(args, "--out");
+    var outDir = outIdx >= 0 && args.Length > outIdx + 1 ? args[outIdx + 1] : null;
+    if (outDir != null) Directory.CreateDirectory(outDir);
+
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        // Cv2.ImDecode (which the Alt* diagnostics use) doesn't handle TIFF — bridge through
+        // the same helper the UI uses to display a TIFF ImageProcessor itself wrote.
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        Console.WriteLine(processor.DebugAltBoundaryDetection(bytes));
+
+        if (outDir != null)
+        {
+            var overlay = processor.AltBoundaryOverlay(bytes);
+            var outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(path) + "_altboundary.png");
+            File.WriteAllBytes(outPath, overlay);
+            Console.WriteLine($"  -> {outPath}");
+        }
+    }
+    return 0;
+}
+
+static int RunAltFlatten(string[] args)
+{
+    if (args.Length < 3) { PrintUsage(); return 1; }
+    var target = args[1];
+    var outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        try
+        {
+            var (leftPng, rightPng, report) = processor.DebugAltFlatten(bytes);
+            Console.WriteLine(report);
+
+            var baseName = Path.GetFileNameWithoutExtension(path);
+            var leftPath = Path.Combine(outDir, baseName + "_altflat_left.png");
+            var rightPath = Path.Combine(outDir, baseName + "_altflat_right.png");
+            File.WriteAllBytes(leftPath, leftPng);
+            File.WriteAllBytes(rightPath, rightPng);
+            Console.WriteLine($"  -> {leftPath}");
+            Console.WriteLine($"  -> {rightPath}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"  FAILED: {ex.Message}");
+        }
     }
     return 0;
 }

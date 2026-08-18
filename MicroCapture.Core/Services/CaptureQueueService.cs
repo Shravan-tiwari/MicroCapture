@@ -64,6 +64,7 @@ public class CaptureQueueService
         // same way EnsureColumn explicitly ALTERs existing tables.
         EnsureCameraCalibrationsTable();
         EnsureColumn("Batches", "CameraCalibrationId", "TEXT NULL");
+        EnsureColumn("Batches", "UseAltBoundaryPipeline", "INTEGER NOT NULL DEFAULT 0");
     }
 
     private void EnsureCameraCalibrationsTable()

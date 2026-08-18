@@ -16,6 +16,15 @@ public class Batch
     
     public bool SplitBookPages { get; set; } = false;
 
+    // Selects the alternative boundary-detection/split/flatten pipeline (ported from
+    // tools/phaseA-prototype/boundary_prototype.ipynb — continuity-walk edge tracing + gutter
+    // notch detection + arc-length flatten) instead of the original contour/confidence-based
+    // pipeline. Runs its own split-vs-single-page decision (see ImageProcessor.Process), so it
+    // supersedes SplitBookPages when on. Also applies to fixed-frame captures (see
+    // ImageProcessor.ProcessFixedFrames), where it replaces the per-frame axis-aligned crop with
+    // real boundary detection + flatten within the calibrated rectangle.
+    public bool UseAltBoundaryPipeline { get; set; } = false;
+
     // Fixed-frame capture: one or more operator-calibrated rectangles reused for every
     // capture in the batch, instead of per-shot auto-crop detection. FixedFrames holds
     // "X,Y,Width,Height" rects (in FixedFrameImageWidth/Height's pixel space) joined by
