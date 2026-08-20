@@ -16,14 +16,15 @@ public class Batch
     
     public bool SplitBookPages { get; set; } = false;
 
-    // Selects the alternative boundary-detection/split/flatten pipeline (ported from
-    // tools/phaseA-prototype/boundary_prototype.ipynb — continuity-walk edge tracing + gutter
-    // notch detection + arc-length flatten) instead of the original contour/confidence-based
-    // pipeline. Runs its own split-vs-single-page decision (see ImageProcessor.Process), so it
-    // supersedes SplitBookPages when on. Also applies to fixed-frame captures (see
-    // ImageProcessor.ProcessFixedFrames), where it replaces the per-frame axis-aligned crop with
-    // real boundary detection + flatten within the calibrated rectangle.
-    public bool UseAltBoundaryPipeline { get; set; } = false;
+    // NOTE: this batch used to carry a UseAltBoundaryPipeline opt-in toggle, selecting between
+    // the original contour/confidence-based pipeline and an alternative ported from
+    // tools/phaseA-prototype/boundary_prototype.ipynb. That toggle is gone — the notebook-ported
+    // pipeline (now with a true Method 4 side-edge detector, not just the notebook's diagnostic-
+    // only Cell 6A baseline) is the ONLY automatic boundary/dewarp path ImageProcessor.Process/
+    // ProcessFixedFrames run; there is no longer a choice to make. The underlying DB column
+    // (Batches.UseAltBoundaryPipeline) is left in place on existing databases as a harmless
+    // orphaned column — see CaptureQueueService.EnsureCompatibleSchema — rather than migrated
+    // away, since no code reads or writes it anymore.
 
     // Fixed-frame capture: one or more operator-calibrated rectangles reused for every
     // capture in the batch, instead of per-shot auto-crop detection. FixedFrames holds
@@ -36,9 +37,9 @@ public class Batch
 
     public string PreferredExportFormat { get; set; } = "PDF";
 
-    // Written into every processed TIFF's resolution tag (dots per inch) for this batch.
-    // This is metadata only — it documents intended print/archival resolution, it does not
-    // change the pixel dimensions the camera actually captured.
+    // Written into every processed TIFF's resolution tag (dots per inch) for this batch, AND
+    // used to resample pixel dimensions — see ImageProcessor.BaselineDpi/ResizeForDpi for the
+    // baseline/scaling convention (150 = native captured size, higher values upsample).
     public int Dpi { get; set; } = 300;
 
     // Corrects spine-curvature distortion on bound-book captures (the page bulging away from
@@ -51,6 +52,13 @@ public class Batch
     // that happens to look bitonal) — smaller files and crisper OCR input, at the cost of
     // losing color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
     public bool BinarizeEnabled { get; set; } = false;
+
+    // Suppresses show-through from text/images printed on the reverse side of a thin page
+    // bleeding into the scan. Local-background-relative depth thresholding — confirmed NOT
+    // effective on colored-image bleedthrough (only grayscale/simple text show-through), so
+    // this is an opt-in per-batch toggle, not on by default. See
+    // ImageProcessor.TryRemoveBleedthrough.
+    public bool BleedthroughEnabled { get; set; } = false;
 
     // Snapshots whichever CameraCalibration was active (see CameraCalibration.IsActive) at
     // Start Batch — so recalibrating the rig mid-batch, or later, can never retroactively

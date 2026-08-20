@@ -4,11 +4,16 @@ using OpenCvSharp;
 
 namespace MicroCapture.Processing;
 
-/// <summary>Alternative boundary-detection/split/flatten pipeline, ported from the
-/// diagnostic-only Python/Jupyter prototype at tools/phaseA-prototype/boundary_prototype.ipynb
-/// (never wired into production there). Selected per-batch via a toggle (see
-/// Batch.UseAltBoundaryPipeline) alongside the original pipeline in ImageProcessor.cs — not a
-/// replacement, so behavior for batches that don't opt in is unaffected.
+/// <summary>Canonical boundary-detection/split/flatten pipeline, ported from the research
+/// prototype at tools/phaseA-prototype/boundary_prototype.ipynb (Method 4 side-edge detection +
+/// cubic-bow single-pass remap — the product owner's designated mandatory reference
+/// implementation). This is now the ONLY automatic (non-manual-override) boundary/dewarp path
+/// ImageProcessor.Process/ProcessFixedFrames run — there used to be a per-batch opt-in toggle
+/// (Batch.UseAltBoundaryPipeline) selecting between this and the original contour/text-line-blob
+/// pipeline in ImageProcessor.cs; that toggle is gone, this file's pipeline replaced it as the
+/// default, and the old pipeline's TryAutoCrop/TryDeskew/TryApplyDewarp/TryApplyLineMesh chain now
+/// only runs for the manual-crop-override path (where the operator's own drawn quad already IS
+/// the boundary, so Method 4 has nothing to auto-detect).
 ///
 /// Core idea, shared by every method in this file: instead of finding a document's boundary as
 /// a single 4-corner quad from a closed contour (the original pipeline's approach), trace each
@@ -584,6 +589,713 @@ public partial class ImageProcessor
         return slice.Length % 2 == 0 ? (slice[mid - 1] + slice[mid]) / 2.0 : slice[mid];
     }
 
+    // ============================================================================
+    // METHOD 4: Gx sign-change count + gutter-anchored span + RANSAC-guided
+    // continuity walk + finger bridging + strength/straightness widen-retry.
+    //
+    // Port of the notebook's Method 4 cells (search boundary_prototype.ipynb for
+    // "Method 4: Gx sign-change count per column" and "signchange_m4"). This is the
+    // notebook's own designated side-boundary detector for the real pipeline — Cell
+    // 6A (AltTraceSideEdge/AltFindBgPageTransition above) is explicitly marked
+    // "diagnostic/baseline only" in the notebook's own comments and is NOT used by
+    // this method or by the flatten pipeline once Method 4 is wired in (see
+    // AltDetectSpreadBoundary/AltFlattenSinglePage below, which now call
+    // AltTraceSideEdgeMethod4 instead of AltTraceSideEdge).
+    //
+    // Method 4 replaces Cell 6A's brightness-Otsu book-span + plain-seeded walk with:
+    //   1. A per-column count of how many times Gx changes sign within the page's
+    //      already-known vertical extent (top/bottom trace) — text produces frequent
+    //      sign alternation, flat background almost none. Purely structural, immune
+    //      to absolute brightness/exposure (unlike Cell 6A's brightness-Otsu split).
+    //   2. Otsu-split that count into a page/not-page mask, then find the book's
+    //      x-span by walking OUTWARD FROM THE GUTTER (not "widest run wins" — a
+    //      dense interior blob, e.g. a photo or dense text block, can out-mass the
+    //      real span otherwise).
+    //   3. A RANSAC-guided continuity walk (reusing collect_ransac_candidates/
+    //      ransac_line_fit's C# ports below and the same trace_side_edge machinery
+    //      AltTraceSideEdge implements) seeded from that span, with a diagram/
+    //      line-art exclusion pass (Hough-detected near-vertical line segments are
+    //      excluded from the RANSAC candidate set — a flowchart/box border is long,
+    //      straight, and high-contrast, exactly what RANSAC treats as trustworthy,
+    //      but sits inside the page, not at the true margin).
+    //   4. The same finger-run bridging technique as the top/bottom trace, applied
+    //      to the vertical walk.
+    //   5. A widen-and-retry loop: each side must be BOTH straight (low residual
+    //      std against its own best-fit line) AND strong (median |Gx| at its own
+    //      accepted points, relative to whichever side is currently stronger) — a
+    //      confidently-wrong trace (e.g. locked onto an interior illustration
+    //      border) can be straight and symmetric while still not being the true
+    //      page edge, which strength alone catches. A side that fails widens its
+    //      OWN search margin (not both sides) and re-runs RANSAC+walk+bridge, up to
+    //      the image edge, where it stops and flags rather than looping forever.
+    // ============================================================================
+
+    /// <summary>Robust straight-line fit x = m*y + b through (row, col) points via RANSAC —
+    /// many random 2-point line hypotheses, keeping the one with the most inliers, then a
+    /// least-squares refit through just those inliers. Port of the notebook's
+    /// `ransac_line_fit`. Returns null slope/intercept if there are too few points or the best
+    /// hypothesis has fewer than 2 inliers (mirrors the notebook's `(None, None)` return).
+    /// Deterministic (fixed seed, matching the notebook's own `seed=0` default) so a page's
+    /// detected boundary doesn't jitter between runs of the same photo.</summary>
+    public readonly record struct RansacLineResult(double? Slope, double? Intercept);
+
+    public static RansacLineResult RansacLineFit((double Row, double Col)[] points, int nIter = 300, double inlierThresh = 4.0, int seed = 0)
+    {
+        if (points.Length < 2) return new RansacLineResult(null, null);
+        var rng = new Random(seed);
+
+        bool[]? bestInliers = null;
+        var bestCount = -1;
+
+        for (var iter = 0; iter < nIter; iter++)
+        {
+            var i1 = rng.Next(points.Length);
+            int i2;
+            do { i2 = rng.Next(points.Length); } while (i2 == i1 && points.Length > 1);
+            var (y1, x1) = points[i1];
+            var (y2, x2) = points[i2];
+            if (y1 == y2) continue;
+
+            var m = (x2 - x1) / (y2 - y1);
+            var b = x1 - m * y1;
+
+            var inliers = new bool[points.Length];
+            var count = 0;
+            for (var i = 0; i < points.Length; i++)
+            {
+                var predX = m * points[i].Row + b;
+                if (Math.Abs(points[i].Col - predX) < inlierThresh) { inliers[i] = true; count++; }
+            }
+            if (count > bestCount) { bestCount = count; bestInliers = inliers; }
+        }
+
+        if (bestInliers == null || bestCount < 2) return new RansacLineResult(null, null);
+
+        // Least-squares refit through inliers only (matches np.polyfit(inlier_ys, inlier_xs, 1)).
+        double sumY = 0, sumX = 0, sumYY = 0, sumYX = 0;
+        var n = 0;
+        for (var i = 0; i < points.Length; i++)
+        {
+            if (!bestInliers[i]) continue;
+            var (y, x) = points[i];
+            sumY += y; sumX += x; sumYY += y * y; sumYX += y * x;
+            n++;
+        }
+        var denom = n * sumYY - sumY * sumY;
+        if (Math.Abs(denom) < 1e-12) return new RansacLineResult(null, null);
+        var slope = (n * sumYX - sumY * sumX) / denom;
+        var intercept = (sumX - slope * sumY) / n;
+        return new RansacLineResult(slope, intercept);
+    }
+
+    /// <summary>Strongest |Gx| peak per sampled row within [colLo, colHi), one candidate every
+    /// <paramref name="step"/> rows. Port of the notebook's `collect_ransac_candidates`
+    /// (`collect_ransac_candidates_excluding` when <paramref name="excludeMask"/> is supplied —
+    /// same function, the notebook just adds one parameter, so this is that combined form; pass
+    /// a null/all-false mask for the plain Cell 6A behavior).</summary>
+    public static (double Row, double Col)[] CollectRansacCandidates(Mat gx, int rowLo, int rowHi, int colLo, int colHi, bool[]? excludeMask = null, int excludeMaskRowOffset = 0, int step = 3)
+    {
+        var w = gx.Cols;
+        gx.GetArray(out float[] gxFlat);
+        var points = new List<(double, double)>();
+        for (var y = rowLo; y < rowHi; y += step)
+        {
+            if (excludeMask != null)
+            {
+                var idx = y - excludeMaskRowOffset;
+                if (idx >= 0 && idx < excludeMask.Length && excludeMask[idx]) continue;
+            }
+            if (colHi <= colLo) continue;
+            var best = colLo;
+            var bestVal = float.MinValue;
+            for (var c = colLo; c < colHi; c++)
+            {
+                var v = Math.Abs(gxFlat[y * w + c]);
+                if (v > bestVal) { bestVal = v; best = c; }
+            }
+            points.Add((y, best));
+        }
+        return points.ToArray();
+    }
+
+    /// <summary>Marks rows (relative to <paramref name="rowLo"/>) that intersect a long,
+    /// near-vertical straight line segment detected via Hough transform within
+    /// [<paramref name="colLo"/>, <paramref name="colHi"/>) — i.e. rows likely to contain
+    /// diagram/line-art edges (a flowchart box border, a printed rule) rather than the true page
+    /// margin. Port of the notebook's `detect_diagram_line_mask`. A diagram's box edge is long,
+    /// straight, and high-contrast — exactly what RANSAC treats as a trustworthy signal — but it
+    /// sits well inside the page, not at the true outer edge; excluding these rows from the
+    /// RANSAC candidate set (see <see cref="AltTraceSideEdgeMethod4"/>) keeps a mostly-blank
+    /// page's sparse true-edge signal from being out-voted by a diagram's self-consistent
+    /// interior line.</summary>
+    public static bool[] DetectDiagramLineMask(Mat gray, int rowLo, int rowHi, int colLo, int colHi, double minLineLengthFrac = 0.05)
+    {
+        var n = rowHi - rowLo;
+        var mask = new bool[Math.Max(0, n)];
+        if (n <= 0 || colHi <= colLo) return mask;
+
+        using var band = new Mat(gray, new Rect(colLo, rowLo, colHi - colLo, rowHi - rowLo));
+        using var edges = new Mat();
+        Cv2.Canny(band, edges, 50, 150);
+        var minLen = Math.Max(15, (int)(n * minLineLengthFrac));
+
+        var lines = Cv2.HoughLinesP(edges, 1, Math.PI / 180, threshold: 40, minLineLength: minLen, maxLineGap: 5);
+        foreach (var line in lines)
+        {
+            var x1 = line.P1.X; var y1 = line.P1.Y; var x2 = line.P2.X; var y2 = line.P2.Y;
+            var length = Math.Sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+            if (length < minLen) continue;
+            if (Math.Abs(x2 - x1) > Math.Abs(y2 - y1) * 0.3) continue; // not near-vertical enough
+            var yLo = Math.Max(0, Math.Min(y1, y2));
+            var yHi = Math.Min(n, Math.Max(y1, y2) + 1);
+            for (var y = yLo; y < yHi; y++) mask[y] = true;
+        }
+        return mask;
+    }
+
+    /// <summary>Per-column count of Gx sign changes within the page's already-known vertical
+    /// extent (the top/bottom trace, trimmed 10% top/bottom to avoid fingers/page-edge
+    /// artifacts) — text produces frequent dark&lt;-&gt;light alternation, flat background
+    /// almost none. Port of the notebook's Method 4 profile computation (search
+    /// "signchange_m4"). Purely structural (counts sign flips, not gradient magnitude), so it's
+    /// immune to absolute brightness/exposure the way Cell 6A's median-brightness approach is
+    /// not — confirmed in the notebook's own comments as the reason Method 4 replaces Cell 6A's
+    /// approach (a dark-toned photo on the page reads as "background" to a pure brightness
+    /// split, but its sign-change count still reads as "page" here).</summary>
+    public readonly record struct SignChangeProfile(float[] SignChanges, bool[] Valid);
+
+    public static SignChangeProfile ComputeSignChangeProfile(Mat gx, double[] topY, double[] botY)
+    {
+        var w = gx.Cols;
+        var h = gx.Rows;
+        gx.GetArray(out float[] gxFlat);
+
+        var signChanges = new float[w];
+        var valid = new bool[w];
+
+        for (var x = 0; x < w; x++)
+        {
+            var top = Math.Clamp((int)Math.Round(topY[x]), 0, h - 1);
+            var bot = Math.Clamp((int)Math.Round(botY[x]), 0, h);
+            if (bot <= top + 10) continue;
+            var hgt = bot - top;
+            var trim = Math.Max(3, (int)(hgt * 0.10));
+            var y1 = top + trim;
+            var y2 = bot - trim;
+            if (y2 <= y1) continue;
+
+            var count = 0;
+            var haveSign = false;
+            var prevSign = 0;
+            for (var y = y1; y < y2; y++)
+            {
+                var v = gxFlat[y * w + x];
+                var sign = v > 0 ? 1 : v < 0 ? -1 : 0;
+                if (sign == 0) continue; // np.sign(...)==0 samples are dropped before np.diff
+                if (haveSign && sign != prevSign) count++;
+                prevSign = sign;
+                haveSign = true;
+            }
+            // Notebook requires >= 2 nonzero-sign samples to compute np.diff at all.
+            var nonzeroCount = 0;
+            for (var y = y1; y < y2; y++) if (gxFlat[y * w + x] != 0) nonzeroCount++;
+            if (nonzeroCount < 2) continue;
+
+            signChanges[x] = count;
+            valid[x] = hgt > 20;
+        }
+
+        return new SignChangeProfile(signChanges, valid);
+    }
+
+    /// <summary>Otsu threshold on the valid portion of an arbitrary scalar per-column profile —
+    /// works on any profile, not just brightness (Method 4 applies this to the sign-change
+    /// count). Port of the notebook's `otsu_split`: scales the valid values into 0-255,
+    /// computes cv2's Otsu threshold on that, then maps it back to the profile's own scale.</summary>
+    public static double OtsuSplit(float[] profile, bool[] validMask)
+    {
+        var valid = new List<float>();
+        for (var i = 0; i < profile.Length; i++) if (validMask[i]) valid.Add(profile[i]);
+        if (valid.Count < 20) throw new InvalidOperationException("Not enough valid columns for Otsu split.");
+
+        var lo = valid.Min();
+        var hi = valid.Max();
+        if (hi <= lo) throw new InvalidOperationException("Profile has no dynamic range to split.");
+
+        using var scaledMat = new Mat(1, valid.Count, MatType.CV_8UC1);
+        var scaledBytes = new byte[valid.Count];
+        for (var i = 0; i < valid.Count; i++)
+            scaledBytes[i] = (byte)Math.Clamp((valid[i] - lo) / (hi - lo) * 255.0, 0, 255);
+        scaledMat.SetArray(scaledBytes);
+
+        using var dst = new Mat();
+        var tU8 = Cv2.Threshold(scaledMat, dst, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+        return lo + (tU8 / 255.0) * (hi - lo);
+    }
+
+    /// <summary>Rolling-majority cleanup of a 1D boolean mask (same technique as Cell 6A step 7
+    /// / <see cref="OtsuSplit"/>'s caller uses for the brightness mask) — a sample survives only
+    /// if at least half of a <c>max(5, w*0.01)</c>-wide (forced odd) window centered on it is
+    /// also set. Port of the notebook's `clean_mask_1d`.</summary>
+    public static bool[] CleanMask1D(bool[] mask, int w)
+    {
+        var kernelWidth = Math.Max(5, (int)(w * 0.01));
+        if (kernelWidth % 2 == 0) kernelWidth++;
+        var pad = kernelWidth / 2;
+
+        int At(int i) => mask[Math.Clamp(i, 0, mask.Length - 1)] ? 1 : 0;
+
+        var result = new bool[w];
+        for (var i = 0; i < w; i++)
+        {
+            var sum = 0;
+            for (var k = -pad; k <= pad; k++) sum += At(i + k);
+            result[i] = sum >= kernelWidth * 0.5;
+        }
+        return result;
+    }
+
+    /// <summary>Finds the book's x-span [lo, hi) from a cleaned page/not-page mask by walking
+    /// OUTWARD FROM THE GUTTER rather than picking whichever contiguous run is widest. Port of
+    /// the notebook's `find_book_span`. A "widest run wins" rule can land on a high-activity
+    /// interior blob (e.g. a photo or dense text block) that has nothing to do with either outer
+    /// edge — the notebook's own comment documents this as a confirmed failure mode on Method
+    /// 4's own sign-change profile. Since the gutter physically has to sit strictly between the
+    /// two true outer edges, anchoring the search there and reading off each side's run's OUTER
+    /// end is guaranteed to reach the real edges as long as the mask is correct near the gutter.
+    /// Returns null if no substantial run exists (mirrors the notebook's own None-return case);
+    /// falls back to widest-run if the gutter isn't bracketed by a run on both sides (mask
+    /// failure near the spine) or if gutterX is null.</summary>
+    public static (int Lo, int Hi)? FindBookSpan(bool[] mask, int w, int? gutterX)
+    {
+        var runs = new List<(int A, int B)>();
+        var inside = false;
+        var start = 0;
+        for (var x = 0; x < w; x++)
+        {
+            if (mask[x] && !inside) { start = x; inside = true; }
+            else if (!mask[x] && inside) { runs.Add((start, x)); inside = false; }
+        }
+        if (inside) runs.Add((start, w));
+
+        var minRunWidth = Math.Max(20, (int)(w * 0.05));
+        runs = runs.Where(r => r.B - r.A >= minRunWidth).ToList();
+        if (runs.Count == 0) return null;
+
+        runs = runs.OrderBy(r => r.A).ToList();
+        var mergeGap = Math.Max(10, (int)(w * 0.03));
+        var merged = new List<(int A, int B)>();
+        foreach (var r in runs)
+        {
+            if (merged.Count == 0) { merged.Add(r); continue; }
+            var (prevA, prevB) = merged[^1];
+            if (r.A - prevB <= mergeGap) merged[^1] = (prevA, Math.Max(prevB, r.B));
+            else merged.Add(r);
+        }
+
+        if (gutterX == null) return merged.OrderByDescending(r => r.B - r.A).First();
+
+        var gx = Math.Clamp(gutterX.Value, 0, w - 1);
+        var leftRuns = merged.Where(r => r.A <= gx).ToList();
+        var rightRuns = merged.Where(r => r.B > gx).ToList();
+        if (leftRuns.Count == 0 || rightRuns.Count == 0)
+            return merged.OrderByDescending(r => r.B - r.A).First();
+
+        var leftRun = leftRuns.OrderByDescending(r => r.B).First();
+        var rightRun = rightRuns.OrderBy(r => r.A).First();
+        return (leftRun.A, rightRun.B);
+    }
+
+    /// <summary>Result of <see cref="AltTraceSideEdgeMethod4"/>: the final (bridged) trace,
+    /// diagnostics for how many rows were bridged, and whether the widen-retry loop ever
+    /// declared this side unreliable (never found a strong/straight fit within the searchable
+    /// window) — surfaced so a caller/diagnostic can flag it, mirroring the notebook's own
+    /// WARNING print.</summary>
+    public readonly record struct Method4SideTrace(double[] Columns, int RowLo, int BridgedCount, bool Unreliable, double FinalMarginPx);
+
+    /// <summary>Method 4's own vertical-trace finger-bridging — identical technique to
+    /// <see cref="AltRejectAndBridgeLowConfidenceRuns"/> (Cell 4D) but applied to a per-row
+    /// column trace instead of a per-column row trace. Kept as a separate small helper (rather
+    /// than reusing the top/bottom version) because indexing is transposed and the notebook
+    /// itself keeps `bridge_finger_runs` as its own local function for exactly this reason.</summary>
+    private static (int[] Bridged, int BridgedCount, bool[] Good) BridgeFingerRunsVertical(int[] edgeX, Mat gx, int rowLo, double lowConfidenceFraction)
+    {
+        var w = gx.Cols;
+        gx.GetArray(out float[] gxFlat);
+        var n = edgeX.Length;
+
+        var peakStrength = new double[n];
+        for (var i = 0; i < n; i++) peakStrength[i] = Math.Abs(gxFlat[(rowLo + i) * w + edgeX[i]]);
+        var medianStrength = Median(Array.ConvertAll(peakStrength, v => (float)v), 0, n);
+        var confidenceThreshold = medianStrength * lowConfidenceFraction;
+        var good = new bool[n];
+        for (var i = 0; i < n; i++) good[i] = peakStrength[i] > confidenceThreshold;
+
+        var bridged = (int[])edgeX.Clone();
+        var bridgedCount = 0;
+        var idx = 0;
+        while (idx < n)
+        {
+            if (good[idx]) { idx++; continue; }
+            var runStart = idx;
+            while (idx < n && !good[idx]) idx++;
+            var runEnd = idx;
+            bridgedCount += runEnd - runStart;
+
+            var loVal = runStart > 0 ? edgeX[runStart - 1] : edgeX[Math.Min(runEnd, n - 1)];
+            var hiVal = runEnd < n ? edgeX[runEnd] : edgeX[Math.Max(runStart - 1, 0)];
+            var runLen = runEnd - runStart;
+            for (var k = 0; k < runLen; k++)
+            {
+                var t = (k + 1.0) / (runLen + 1.0);
+                bridged[runStart + k] = (int)Math.Round(loVal + t * (hiVal - loVal));
+            }
+        }
+        return (bridged, bridgedCount, good);
+    }
+
+    /// <summary>Std-dev of a trace's deviation from its own best-fit line — low = straight/clean
+    /// trace, high = jittery/wandering. Port of the notebook's
+    /// `edge_straightness_residual_std`.</summary>
+    private static double EdgeStraightnessResidualStd(double[] edgeX, int rowLo)
+    {
+        var n = edgeX.Length;
+        var pts = new (double Row, double Col)[n];
+        for (var i = 0; i < n; i++) pts[i] = (rowLo + i, edgeX[i]);
+        var fit = RansacLineFitExact(pts);
+        var sumSq = 0.0;
+        for (var i = 0; i < n; i++)
+        {
+            var pred = fit.Slope * (rowLo + i) + fit.Intercept;
+            var residual = edgeX[i] - pred;
+            sumSq += residual * residual;
+        }
+        return Math.Sqrt(sumSq / n);
+    }
+
+    /// <summary>Plain (non-robust) least-squares line fit — port of `np.polyfit(ys, xs, 1)`,
+    /// used only by <see cref="EdgeStraightnessResidualStd"/> to compute a trace's OWN
+    /// best-fit line (not a robust/outlier-rejecting fit — the notebook doesn't use RANSAC
+    /// here either, since this measures the trace's own internal straightness, not fitting
+    /// against noisy per-row candidates).</summary>
+    private static (double Slope, double Intercept) RansacLineFitExact((double Row, double Col)[] points)
+    {
+        double sumY = 0, sumX = 0, sumYY = 0, sumYX = 0;
+        var n = points.Length;
+        foreach (var (y, x) in points) { sumY += y; sumX += x; sumYY += y * y; sumYX += y * x; }
+        var denom = n * sumYY - sumY * sumY;
+        if (Math.Abs(denom) < 1e-12) return (0, points.Length > 0 ? points[0].Col : 0);
+        var slope = (n * sumYX - sumY * sumX) / denom;
+        var intercept = (sumX - slope * sumY) / n;
+        return (slope, intercept);
+    }
+
+    private static double GutterDistance(double[] edgeX, double gutterX)
+    {
+        var vals = new double[edgeX.Length];
+        for (var i = 0; i < edgeX.Length; i++) vals[i] = Math.Abs(edgeX[i] - gutterX);
+        Array.Sort(vals);
+        var mid = vals.Length / 2;
+        return vals.Length % 2 == 0 ? (vals[mid - 1] + vals[mid]) / 2.0 : vals[mid];
+    }
+
+    private static double EdgeStrengthScore(double[] edgeX, int rowLo, Mat gx)
+    {
+        var w = gx.Cols;
+        gx.GetArray(out float[] gxFlat);
+        var vals = new double[edgeX.Length];
+        for (var i = 0; i < edgeX.Length; i++)
+            vals[i] = Math.Abs(gxFlat[(rowLo + i) * w + Math.Clamp((int)Math.Round(edgeX[i]), 0, w - 1)]);
+        Array.Sort(vals);
+        var mid = vals.Length / 2;
+        return vals.Length % 2 == 0 ? (vals[mid - 1] + vals[mid]) / 2.0 : vals[mid];
+    }
+
+    /// <summary>Symmetry ratio threshold — sides whose gutter distance differs by more than this
+    /// factor are suspect. Ported as-is from the notebook (`SYMMETRY_RATIO_THRESHOLD = 1.3`).</summary>
+    public double Method4SymmetryRatioThreshold { get; set; } = 1.3;
+    /// <summary>Straightness residual std (px) above which a trace is considered jittery/
+    /// wandering. Ported as-is from the notebook (`JITTER_THRESHOLD_PX = 3.0`).</summary>
+    public double Method4JitterThresholdPx { get; set; } = 3.0;
+    /// <summary>Per-retry search-margin growth factor. Ported as-is from the notebook
+    /// (`RETRY_MARGIN_STEP_MULT = 2`).</summary>
+    public double Method4RetryMarginStepMult { get; set; } = 2.0;
+    /// <summary>Minimum fraction of the stronger side's edge strength a side must reach to be
+    /// considered "strong." Ported as-is from the notebook (`STRENGTH_RATIO_THRESHOLD = 0.5`).</summary>
+    public double Method4StrengthRatioThreshold { get; set; } = 0.5;
+
+    /// <summary>One RANSAC-guided walk + finger-bridge for one side of one page, at a given
+    /// search margin around <paramref name="bookX"/> — the unit of work the widen-retry loop
+    /// repeats with a larger margin. Port of the notebook's `rerun_side_with_margin` (which
+    /// itself duplicates the LEFT/RIGHT block's own first-pass logic — this helper is used for
+    /// BOTH the first pass and every retry, unlike the notebook which inlines the first pass
+    /// separately; the math is identical, so sharing one implementation here is a faithful
+    /// simplification, not a behavior change).</summary>
+    private (int[] Raw, double? GuideM, double? GuideB) RunSideWalk(Mat gray, Mat gx, int rowTop, int rowBot, int bookX, int margin, int w)
+    {
+        var ransacRowLo = rowTop + (int)((rowBot - rowTop) * 0.15);
+        var ransacRowHi = rowTop + (int)((rowBot - rowTop) * 0.85);
+        var colLo = Math.Max(0, bookX - margin);
+        var colHi = Math.Min(w, bookX + margin);
+
+        var diagramMask = DetectDiagramLineMask(gray, rowTop, rowBot, colLo, colHi);
+        // diagramMask is indexed relative to rowTop (length rowBot-rowTop); the RANSAC sampling
+        // range [ransacRowLo, ransacRowHi) is a sub-range of that — slice with the same offset
+        // convention CollectRansacCandidates expects (excludeMaskRowOffset = rowTop).
+        var pts = CollectRansacCandidates(gx, ransacRowLo, ransacRowHi, colLo, colHi, diagramMask, rowTop);
+        var guide = RansacLineFit(pts, nIter: 1000, inlierThresh: 2.0);
+
+        var seedX = bookX;
+        if (guide.Slope is { } gm && guide.Intercept is { } gb)
+        {
+            var seedRow = (rowTop + rowBot) / 2;
+            seedX = (int)Math.Round(gm * seedRow + gb);
+            seedX = Math.Clamp(seedX, bookX - margin, bookX + margin - 1);
+        }
+
+        var raw = TraceSideEdgeGx(gx, rowTop, rowBot, seedX, colLo, colHi, guide.Slope, guide.Intercept);
+        return (raw, guide.Slope, guide.Intercept);
+    }
+
+    /// <summary>The continuity-constrained |Gx| walk itself (notebook's `trace_side_edge`),
+    /// shared by every Method 4 pass (first pass and every widen-retry). Distinct from
+    /// <see cref="AltTraceSideEdge"/> (Cell 6A's own walk): this version takes an explicit RANSAC
+    /// guide line and pulls the search window back toward it when the previous step's accepted
+    /// column drifts more than <paramref name="guideTolerance"/> px away — Cell 6A's walk has no
+    /// guide-line parameter at all. Returns one column per row across [rowTop, rowBot).</summary>
+    private static int[] TraceSideEdgeGx(Mat gx, int rowTop, int rowBot, int seedX, int colLo, int colHi, double? guideM, double? guideB, int maxStep = 6, double guideTolerance = 15)
+    {
+        var w = gx.Cols;
+        gx.GetArray(out float[] gxFlat);
+        var n = rowBot - rowTop;
+        var edgeX = new int[n];
+        var seedRow = rowTop + n / 2;
+        seedX = Math.Clamp(seedX, colLo, colHi - 1);
+        edgeX[seedRow - rowTop] = seedX;
+
+        int StepCenter(int prev, int row)
+        {
+            var center = (double)prev;
+            if (guideM is { } gm && guideB is { } gb)
+            {
+                var guideX = gm * row + gb;
+                if (Math.Abs(center - guideX) > guideTolerance)
+                    center = guideX + Math.Clamp(center - guideX, -guideTolerance, guideTolerance);
+            }
+            return (int)Math.Round(center);
+        }
+
+        int ArgMaxWindow(int row, int center)
+        {
+            var lo = Math.Max(colLo, center - maxStep);
+            var hi = Math.Min(colHi, center + maxStep + 1);
+            if (hi <= lo) return center;
+            var best = lo;
+            var bestVal = float.MinValue;
+            for (var c = lo; c < hi; c++)
+            {
+                var v = Math.Abs(gxFlat[row * w + c]);
+                if (v > bestVal) { bestVal = v; best = c; }
+            }
+            return best;
+        }
+
+        var prev = seedX;
+        for (var row = seedRow + 1; row < rowBot; row++)
+        {
+            prev = ArgMaxWindow(row, StepCenter(prev, row));
+            edgeX[row - rowTop] = prev;
+        }
+        prev = seedX;
+        for (var row = seedRow - 1; row >= rowTop; row--)
+        {
+            prev = ArgMaxWindow(row, StepCenter(prev, row));
+            edgeX[row - rowTop] = prev;
+        }
+        return edgeX;
+    }
+
+    /// <summary>Method 4's full side-edge detector for ONE side (left or right) of one page:
+    /// RANSAC-guided walk + finger bridging, then the symmetry+straightness+strength widen-retry
+    /// loop against the OTHER side. Since both sides need each other's strength/distance to
+    /// evaluate symmetry, this is called as a pair from <see cref="AltTraceSideEdgeMethod4Pair"/>
+    /// rather than independently — mirrors the notebook's single shared cell computing both
+    /// sides together rather than two independent function calls.</summary>
+    private (Method4SideTrace Left, Method4SideTrace Right) TraceMethod4Pair(
+        Mat img, Mat gray, Mat gx,
+        int rowTopLeft, int rowBotLeft, int bookXLo,
+        int rowTopRight, int rowBotRight, int bookXHi,
+        int margin, double gutterCol, int w)
+    {
+        var (leftRaw, leftGm, leftGb) = RunSideWalk(gray, gx, rowTopLeft, rowBotLeft, bookXLo, margin, w);
+        var (rightRaw, rightGm, rightGb) = RunSideWalk(gray, gx, rowTopRight, rowBotRight, bookXHi, margin, w);
+
+        var (leftBridged, leftBridgedCount, _) = BridgeFingerRunsVertical(leftRaw, gx, rowTopLeft, AltLowConfidencePeakFraction);
+        var (rightBridged, rightBridgedCount, _) = BridgeFingerRunsVertical(rightRaw, gx, rowTopRight, AltLowConfidencePeakFraction);
+
+        var leftX = Array.ConvertAll(leftBridged, v => (double)v);
+        var rightX = Array.ConvertAll(rightBridged, v => (double)v);
+
+        var leftDist = GutterDistance(leftX, gutterCol);
+        var rightDist = GutterDistance(rightX, gutterCol);
+        var leftJitter = EdgeStraightnessResidualStd(leftX, rowTopLeft);
+        var rightJitter = EdgeStraightnessResidualStd(rightX, rowTopRight);
+        var leftStrength = EdgeStrengthScore(leftX, rowTopLeft, gx);
+        var rightStrength = EdgeStrengthScore(rightX, rowTopRight, gx);
+
+        bool SideIsGood(double jitter, double strength, double referenceStrength) =>
+            jitter <= Method4JitterThresholdPx && strength >= referenceStrength * Method4StrengthRatioThreshold;
+
+        var leftMargin = (double)margin;
+        var rightMargin = (double)margin;
+        var leftMaxed = false;
+        var rightMaxed = false;
+
+        while (true)
+        {
+            var referenceStrength = Math.Max(leftStrength, rightStrength);
+            var leftOk = SideIsGood(leftJitter, leftStrength, referenceStrength);
+            var rightOk = SideIsGood(rightJitter, rightStrength, referenceStrength);
+            var symmetric = Math.Max(leftDist, rightDist) / Math.Max(Math.Min(leftDist, rightDist), 1e-6) <= Method4SymmetryRatioThreshold;
+
+            var leftNeedsRetry = !leftOk || (!symmetric && leftDist <= rightDist);
+            var rightNeedsRetry = !rightOk || (!symmetric && rightDist < leftDist);
+
+            if ((!leftNeedsRetry && !rightNeedsRetry) || (leftMaxed && rightMaxed)) break;
+
+            var retriedSomething = false;
+
+            if (leftNeedsRetry && !leftMaxed)
+            {
+                retriedSomething = true;
+                leftMargin = Math.Min(bookXLo, leftMargin * Method4RetryMarginStepMult);
+                leftMaxed = (bookXLo - leftMargin) <= 0;
+                var (raw, gm, gb) = RunSideWalk(gray, gx, rowTopLeft, rowBotLeft, bookXLo, (int)leftMargin, w);
+                leftGm = gm; leftGb = gb;
+                var (bridged, bridgedCount, _) = BridgeFingerRunsVertical(raw, gx, rowTopLeft, AltLowConfidencePeakFraction);
+                leftBridgedCount = bridgedCount;
+                leftX = Array.ConvertAll(bridged, v => (double)v);
+                leftDist = GutterDistance(leftX, gutterCol);
+                leftJitter = EdgeStraightnessResidualStd(leftX, rowTopLeft);
+                leftStrength = EdgeStrengthScore(leftX, rowTopLeft, gx);
+            }
+
+            if (rightNeedsRetry && !rightMaxed)
+            {
+                retriedSomething = true;
+                rightMargin = Math.Min(w - bookXHi, rightMargin * Method4RetryMarginStepMult);
+                rightMaxed = (bookXHi + rightMargin) >= w;
+                var (raw, gm, gb) = RunSideWalk(gray, gx, rowTopRight, rowBotRight, bookXHi, (int)rightMargin, w);
+                rightGm = gm; rightGb = gb;
+                var (bridged, bridgedCount, _) = BridgeFingerRunsVertical(raw, gx, rowTopRight, AltLowConfidencePeakFraction);
+                rightBridgedCount = bridgedCount;
+                rightX = Array.ConvertAll(bridged, v => (double)v);
+                rightDist = GutterDistance(rightX, gutterCol);
+                rightJitter = EdgeStraightnessResidualStd(rightX, rowTopRight);
+                rightStrength = EdgeStrengthScore(rightX, rowTopRight, gx);
+            }
+
+            if (!retriedSomething) break;
+        }
+
+        var finalReference = Math.Max(leftStrength, rightStrength);
+        var leftUnreliable = !SideIsGood(leftJitter, leftStrength, finalReference);
+        var rightUnreliable = !SideIsGood(rightJitter, rightStrength, finalReference);
+
+        return (
+            new Method4SideTrace(leftX, rowTopLeft, leftBridgedCount, leftUnreliable, leftMargin),
+            new Method4SideTrace(rightX, rowTopRight, rightBridgedCount, rightUnreliable, rightMargin)
+        );
+    }
+
+    /// <summary>Method 4's book-span detector: the sign-change-count profile, Otsu-split into a
+    /// page mask, gutter-anchored span. Port of the notebook's Method 4 span-detection cell.
+    /// <paramref name="spanGutterX"/> is the best available REAL gutter-x estimate to anchor
+    /// <see cref="FindBookSpan"/>'s outward-from-the-gutter walk — pass null when there is no
+    /// real gutter (a genuine single page, not a spread) to fall back to
+    /// <see cref="FindBookSpan"/>'s own widest-merged-run behavior instead. Anchoring a fake
+    /// "gutter" (e.g. the image's own horizontal center) on a true single page is unsound: unlike
+    /// a real spine, which the sign-change mask reliably breaks around because the two pages'
+    /// text blocks are physically separated by a gap/shadow, a single page's own mask can have a
+    /// merged run that happens to straddle the image center without the run's ends being
+    /// anywhere near the true left/right page edges — confirmed as a real bug on a real fixture
+    /// (Trapezoid_Image003: a spread with the left page mostly out of frame, misclassified as a
+    /// single page by the upstream spine-shadow gutter check — DetectGutter's own doc comment
+    /// notes it scores this exact photo's family as a non-confident single page — where anchoring
+    /// at the image center collapsed the detected span to a ~378px band deep inside the visible
+    /// page's own text block, producing a near-zero-width flattened output). The notebook itself
+    /// only ever runs on already-split single-page images with `gutter_x_global` as a crude
+    /// `Wf // 2` fallback and never hit this failure mode in its own test photos; this null-gutter
+    /// path is this port's own hardening for a case the notebook's fixtures didn't exercise.</summary>
+    public static (int Lo, int Hi)? DetectMethod4Span(Mat gx, double[] topY, double[] botY, int? spanGutterX, int w)
+    {
+        var profile = ComputeSignChangeProfile(gx, topY, botY);
+        double threshold;
+        try { threshold = OtsuSplit(profile.SignChanges, profile.Valid); }
+        catch (InvalidOperationException) { return null; }
+
+        var mask = new bool[w];
+        for (var x = 0; x < w; x++) mask[x] = profile.Valid[x] && profile.SignChanges[x] >= threshold;
+        mask = CleanMask1D(mask, w);
+
+        return FindBookSpan(mask, w, spanGutterX);
+    }
+
+    /// <summary>Full Method 4 side-boundary detection for a spread OR a genuine single page:
+    /// span detection + RANSAC-guided walk + bridging + widen-retry for both sides, returning
+    /// the same <see cref="AltSideEdgeTrace"/> shape <see cref="AltTraceSideEdge"/> (Cell 6A)
+    /// produces so it drops directly into <see cref="AltDetectSpreadBoundary"/>/
+    /// <see cref="AltFlattenSinglePage"/> in its place.
+    /// <paramref name="gutterSeedColumn"/> is always used for the symmetry check's own
+    /// gutter-distance reference (a left/right-vs-center comparison is a reasonable symmetry
+    /// gate for either a real spread or a single page — the notebook uses the same
+    /// `gutter_x_global - left_cut` for both). <paramref name="hasRealGutter"/> controls ONLY
+    /// whether <see cref="DetectMethod4Span"/>'s span search itself is anchored there (true — a
+    /// real spread, where a text-block gap/shadow really does separate the two pages at that
+    /// column) or falls back to widest-run (false — a genuine single page, where anchoring a fake
+    /// center "gutter" risks locking onto an interior text blob instead of the true page
+    /// extent — see <see cref="DetectMethod4Span"/>'s own doc comment for the confirmed failure
+    /// this avoids).</summary>
+    public readonly record struct Method4Result(AltSideEdgeTrace Left, AltSideEdgeTrace Right, int BookXLo, int BookXHi, bool SpanFound);
+
+    public Method4Result AltTraceSideEdgeMethod4Pair(Mat img, Mat gray, Mat gx, double[] topY, double[] botY, int gutterSeedColumn, bool hasRealGutter = true)
+    {
+        var w = img.Cols;
+        var span = DetectMethod4Span(gx, topY, botY, hasRealGutter ? gutterSeedColumn : null, w);
+        if (span is not { } s)
+        {
+            // No span detected — mirror the notebook's own "skip edge trace" fallback by
+            // returning empty/degenerate traces; callers already handle a zero-width side
+            // trace the same way AltTraceSideEdge's own defensive clamps do.
+            var empty = new AltSideEdgeTrace(Array.Empty<double>(), 0, 0, 0);
+            return new Method4Result(empty, empty, 0, w, false);
+        }
+
+        var (bookXLo, bookXHi) = s;
+
+        int RowMedian(double[] arr, int lo, int hi)
+        {
+            lo = Math.Max(0, lo); hi = Math.Min(arr.Length, hi);
+            if (hi <= lo) return 0;
+            var slice = arr.Skip(lo).Take(hi - lo).Select(v => (float)v).ToArray();
+            return (int)Median(slice, 0, slice.Length);
+        }
+
+        var rowTopLeft = Math.Clamp(RowMedian(topY, bookXLo, bookXLo + 10), 0, img.Rows - 1);
+        var rowBotLeft = Math.Clamp(RowMedian(botY, bookXLo, bookXLo + 10), rowTopLeft + 1, img.Rows);
+        var rowTopRight = Math.Clamp(RowMedian(topY, bookXHi - 10, bookXHi), 0, img.Rows - 1);
+        var rowBotRight = Math.Clamp(RowMedian(botY, bookXHi - 10, bookXHi), rowTopRight + 1, img.Rows);
+
+        var margin = Math.Max(20, (int)(w * 0.04));
+
+        var (left, right) = TraceMethod4Pair(img, gray, gx, rowTopLeft, rowBotLeft, bookXLo, rowTopRight, rowBotRight, bookXHi, margin, gutterSeedColumn, w);
+
+        var leftTrace = new AltSideEdgeTrace(left.Columns, left.RowLo, left.BridgedCount, 0);
+        var rightTrace = new AltSideEdgeTrace(right.Columns, right.RowLo, right.BridgedCount, 0);
+
+        return new Method4Result(leftTrace, rightTrace, bookXLo, bookXHi, true);
+    }
+
     // --- Phase 2 orchestration + diagnostic entry point ---
 
     /// <summary>Full result of tracing a whole spread's boundary (Phases 1-3 combined): raw
@@ -608,22 +1320,15 @@ public partial class ImageProcessor
     /// <see cref="DebugAltBoundaryDetection"/> (text + overlay diagnostic) and, once wired in
     /// (Phase 5), the real pipeline entry point.
     ///
-    /// Left/right are deliberately NOT smoothed: the notebook's own Cell 10 comment claims they
-    /// are "already a straight line by construction" (so Sav-Gol would add nothing), but reading
-    /// the notebook's actual Cell 9 code shows the side-edge trace is a per-row point-by-point
-    /// continuity walk with local bridging — not a fitted line — contradicting that comment. This
-    /// was flagged in the port plan as a real, confirmed discrepancy, to be resolved empirically
-    /// rather than by trusting the stale comment. Resolved here by inspecting this phase's own
-    /// overlay (see <see cref="AltBoundaryOverlay"/>) on all 8 real fixtures: the side-edge
-    /// traces already come out visually clean (the confidence-gated bridging in
-    /// <see cref="AltTraceSideEdge"/> already removes the jitter Sav-Gol would otherwise smooth),
-    /// and the side edges are frequently genuinely non-straight in real photos (e.g. a page's
-    /// true physical curl, or the deliberate tilt in <c>Trapezoid_Image001</c>/`002` — see the
-    /// fixtures) — smoothing them risks flattening real shape the same way over-aggressive
-    /// smoothing was already shown to risk flattening the gutter V-notch. Top/bottom get Sav-Gol
-    /// because the notebook applies it there unconditionally and because that curve is expected
-    /// to be smooth by physical construction (a page edge doesn't have sharp corners along its
-    /// own length, unlike text-line noise).</summary>
+    /// Left/right come from Method 4 (Gx sign-change count + gutter-anchored span + RANSAC-
+    /// guided continuity walk + finger bridging + strength/straightness widen-retry — see
+    /// <see cref="AltTraceSideEdgeMethod4Pair"/>), NOT smoothed here either: Method 4's own
+    /// bridging already removes finger-occlusion jitter the same way Cell 6A's did, and a
+    /// side's genuine tilt/bow (real physical curl, or the deliberate tilt in
+    /// <c>Trapezoid_Image001</c>/`002`) must survive downstream exactly as the notebook's own
+    /// Method 4 trace does. Top/bottom get Sav-Gol because the notebook applies it there
+    /// unconditionally and because that curve is expected to be smooth by physical construction
+    /// (a page edge doesn't have sharp corners along its own length, unlike text-line noise).</summary>
     public AltSpreadBoundary AltDetectSpreadBoundary(Mat img)
     {
         using var gray = new Mat();
@@ -645,21 +1350,24 @@ public partial class ImageProcessor
         var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
         var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
 
-        var gutterSeedColumn = img.Cols / 2; // crude center seed — no prior gutter estimate to anchor to yet
+        // Gutter seed: prefer the already-validated spine-shadow detector (ImageProcessor.
+        // DetectGutter — real per-batch signal, confirmed against real fixtures per its own doc
+        // comment) over the notebook's own crude `Wf // 2` fallback, which is only ever a last
+        // resort when no better measurement exists (the notebook's own comment on
+        // gutter_x_global says exactly this: "crude center seed -- no Cb-valley gutter estimate
+        // to anchor to"). Falls back to center when DetectGutter isn't confident, matching the
+        // notebook's own fallback behavior.
+        var gutterDetection = DetectGutter(img, GutterMinFlankMarginFraction);
+        var gutterSeedColumn = gutterDetection.Confidence >= GutterConfidenceThreshold
+            ? Math.Clamp((int)Math.Round(img.Cols * gutterDetection.Fraction), 0, img.Cols - 1)
+            : img.Cols / 2;
         var gutter = AltDetectGutterNotch(topSmooth, bottomSmooth, gutterSeedColumn);
 
-        // Clamp to valid image rows: Sav-Gol's least-squares fit can overshoot slightly beyond
-        // the raw traced range right at a column's own edge (0 or w-1), where the smoothing
-        // window is asymmetric/shrunk — confirmed via a real crash on Trapezoid_Image001 before
-        // this clamp was added (AltTraceSideEdge indexing gxFlat with a row >= h).
-        var rowTopLeft = Math.Clamp((int)Math.Round(topSmooth[0]), 0, img.Rows - 1);
-        var rowBotLeft = Math.Clamp((int)Math.Round(bottomSmooth[0]), 0, img.Rows - 1);
-        var rowTopRight = Math.Clamp((int)Math.Round(topSmooth[^1]), 0, img.Rows - 1);
-        var rowBotRight = Math.Clamp((int)Math.Round(bottomSmooth[^1]), 0, img.Rows - 1);
         var gutterMidCol = Math.Clamp((int)Math.Round((gutter.TopNotch.Column + gutter.BottomNotch.Column) / 2.0), 0, img.Cols - 1);
 
-        var left = AltTraceSideEdge(img, gx, rowTopLeft, rowBotLeft, 0, gutterMidCol, fromLeft: true);
-        var right = AltTraceSideEdge(img, gx, rowTopRight, rowBotRight, gutterMidCol, img.Cols, fromLeft: false);
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, gutterMidCol);
+        var left = method4.Left;
+        var right = method4.Right;
 
         return new AltSpreadBoundary(topRaw, topBridged, topSmooth, bottomRaw, bottomBridged, bottomSmooth, gutter, left, right, topBridgedCount, bottomBridgedCount);
     }
@@ -804,14 +1512,21 @@ public partial class ImageProcessor
     }
 
     /// <summary>Per-column arc-length "physical x" axis for a page's top/bottom curves, per the
-    /// notebook's Cell 9A/9B: at each step, the arc-length increment is the AVERAGE of the
-    /// top and bottom curves' own hypot(1, dy) step (each individually guaranteed >= 1, the
+    /// notebook's Cell 9A/9B (Method 1): at each step, the arc-length increment is the AVERAGE of
+    /// the top and bottom curves' own hypot(1, dy) step (each individually guaranteed >= 1, the
     /// straight-line step) — so the cumulative physical-x axis is guaranteed >= the raw pixel
     /// column count by construction. This is the invariant the notebook's two rejected
     /// width-correction approaches (closed-form circular-arc radius fit — numerically unstable;
     /// direct H0/h(x) integration — could produce an output NARROWER than the raw crop, which
     /// is physically impossible for a page that only bends) both violated. Returns a
-    /// same-length array, index 0 = 0 (the starting edge).</summary>
+    /// same-length array, index 0 = 0 (the starting edge).
+    ///
+    /// NOT currently called by <see cref="AltFlattenPage"/> — the notebook itself never picks a
+    /// winner between this (Method 1) and the cubic-bow fit (Method 2, <see cref="FitWidthCubic"/>)
+    /// and instead ends on a side-by-side comparison cell (Cell 9C). The product owner's own
+    /// framing ("Method 4 + its cubic-bow remap" as the mandatory reference) is what selects
+    /// Method 2 as the shipped default; this Method 1 primitive is kept, unused, as a documented,
+    /// faithful port of the notebook's other validated option, not dead/orphaned code.</summary>
     private static double[] AltArcLengthPhysicalX(double[] topY, double[] botY)
     {
         var n = topY.Length;
@@ -826,11 +1541,125 @@ public partial class ImageProcessor
         return physX;
     }
 
+    /// <summary>Samples f(t) for t in [0,1] (n points) given edge slopes alpha/beta, for the
+    /// cubic "vertical sheet" cross-section f(0)=0, f(1)=0, f'(0)=alpha, f'(1)=beta — page_dewarp.py's
+    /// model, adapted here to boundary curves (see <see cref="FitWidthCubic"/>). Port of the
+    /// notebook's `cubic_bow`, which solves this system symbolically via sympy at import time;
+    /// this closed-form solve is the same system worked out algebraically (d=0 from f(0)=0,
+    /// c=alpha from f'(0)=alpha, then f(1)=0 and f'(1)=beta give a=alpha+beta, b=-2*alpha-beta —
+    /// verified by substitution: a+b+c = (alpha+beta)+(-2alpha-beta)+alpha = 0, and
+    /// 3a+2b+c = 3(alpha+beta)+2(-2alpha-beta)+alpha = beta).</summary>
+    public static double[] CubicBow(double alpha, double beta, int n)
+    {
+        var a = alpha + beta;
+        var b = -2 * alpha - beta;
+        var c = alpha;
+        var result = new double[n];
+        for (var i = 0; i < n; i++)
+        {
+            var t = n <= 1 ? 0.0 : (double)i / (n - 1);
+            result[i] = a * t * t * t + b * t * t + c * t;
+        }
+        return result;
+    }
+
+    /// <summary>Fits a single-parameter cubic bow (beta = -alpha, i.e. symmetric spine-to-outer-
+    /// edge droop) to the observed column-height profile h(x) = bot_y - top_y, then uses the
+    /// fitted curve's own arc length as the physical width estimate. Port of the notebook's
+    /// `fit_width_cubic` — this is the "mandatory reference" width-correction method (per the
+    /// product owner: "Method 4 + its cubic-bow remap"), distinct from the plain arc-length
+    /// measurement of the raw traced curve (<see cref="AltArcLengthPhysicalX"/>, kept in this
+    /// file only as the underlying arc-length primitive <see cref="AltArcLength"/> the cubic fit
+    /// itself still needs — not used for the page-width estimate anymore). The cubic model asks
+    /// "what flat page, viewed under perspective by a camera at this pose, would produce this
+    /// exact curve" rather than treating the raw traced curve's own pixel noise as ground truth
+    /// — same guaranteed->=raw-span property as the arc-length approach (each ds step is
+    /// hypot(1, dy) >= 1 by construction), but the per-column stretch comes from a physically-
+    /// motivated bow model fit to the observed shrinkage instead of the noisy trace directly.
+    /// scipy's `minimize_scalar(bounds=(-3,3), method='bounded')` is a golden-section search;
+    /// ported here as a plain grid+refine search over the same bounds since this project has no
+    /// general-purpose optimizer dependency (consistent with this file's existing hand-rolled
+    /// numerical code, e.g. <see cref="RansacLineFit"/>/<see cref="WeightedPolyFit"/>) — a
+    /// smooth, unimodal 1D objective over a bounded range converges to the same optimum via
+    /// either method.</summary>
+    public static (double[] PhysX, double Alpha) FitWidthCubic(double[] topY, double[] botY, double widthGain = 1.0)
+    {
+        var n = topY.Length;
+        var h = new double[n];
+        for (var i = 0; i < n; i++) h[i] = botY[i] - topY[i];
+        var hMin = h.Min();
+        var hMax = h.Max();
+        var hNorm = new double[n];
+        for (var i = 0; i < n; i++) hNorm[i] = hMax > hMin ? (h[i] - hMin) / (hMax - hMin) : (h[i] - hMin);
+
+        double Objective(double alpha)
+        {
+            var bow = CubicBow(alpha, -alpha, n);
+            var bowMin = bow.Min();
+            var bowMax = bow.Max();
+            var sumSq = 0.0;
+            for (var i = 0; i < n; i++)
+            {
+                var bowNorm = bowMax > bowMin ? (bow[i] - bowMin) / (bowMax - bowMin) : (bow[i] - bowMin);
+                var diff = bowNorm - hNorm[i];
+                sumSq += diff * diff;
+            }
+            return sumSq;
+        }
+
+        // Golden-section search over [-3, 3], mirroring scipy's bounded minimize_scalar — a
+        // derivative-free bracket search appropriate for this smooth, unimodal, single-parameter
+        // objective (matches the notebook's own choice of `method='bounded'`).
+        var lo = -3.0; var hi = 3.0;
+        const double gr = 0.6180339887498949; // 1/golden ratio
+        var c1 = hi - gr * (hi - lo);
+        var c2 = lo + gr * (hi - lo);
+        var f1 = Objective(c1);
+        var f2 = Objective(c2);
+        for (var iter = 0; iter < 100 && hi - lo > 1e-6; iter++)
+        {
+            if (f1 < f2)
+            {
+                hi = c2; c2 = c1; f2 = f1;
+                c1 = hi - gr * (hi - lo);
+                f1 = Objective(c1);
+            }
+            else
+            {
+                lo = c1; c1 = c2; f1 = f2;
+                c2 = lo + gr * (hi - lo);
+                f2 = Objective(c2);
+            }
+        }
+        var alphaFit = (lo + hi) / 2.0;
+
+        var bowFit = CubicBow(alphaFit, -alphaFit, n);
+        var bowRange = hMax > hMin ? hMax - hMin : 1.0;
+        var physX = new double[n];
+        var cum = 0.0;
+        physX[0] = 0.0;
+        for (var i = 1; i < n; i++)
+        {
+            var dy = (bowFit[i] - bowFit[i - 1]) * bowRange;
+            var ds = Math.Sqrt(1.0 + dy * dy) * widthGain;
+            cum += ds;
+            physX[i] = cum;
+        }
+        return (physX, alphaFit);
+    }
+
     /// <summary>Result of <see cref="AltFlattenPage"/>: the flattened page image plus the
-    /// output dimensions actually used (arc-length-derived, not the raw polygon crop's pixel
-    /// span) — exposed so callers/diagnostics can verify the arc-length invariant (flattened
-    /// width must never be smaller than the raw apparent crop width).</summary>
-    public readonly record struct AltFlattenResult(Mat Flattened, int OutWidth, int OutHeight);
+    /// output dimensions actually used (cubic-bow-derived, not the raw polygon crop's pixel
+    /// span) — exposed so callers/diagnostics can verify the width-correction invariant
+    /// (flattened width must never be smaller than the raw apparent crop width).
+    /// <paramref name="FoundRealEdges"/> is false only when the input had too little
+    /// gradient/texture evidence anywhere for Method 4 to find real page edges at all (a
+    /// featureless/blank capture) — Flattened is still a real, non-degenerate image in that
+    /// case (the defensive fallbacks in this method guarantee that), just an unrefined
+    /// pass-through of the input rather than a genuine geometric correction. Callers that have
+    /// their own trusted fallback boundary (e.g. ProcessFixedFrames' own calibrated rectangle)
+    /// should prefer that over trusting this pass-through result's exact dimensions.</summary>
+    public readonly record struct AltFlattenResult(Mat Flattened, int OutWidth, int OutHeight, double FittedAlpha, bool FoundRealEdges = true);
 
     /// <summary>Flattens one page (left or right half of a spread, or a whole single page — see
     /// <see cref="AltFlattenSinglePage"/>) via the notebook's arc-length remap (Cell 9A/9B,
@@ -840,9 +1669,10 @@ public partial class ImageProcessor
     /// the two SHORT edges (outer + inner/gutter, each a row-indexed x-position, not necessarily
     /// a constant column) to drive the remap.
     ///
-    /// WIDTH = arc length of the top/bottom curves, averaged (<see cref="AltArcLengthPhysicalX"/>)
-    /// — guaranteed >= the raw pixel span. HEIGHT = the outer edge's own traced arc length (the
-    /// least-foreshortened available measurement of true page height).
+    /// WIDTH = cubic-bow-fit physical x-axis (<see cref="FitWidthCubic"/>, the notebook's Method
+    /// 2 / Cell 9B-alt — the product owner's designated mandatory reference over the plain
+    /// arc-length sum) — guaranteed >= the raw pixel span. HEIGHT = the outer edge's own traced
+    /// arc length (the least-foreshortened available measurement of true page height).
     ///
     /// TILT FIX (an explicit, previously-shipped-then-fixed bug in the notebook itself — the
     /// single easiest regression to reintroduce when porting this, called out prominently in the
@@ -863,8 +1693,36 @@ public partial class ImageProcessor
         double[] innerXAtRow, int innerRowStart) // row-indexed inner (gutter or far-side) edge x, index 0 = innerRowStart
     {
         var n = topY.Length;
-        var physX = AltArcLengthPhysicalX(topY, botY);
+
+        // Defensive fallback for a genuinely featureless/low-signal crop (e.g. a fixed-frame
+        // search region with too little edge content for Method 4 to find anything —
+        // AltTraceSideEdgeMethod4Pair's own doc comment says "callers already handle a
+        // zero-width side trace" but nothing downstream actually did, which crashed
+        // ProcessFixedFrames outright with Math.Clamp(x, 0, -1) on any blank/low-texture
+        // capture). No row-indexed edge trace means no tilt data to correct with — fall back to
+        // a single constant column (the crop's own left/right bound) at every row, which
+        // degrades to exactly the untilted, no-correction case rather than crashing.
+        var foundRealEdges = outerXAtRow.Length > 0 && innerXAtRow.Length > 0;
+        if (outerXAtRow.Length == 0)
+            outerXAtRow = new[] { (double)(sourceColumns.Length > 0 ? sourceColumns[0] : 0) };
+        if (innerXAtRow.Length == 0)
+            innerXAtRow = new[] { (double)(sourceColumns.Length > 0 ? sourceColumns[^1] : img.Cols - 1) };
+        // WIDTH: cubic-bow fit (notebook's Cell 9B-alt / Method 2), the product owner's
+        // designated mandatory reference width correction ("Method 4 + its cubic-bow remap") —
+        // see FitWidthCubic's own doc comment for why this supersedes the plain arc-length sum
+        // of the raw traced curve (AltArcLengthPhysicalX, still used by AltArcLength/HEIGHT
+        // below, just no longer for the page-width estimate).
+        var (physX, fittedAlpha) = FitWidthCubic(topY, botY, widthGain: 1.0);
         var outW = Math.Max(1, (int)Math.Round(physX[^1]));
+        // Sanity bound: the cubic-bow width fit is only meaningful with real per-column
+        // height-variation evidence. On a span too narrow/degenerate for Method 4 to have found
+        // real content (e.g. a synthetic/low-texture image where sign-change detection locks
+        // onto a near-zero-width sliver instead of the true page span), the fit can still run
+        // but produces a physically nonsensical output (confirmed: a 2-column span produced a
+        // literal 2px-wide output on a 3840px-wide source). Rather than emit that, fall back to
+        // the raw source-column span — still not "correct" if the span itself is wrong, but at
+        // least a recognizable, non-degenerate crop instead of an unusable sliver.
+        if (outW < sourceColumns.Length / 4) outW = Math.Max(1, sourceColumns.Length);
 
         // HEIGHT: arc length of the outer edge — but measured against a SMOOTHED copy of
         // outerXAtRow, not the raw trace used for the actual per-pixel mapX lookup below. The
@@ -878,11 +1736,37 @@ public partial class ImageProcessor
         // the flattened output (each output row advancing far less than one real source pixel).
         // Smoothing ONLY for this length measurement fixes it without reopening Phase 3's
         // decision to keep the raw trace itself unsmoothed for cropping.
+        // Fallback height evidence, independent of the row-indexed side trace: the page's own
+        // top/bottom curve span (topY/botY, always populated — even when the span/side-edge
+        // detection above collapsed to the single-element constant-column fallback, e.g. on a
+        // real page with a deliberate edge gap where the side trace itself found nothing but
+        // the top/bottom trace correctly measured the true ~1000px page height). Used both as
+        // the "no real row-indexed trace" replacement for outerXAtRow.Length<=1 and as a lower
+        // sanity floor even when a trace exists.
+        var topBotHeight = n > 0 ? Math.Max(1, (int)Math.Round(botY.Zip(topY, (b, t) => b - t).Max())) : 1;
+
         var outerXSmooth = AltSavGolFilter(outerXAtRow, AltSavGolWindow, AltSavGolPolyDegree);
         var outerYs = new double[outerXAtRow.Length];
         for (var i = 0; i < outerYs.Length; i++) outerYs[i] = outerRowStart + i;
         var outerArcLen = AltArcLength(outerXSmooth, outerYs);
         var outH = Math.Max(1, (int)Math.Round(outerArcLen));
+        // Same sanity bound as outW above, mirrored for height: even Sav-Gol-smoothed, a
+        // per-row trace that's still jittery relative to its own net vertical span (a real
+        // failure mode this method's own comment above already documents — "sum-of-|delta| was
+        // 1498px ... against a net displacement of only 4px") can inflate arc length far past
+        // the row count it was actually measured over. Bound against BOTH the raw row count the
+        // arc length was measured over AND the independently-derived topBotHeight (the page's
+        // own top/bottom curve span) — confirmed a single bound isn't tight enough on its own:
+        // a generous 3x-rawRowSpan cap alone still let a real bug through (a synthetic
+        // mock-capture image's side trace inflated arc length to 3656 against a true ~1400px
+        // page height, comfortably under a 3x cap but still a physically wrong ~2.6x result).
+        // A real page's traced arc length legitimately exceeds its straight-line height for
+        // genuine curvature/tilt, but not by more than roughly 50% on anything this codebase has
+        // seen — anything beyond that is jitter inflation, not real path length, so floor/ceiling
+        // against topBotHeight's own independent measurement rather than trust arc length alone.
+        var rawRowSpan = Math.Max(1, outerXAtRow.Length);
+        if (outH > rawRowSpan * 3) outH = rawRowSpan;
+        if (outerXAtRow.Length <= 1 || outH > topBotHeight * 3 / 2 || outH < topBotHeight / 4) outH = topBotHeight;
 
         var idxAxis = new double[n];
         for (var i = 0; i < n; i++) idxAxis[i] = i;
@@ -924,7 +1808,7 @@ public partial class ImageProcessor
         var flattened = new Mat();
         Cv2.Remap(img, flattened, mapXMat, mapYMat, InterpolationFlags.Linear, BorderTypes.Constant, Scalar.White);
 
-        return new AltFlattenResult(flattened, outW, outH);
+        return new AltFlattenResult(flattened, outW, outH, fittedAlpha, foundRealEdges);
     }
 
     /// <summary>Linear interpolation of <paramref name="fp"/> (values) at each of
@@ -1125,20 +2009,55 @@ public partial class ImageProcessor
         var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
         var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
 
-        var rowTopLeft = Math.Clamp((int)Math.Round(topSmooth[0]), 0, img.Rows - 1);
-        var rowBotLeft = Math.Clamp((int)Math.Round(bottomSmooth[0]), 0, img.Rows - 1);
-        var rowTopRight = Math.Clamp((int)Math.Round(topSmooth[^1]), 0, img.Rows - 1);
-        var rowBotRight = Math.Clamp((int)Math.Round(bottomSmooth[^1]), 0, img.Rows - 1);
-
-        var left = AltTraceSideEdge(img, gx, rowTopLeft, rowBotLeft, 0, img.Cols / 2, fromLeft: true);
-        var right = AltTraceSideEdge(img, gx, rowTopRight, rowBotRight, img.Cols / 2, img.Cols, fromLeft: false);
+        // No real gutter/spine for a single page — Method 4's own span/symmetry math still
+        // needs SOME anchor column between the two sides for the symmetry check, so use the
+        // image center, matching the notebook's own fallback for "no better gutter estimate
+        // exists" (gutter_x_global = Wf // 2). hasRealGutter: false keeps that center column OUT
+        // of the span search itself (DetectMethod4Span falls back to widest-run instead of
+        // anchoring at a fake gutter) — see AltTraceSideEdgeMethod4Pair's own doc comment for
+        // the confirmed real-fixture bug this avoids (a single page's mask can have a merged run
+        // that straddles the image center without being anywhere near the true page edges).
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, img.Cols / 2, hasRealGutter: false);
+        var left = method4.Left;
+        var right = method4.Right;
 
         // Same median-based robust outer-bound clamp used for spread pages (see AltFlattenSpread
-        // — Max()/Min() were confirmed non-robust to a jittery trace on real fixtures).
-        var leftBound = (int)Math.Round(Median(Array.ConvertAll(left.Columns, v => (float)v), 0, left.Columns.Length));
-        var rightBound = (int)Math.Round(Median(Array.ConvertAll(right.Columns, v => (float)v), 0, right.Columns.Length));
-        leftBound = Math.Clamp(leftBound, 0, img.Cols - 2);
-        rightBound = Math.Clamp(rightBound, leftBound + 1, img.Cols - 1);
+        // — Max()/Min() were confirmed non-robust to a jittery trace on real fixtures). A
+        // featureless/low-signal capture (nothing for Sobel to find at all — confirmed on a
+        // flat solid-color synthetic test image) leaves left.Columns/right.Columns empty
+        // (Method4Result's own "no span found" fallback), which collapsed the whole-image width
+        // down to a degenerate few-pixel span here before any of it reached AltFlattenPage's own
+        // guards. Fall back to the image's own full width in that case — the same "nothing to
+        // detect, don't invent a tiny crop" spirit as the legacy pipeline's confidence gate,
+        // just triggered by "no edge evidence at all" instead of a numeric confidence score.
+        int leftBound, rightBound;
+        if (left.Columns.Length == 0 || right.Columns.Length == 0)
+        {
+            leftBound = 0;
+            rightBound = img.Cols - 1;
+        }
+        else
+        {
+            leftBound = (int)Math.Round(Median(Array.ConvertAll(left.Columns, v => (float)v), 0, left.Columns.Length));
+            rightBound = (int)Math.Round(Median(Array.ConvertAll(right.Columns, v => (float)v), 0, right.Columns.Length));
+            leftBound = Math.Clamp(leftBound, 0, img.Cols - 2);
+            rightBound = Math.Clamp(rightBound, leftBound + 1, img.Cols - 1);
+            // Both sides found SOME trace, but Method 4's span detection itself can still lock
+            // onto an implausibly narrow sliver on a real image with too little interior
+            // texture/gradient content for the sign-change signal to separate page from
+            // background (confirmed: a synthetic mock-capture image — solid background, thin
+            // stroked-outline "page", sparse text — produced a 2-column span here, which
+            // propagated into AltFlattenPage as a 1px-wide/thousands-of-px-tall degenerate
+            // output despite that method's own guards, since a "found something, just tiny"
+            // span isn't the same case as "found literally nothing" above). Same "don't invent
+            // an unusable sliver crop" spirit as the empty-trace branch — fall back to the full
+            // image width when the detected span is too narrow to be a real page.
+            if (rightBound - leftBound + 1 < img.Cols / 4)
+            {
+                leftBound = 0;
+                rightBound = img.Cols - 1;
+            }
+        }
 
         var n = rightBound - leftBound + 1;
         var topY = new double[n];

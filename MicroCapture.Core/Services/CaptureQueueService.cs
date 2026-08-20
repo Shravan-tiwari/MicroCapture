@@ -64,6 +64,11 @@ public class CaptureQueueService
         // same way EnsureColumn explicitly ALTERs existing tables.
         EnsureCameraCalibrationsTable();
         EnsureColumn("Batches", "CameraCalibrationId", "TEXT NULL");
+        // UseAltBoundaryPipeline is no longer read by Batch.cs/ImageProcessor (the notebook-
+        // ported pipeline is the only automatic boundary/dewarp path now — see Batch.cs's own
+        // comment where the property used to live) — left here so an existing database's schema
+        // still matches what it already has on disk; a destructive column-drop migration isn't
+        // worth it for one harmless orphaned INTEGER column.
         EnsureColumn("Batches", "UseAltBoundaryPipeline", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "HasManualAdjustments", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "RotationDegrees", "INTEGER NOT NULL DEFAULT 0");
@@ -74,6 +79,7 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "Saturation", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "Sharpness", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "WhiteBalance", "REAL NOT NULL DEFAULT 0");
+        EnsureColumn("Batches", "BleedthroughEnabled", "INTEGER NOT NULL DEFAULT 0");
     }
 
     private void EnsureCameraCalibrationsTable()

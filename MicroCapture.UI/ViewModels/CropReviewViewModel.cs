@@ -197,6 +197,13 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         Saturation = preset.Saturation;
     }
 
+    [RelayCommand]
+    private void ToggleAdjustMode()
+    {
+        if (Image == null) return;
+        IsAdjustMode = !IsAdjustMode;
+    }
+
     private bool HasNonDefaultAdjustments =>
         RotationDegrees != 0 || FlipHorizontal || FlipVertical || Brightness != 0 ||
         Contrast != 0 || Saturation != 0 || Sharpness != 0 || WhiteBalance != 0;

@@ -64,8 +64,10 @@ public partial class MainWindowViewModel : ViewModelBase
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
 
     // DPI is fixed per batch (like fixed frames/split), not changeable per export — every page
-    // processed under this batch gets tagged with it. Metadata only: it documents intended
-    // print/archival resolution, it does not change the pixel dimensions actually captured.
+    // processed under this batch gets tagged with it AND resampled to it. 150 (the smallest
+    // option) is the baseline — the camera has no fixed native optical DPI, so pixel dimensions
+    // are left untouched there, and every higher selection upsamples proportionally (never
+    // downsamples away real captured detail). See ImageProcessor.BaselineDpi/ResizeForDpi.
     [ObservableProperty] private int _selectedDpi = 300;
     public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
 
@@ -79,14 +81,10 @@ public partial class MainWindowViewModel : ViewModelBase
     // color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
     [ObservableProperty] private bool _binarizeEnabled = false;
 
-    // Selects the alternative boundary-detection/split/flatten pipeline (see
-    // ImageProcessor.AltBoundaryPipeline.cs / Batch.UseAltBoundaryPipeline) in place of the
-    // original contour/confidence-based one. Fixed per batch, like the other processing toggles.
-    // Applies to both the spread-detection path and fixed-frame captures (ProcessFixedFrames'
-    // own useAltPipeline branch flattens within each calibrated rectangle instead of a plain
-    // crop) — orthogonal to UseFixedFrames, not exclusive with it. Mutually exclusive with
-    // SplitBookPages, since the alt pipeline decides split-vs-single-page itself.
-    [ObservableProperty] private bool _useAltBoundaryPipeline = false;
+    // Suppresses show-through from the reverse side of a thin page bleeding into the scan.
+    // Confirmed not effective on colored-image bleedthrough (grayscale/text show-through
+    // only) — opt-in per batch. See ImageProcessor.TryRemoveBleedthrough.
+    [ObservableProperty] private bool _bleedthroughEnabled = false;
 
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
@@ -101,11 +99,6 @@ public partial class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(CalibrateButtonLabel));
     }
     partial void OnSplitBookPagesChanged(bool value) { if (value) UseFixedFrames = false; }
-    // UseAltBoundaryPipeline is orthogonal to UseFixedFrames (it applies to both the
-    // spread-detection path and, via ProcessFixedFrames' own useAltPipeline branch, the
-    // fixed-frame path too — see the property's own doc comment above) but still mutually
-    // exclusive with SplitBookPages, since the alt pipeline runs its own split decision.
-    partial void OnUseAltBoundaryPipelineChanged(bool value) { if (value) SplitBookPages = false; }
     partial void OnIsFixedFrameBatchChanged(bool value)
     {
         OnPropertyChanged(nameof(IsAutoCaptureAvailable));
@@ -492,12 +485,17 @@ public partial class MainWindowViewModel : ViewModelBase
                 SelectedDpi = batch.Dpi;
                 DewarpEnabled = batch.DewarpEnabled;
                 BinarizeEnabled = batch.BinarizeEnabled;
-                UseAltBoundaryPipeline = batch.UseAltBoundaryPipeline;
+                BleedthroughEnabled = batch.BleedthroughEnabled;
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
             else
             {
+                var activeCalibrationId = await _dbContext.CameraCalibrations
+                    .Where(c => c.IsActive)
+                    .Select(c => c.Id)
+                    .FirstOrDefaultAsync();
+
                 batch = new Batch
                 {
                     ProjectId = project.Id,
@@ -509,7 +507,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
                     BinarizeEnabled = BinarizeEnabled,
-                    UseAltBoundaryPipeline = UseAltBoundaryPipeline
+                    BleedthroughEnabled = BleedthroughEnabled,
+                    CameraCalibrationId = activeCalibrationId
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();

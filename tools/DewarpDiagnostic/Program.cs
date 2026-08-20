@@ -1,9 +1,24 @@
 // Diagnostic tool (not part of the shipped app): runs the real ImageProcessor pipeline
-// against real-photo fixtures and reports what happened, for visually validating the Phase 1
-// accuracy rework (boundary detection, trapezoid, book-curve dewarp, deskew, binarization)
-// against real captures instead of only synthetic SmokeTest images. Never contributes to any
-// automated pass/fail — real photos can only be visually judged, not asserted against a
-// synthetic ground truth. See tools/SmokeTest/Fixtures/real-photos/README.md.
+// against real-photo fixtures and reports what happened, for visually validating boundary
+// detection, dewarp, deskew, and binarization against real captures instead of only synthetic
+// SmokeTest images. Never contributes to any automated pass/fail — real photos can only be
+// visually judged, not asserted against a synthetic ground truth. See
+// tools/SmokeTest/Fixtures/real-photos/README.md.
+//
+// `process` is THE canonical command: it calls ImageProcessor.Process/ProcessFixedFrames, the
+// exact same entry points MicroCapture.Processing/BackgroundProcessingWorker.cs invokes for a
+// real batch — there is only one boundary/dewarp pipeline now (Method 4 side-edge detection +
+// cubic-bow single-pass remap, ported from tools/phaseA-prototype/boundary_prototype.ipynb),
+// not a choice between "the real one" and "an alternative," so this subcommand's output is
+// exactly what a real capture would produce. `altboundary`/`altflatten` were previously separate
+// subcommands exercising a genuinely different code path than `process` (a known, confirmed gap
+// — validating them didn't validate what the shipped app actually ran); they're kept below only
+// as finer-grained diagnostics INTO THE SAME pipeline `process` now runs (boundary trace only,
+// or flatten only, without the finger/bleedthrough/enhance/binarize tail) — not a different
+// pipeline anymore. `boundary`/`corners`/`rotfield`/`spread`/`points`/`mesh` are the OLD
+// contour/text-line-blob detector's own diagnostics — that detector only still runs for the
+// manual-crop-override path (Process's manualOverride branch), never for an automatic capture,
+// so treat their output as manual-path-only, not representative of `process`'s automatic result.
 //
 // Usage:
 //   dotnet run --project tools/DewarpDiagnostic -- process <input-dir> <output-dir> [--binarize]
@@ -35,6 +50,8 @@ switch (args[0])
         return RunAltBoundary(args);
     case "altflatten":
         return RunAltFlatten(args);
+    case "singleflatten":
+        return RunSingleFlatten(args);
     case "corners":
         return RunCorners(args);
     case "rotfield":
@@ -62,6 +79,7 @@ static void PrintUsage()
     Console.WriteLine("  boundary <image-or-dir>");
     Console.WriteLine("  altboundary <image-or-dir> [--out <out-dir>]");
     Console.WriteLine("  altflatten <image-or-dir> <out-dir>");
+    Console.WriteLine("  singleflatten <image-or-dir> <out-dir>");
     Console.WriteLine("  corners <image-or-dir>");
     Console.WriteLine("  rotfield <image-or-dir>");
     Console.WriteLine("  points <image> [pointsPerEdge]");
@@ -76,11 +94,16 @@ static int RunProcess(string[] args)
     var inputDir = args[1];
     var outputDir = args[2];
     var binarize = args.Contains("--binarize");
-    // Dev-only escape hatch for generating "what the old architecture produced" comparison
-    // baselines: disables the auto-split promotion entirely (see ImageProcessor.Process) so a
-    // real spread goes through the old single-whole-image path, without needing to hand-edit
-    // ImageProcessor to see the before/after difference.
+    // Dev-only escape hatch: disables the auto-split promotion entirely (see
+    // ImageProcessor.Process's GutterConfidenceThreshold check) so a real spread is forced
+    // through the single-page Method 4 flatten (AltFlattenSinglePage) instead of the two-page
+    // split (AltFlattenSpread), without needing to hand-edit ImageProcessor to compare the two.
     var forceSingle = args.Contains("--force-single");
+    // NOTE: dewarpEnabled only affects the manual-crop-override path now (TryApplyDewarp, the
+    // legacy book-curve dewarp curve) — the automatic Method 4 path this tool actually exercises
+    // folds curve-straightening into its own single-pass remap unconditionally, so --no-dewarp
+    // has no effect on a normal (non-manual-override) `process` run. Kept for the manual-path
+    // diagnostics below (dewarp-lines/dewarp-model) and for the rare manual-crop fixture.
     var noDewarp = args.Contains("--no-dewarp");
 
     if (!Directory.Exists(inputDir))
@@ -340,6 +363,48 @@ static int RunAltFlatten(string[] args)
         catch (Exception ex)
         {
             Console.Error.WriteLine($"  FAILED: {ex.Message}");
+        }
+    }
+    return 0;
+}
+
+static int RunSingleFlatten(string[] args)
+{
+    if (args.Length < 3) { PrintUsage(); return 1; }
+    var target = args[1];
+    var outDir = args[2];
+    Directory.CreateDirectory(outDir);
+
+    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
+        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
+    IEnumerable<string> files = Directory.Exists(target)
+        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
+        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
+    var fileList = files.ToList();
+
+    if (fileList.Count == 0)
+    {
+        Console.Error.WriteLine($"No image(s) found at {target}");
+        return 1;
+    }
+
+    var processor = new ImageProcessor();
+    foreach (var path in fileList)
+    {
+        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
+        try
+        {
+            var png = processor.DebugAltFlattenSinglePage(bytes);
+            var baseName = Path.GetFileNameWithoutExtension(path);
+            var outPath = Path.Combine(outDir, baseName + "_singleflat.png");
+            File.WriteAllBytes(outPath, png);
+            Console.WriteLine($"  -> {outPath}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"  FAILED: {ex}");
         }
     }
     return 0;

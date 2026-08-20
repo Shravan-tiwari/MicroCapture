@@ -78,6 +78,14 @@ public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Wi
 public partial class ImageProcessor
 {
     // --- Configuration ---
+    // The DPI at which a capture's pixel dimensions are left unresampled — the camera has no
+    // fixed native optical DPI concept (a real print/scan DPI would require sensor size +
+    // capture distance + lens geometry, none of which is calibrated anywhere in this app), so
+    // this is a chosen reference point, not a measured one. AvailableDpiOptions' smallest value
+    // (150) is deliberately the baseline: every higher selection upsamples toward more pixels,
+    // and nothing ever downsamples away real captured detail just because of this setting. See
+    // ResizeForDpi.
+    public const int BaselineDpi = 150;
     public double CropConfidenceThreshold { get; set; } = 0.5;
     // Below this, detection is unreliable enough that Crop Review shouldn't pre-fill a
     // suggestion at all — full-frame/manual is the safer default. Between this and
@@ -214,6 +222,13 @@ public partial class ImageProcessor
     // page edge — reject and fall back rather than trust it. 20% is a generous ceiling: the
     // real defect this was built for (Trapezoid_Image001) implied roughly 3-5%.
     public double BoundaryCurveMaxOffsetFraction { get; set; } = 0.2;
+    // Below this, a fitted edge's "bend" is indistinguishable from Canny edge-point jitter
+    // (the band search itself tolerates up to BoundaryCurveBandPx=30px of scatter) — not a
+    // real correction worth paying for. Matters most for an already-cropped page (e.g. the
+    // second TryAutoCrop pass an auto-split half gets inside ProcessSinglePage): re-fitting
+    // curves against fresh edges of an already-rectified page can "find" a few noise pixels
+    // of fake bend and pay for a whole extra Cv2.Remap pass to correct essentially nothing.
+    public double BoundaryCurveNegligibleOffsetPx { get; set; } = 2.0;
     // Boundary-curve rectification (above) guarantees the page's *outer* rectangle comes out
     // straight — it does not guarantee interior content does too, because a Coons-patch blend
     // of only 4 edge curves can't represent every real page's actual per-line distortion.
@@ -387,7 +402,7 @@ public partial class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool useAltPipeline = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -422,108 +437,116 @@ public partial class ImageProcessor
             using var undistorted = lensCalibration is { } calib ? SafeUndistort(rawSrc, calib, result) : null;
             var src = undistorted ?? rawSrc;
 
-            // Alt pipeline (see AltBoundaryPipeline.cs): a self-contained alternative to
-            // everything below (DetectGutter split-decision, TryAutoCrop, TryDeskew,
-            // TryApplyDewarp, TryApplyLineMesh) — it runs its own edge trace directly on the
-            // whole frame and decides split-vs-single-page from its own gutter-notch detection,
-            // which is a superset of what DetectGutter's brightness-band pre-check does. Kept as
-            // a fully separate branch (not interleaved into the legacy sequence below) so a
-            // batch that doesn't opt in gets byte-identical output to before this toggle existed.
-            if (useAltPipeline)
-            {
-                var altSpread = AltFlattenSpread(src);
-                using (altSpread.Left.Flattened) using (altSpread.Right.Flattened)
-                {
-                    var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                    WriteTiff(outLeft, altSpread.Left.Flattened, meta, false);
-                    result.OutputFilePaths.Add(outLeft);
-
-                    var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                    WriteTiff(outRight, altSpread.Right.Flattened, meta, false);
-                    result.OutputFilePaths.Add(outRight);
-                }
-                result.Success = true;
-                return result;
-            }
-
-            // Automatic (non-manual) captures never got a chance to route through the split
-            // path unless an operator remembered to check Batch.SplitBookPages up front — in
-            // practice most real spreads went through the single-whole-image quad path
-            // instead, which is a poor fit for book curvature (one cubic trying to model two
-            // independent per-page bowl shapes meeting at a spine trough).
+            // Canonical pipeline (see AltBoundaryPipeline.cs): Method 4 (Gx sign-change count +
+            // gutter-anchored span + RANSAC-guided continuity walk + finger bridging +
+            // strength/straightness widen-retry) side-edge detection, combined with the
+            // top/bottom continuity trace + gutter-notch split + cubic-bow single-pass remap —
+            // this is the only automatic (non-manual-override) boundary/dewarp path now; the
+            // old contour/confidence-based TryAutoCrop + TryDeskew + TryApplyDewarp +
+            // TryApplyLineMesh chain (still used below for the manualOverride path, where the
+            // operator's own drawn quad IS the boundary and there's nothing left to
+            // auto-detect) chained up to 5 sequential lossy Cubic-interpolation resamples —
+            // crop, up to 2 deskew sub-corrections, book-curve dewarp, and an unconditional
+            // line-mesh pass — each compounding blur on the last. Method 4's flatten does ALL
+            // geometric correction (crop rectification + curve straightening + width/perspective
+            // correction + tilt fix) in exactly ONE Cv2.Remap call with InterpolationFlags.Linear,
+            // matching the notebook exactly — this is the fix for that compounding-blur behavior.
             //
-            // The spine-shadow gutter signal (DetectGutter), not the two-page contour detector
-            // below, is what actually distinguishes a real spread from a real single page on
-            // this app's own captures: validated against the operator's real photo fixtures
-            // (tools/SmokeTest/Fixtures/real-photos), all 4 genuine book-curve spreads scored
-            // gutter confidence 0.23-0.79 and the one genuine single trapezoid page scored
-            // 0.05 — cleanly on either side of GutterConfidenceThreshold (0.08). The contour
-            // detector (DetectTwoPageBoundaries), by contrast, found zero of those 5 photos:
-            // real spreads with pages pressed together at the spine (no visible physical gap,
-            // just a shadow) trace as one contour, exactly per its own doc comment. It's kept
-            // below purely as an opportunistic quality upgrade for the (rarer) spread that does
-            // have a visible gap, never as the trigger for whether to split at all.
+            // The spine-shadow gutter signal (DetectGutter) still decides split-vs-single: this
+            // is a real, validated signal (see its own doc comment — confirmed against the
+            // operator's real photo fixtures, all 4 genuine spreads scored gutter confidence
+            // 0.23-0.79 and the one genuine single trapezoid page scored 0.05, cleanly on either
+            // side of GutterConfidenceThreshold) and the notebook itself never covers this
+            // decision (it only ever processes already-split single-page images), so there is no
+            // notebook behavior to defer to here — kept exactly as before rather than re-derived.
             // Skipped entirely under manualOverride: an operator who already reviewed the crop
             // in Crop Review made an explicit choice that shouldn't be second-guessed.
-            var gutter = DetectGutter(src, GutterMinFlankMarginFraction);
-            var autoSplitBySpine = !manualOverride
-                && gutter.Confidence >= GutterConfidenceThreshold
-                && gutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold;
-
-            if (splitPages || autoSplitBySpine)
+            if (!manualOverride)
             {
-                var autoTwoPage = !manualOverride ? DetectTwoPageBoundaries(src) : default;
-                var autoTwoPageConfident = autoTwoPage.Found
-                    && autoTwoPage.Left.Confidence >= MediumConfidenceThreshold
-                    && autoTwoPage.Right.Confidence >= MediumConfidenceThreshold;
+                var autoGutter = DetectGutter(src, GutterMinFlankMarginFraction);
+                var autoSplit = splitPages
+                    || (autoGutter.Confidence >= GutterConfidenceThreshold && autoGutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold);
 
+                if (autoSplit)
+                {
+                    var altSpread = AltFlattenSpread(src);
+                    using var leftFlat = altSpread.Left.Flattened;
+                    using var rightFlat = altSpread.Right.Flattened;
+                    // Method 4 doesn't expose a separate "found real edges" flag on its result
+                    // the way the legacy TryAutoCrop path does (result.WasCropped, set only
+                    // inside that method) — a split always produces a real geometric flatten of
+                    // each half, so "differs from the pre-split half's own raw dimensions" is
+                    // the honest available signal here.
+                    result.WasCropped = leftFlat.Cols != src.Cols / 2 || leftFlat.Rows != src.Rows
+                        || rightFlat.Cols != src.Cols / 2 || rightFlat.Rows != src.Rows;
+
+                    using var leftFinished = FinishPageProcessing(leftFlat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                    var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
+                    WriteTiff(outLeft, leftFinished, meta, result.WasBinarized);
+                    result.OutputFilePaths.Add(outLeft);
+
+                    using var rightFinished = FinishPageProcessing(rightFlat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                    var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
+                    WriteTiff(outRight, rightFinished, meta, result.WasBinarized);
+                    result.OutputFilePaths.Add(outRight);
+
+                    if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (spine shadow) — split into left/right pages automatically.");
+                    result.Success = true;
+                    return result;
+                }
+                else
+                {
+                    var altSingle = AltFlattenSinglePage(src);
+                    using var flat = altSingle.Flattened;
+                    // Same reasoning as the split branch above: "output dimensions differ from
+                    // the raw source" is the honest, available signal for whether Method 4
+                    // found and applied a real geometric correction versus degrading to an
+                    // effective pass-through on a featureless/low-signal capture.
+                    result.WasCropped = flat.Cols != src.Cols || flat.Rows != src.Rows;
+                    using var finished = FinishPageProcessing(flat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+
+                    var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
+                    var outPath = Path.Combine(outputDirectory, outName);
+                    WriteTiff(outPath, finished, meta, result.WasBinarized);
+                    result.OutputFilePaths.Add(outPath);
+                    result.Success = true;
+                    return result;
+                }
+            }
+
+            // --- Manual-override path only, from here down: the operator's own saved crop
+            // quad(s) already ARE the page boundary (drawn/confirmed in Crop Review), so there's
+            // nothing for Method 4 to auto-detect — this keeps using WarpQuad + the legacy
+            // deskew/dewarp/mesh touch-ups (ProcessSinglePage) exactly as before. manualOverride
+            // is always true below this point (the automatic/non-override path already
+            // returned above), so the old auto-two-page-contour branch that used to sit here is
+            // gone — it only ever ran for a non-manual capture, which now goes through Method 4
+            // instead (DetectTwoPageBoundaries is otherwise unused by this method now, but is
+            // still called by the UI's own boundary lookups elsewhere in this file).
+            var gutter = DetectGutter(src, GutterMinFlankMarginFraction);
+
+            if (splitPages)
+            {
                 // Split logic. Each side is parsed to its 4 corners; a plain saved strip
-                // (today's UI) is an axis-aligned quad and takes WarpQuad's cheap-crop path,
-                // while a per-half quad (manual edit, or an auto-detected page contour) gets a
-                // real warp — one shared implementation, no special-casing here.
+                // (today's UI) is an axis-aligned quad and takes WarpQuad's cheap-crop path.
                 Point2f[] leftCorners, rightCorners;
-                if (manualOverride && !string.IsNullOrEmpty(leftCrop) && !string.IsNullOrEmpty(rightCrop))
+                if (!string.IsNullOrEmpty(leftCrop) && !string.IsNullOrEmpty(rightCrop))
                 {
                     leftCorners = ParseCropCorners(leftCrop, src.Width, src.Height);
                     rightCorners = ParseCropCorners(rightCrop, src.Width, src.Height);
                 }
-                else if (autoTwoPageConfident && autoTwoPage.Left.Quad != null && autoTwoPage.Right.Quad != null)
-                {
-                    // Each half already comes from its own independently-detected page
-                    // contour (real edges, not an axis-aligned guess at a shared split line) —
-                    // this is what makes a V-cradle spread's asymmetric, draping page shapes
-                    // work, where a single vertical split line would not.
-                    leftCorners = autoTwoPage.Left.Quad;
-                    rightCorners = autoTwoPage.Right.Quad;
-                    if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (page contours) — split into left/right pages automatically.");
-                }
                 else
                 {
-                    // Best-effort automatic gutter detection; falls back to an even
-                    // 50/50 split when no confident spine shadow is found.
-                    //
-                    // Tried and reverted: cropping the whole spread's own boundary first (the
-                    // same detector TryAutoCrop already trusts for a single page, which does
-                    // crop the whole spread reliably) and splitting *that* instead of the raw
-                    // frame. It reliably removed the background/hand clutter that otherwise
-                    // defeats each half's own auto-crop — but a single straight vertical cut
-                    // through a rectified whole-spread crop doesn't track a real book's spine,
-                    // which isn't a straight vertical line once there's any page curvature or
-                    // camera tilt. Confirmed on a real photo: the "right" half's crop landed far
-                    // enough left of the true spine to include a legible, non-mirrored chunk of
-                    // the *left* page's own text — genuine cross-page content contamination,
-                    // not the faint mirrored show-through of real paper bleedthrough. That's a
-                    // worse failure than the background-inclusion problem it was meant to fix
-                    // (a background-inclusive crop only wastes space; this loses/duplicates real
-                    // page content), so it's reverted rather than shipped. The background-in-half
-                    // gap therefore remains open — see the validation report.
+                    // No saved manual quads yet for this split (e.g. Crop Review's split
+                    // toggle was just turned on) — best-effort automatic gutter detection,
+                    // falling back to an even 50/50 split when no confident spine shadow is
+                    // found.
                     var splitX = gutter.Confidence >= GutterConfidenceThreshold
                         ? (int)Math.Round(src.Width * gutter.Fraction)
                         : src.Width / 2;
                     splitX = Math.Clamp(splitX, 1, src.Width - 1);
                     leftCorners = RectCorners(0, 0, splitX, src.Height);
                     rightCorners = RectCorners(splitX, 0, src.Width - splitX, src.Height);
-                    if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (spine shadow) — split into left/right pages automatically.");
                 }
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
@@ -621,7 +644,7 @@ public partial class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool useAltPipeline = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -666,33 +689,52 @@ public partial class ImageProcessor
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
 
-                if (useAltPipeline)
+                // Method 4 single-page flatten within a padded search region around the
+                // calibrated rectangle — a fixed frame is always a single page (no per-shot
+                // manual quad concept exists for a copy-stand rig), so this is always the
+                // automatic-detection path, same as Process's own !manualOverride branch. The
+                // calibrated rectangle may not exactly match the real page edge, so the trace
+                // needs margin around it to find the true boundary (FixedFrameSearchPadFraction,
+                // same convention the old searchRegion path used).
+                var padded = ClampRectToBounds(new Rect(
+                    (int)Math.Round(rect.X - rect.Width * FixedFrameSearchPadFraction),
+                    (int)Math.Round(rect.Y - rect.Height * FixedFrameSearchPadFraction),
+                    (int)Math.Round(rect.Width * (1 + 2 * FixedFrameSearchPadFraction)),
+                    (int)Math.Round(rect.Height * (1 + 2 * FixedFrameSearchPadFraction))), src.Cols, src.Rows);
+                var sub = new Mat(src, padded);
+                var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
+                var altResult = AltFlattenSinglePage(sub);
+                // A featureless/low-signal capture (nothing for Method 4 to find anywhere in
+                // the padded search region — confirmed on a flat solid-color synthetic image)
+                // makes AltFlattenPage's own defensive fallback return an unrefined pass-through
+                // of the padded region, not the operator's actual calibrated rectangle — worse
+                // than just trusting the calibration directly, since it includes the extra
+                // search margin and none of the correction the padding exists to allow for. Fall
+                // back to a plain crop of the calibrated rect itself in that case; it's the
+                // rig's own known-good boundary, not a heuristic guess.
+                Mat flat;
+                if (altResult.FoundRealEdges)
                 {
-                    // Same padded-search-region convention as the legacy searchRegion path
-                    // (FixedFrameSearchPadFraction) — the calibrated rectangle may not exactly
-                    // match the real page edge, so the alt trace needs margin to find it.
-                    var padded = ClampRectToBounds(new Rect(
-                        (int)Math.Round(rect.X - rect.Width * FixedFrameSearchPadFraction),
-                        (int)Math.Round(rect.Y - rect.Height * FixedFrameSearchPadFraction),
-                        (int)Math.Round(rect.Width * (1 + 2 * FixedFrameSearchPadFraction)),
-                        (int)Math.Round(rect.Height * (1 + 2 * FixedFrameSearchPadFraction))), src.Cols, src.Rows);
-                    using var sub = new Mat(src, padded);
-                    using var altResult = AltFlattenSinglePage(sub).Flattened;
-                    WriteTiff(outPath, altResult, meta, false);
-                    result.OutputFilePaths.Add(outPath);
+                    flat = altResult.Flattened;
+                    sub.Dispose();
                 }
                 else
                 {
-                    var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                    using var processed = ProcessSinglePage(src, frameResult, skipAutoCrop: false, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, searchRegion: rect, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
-                    WriteTiff(outPath, processed, meta, frameResult.WasBinarized);
-                    result.OutputFilePaths.Add(outPath);
-
-                    result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
-                    result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
-                    result.BlurScore = frameResult.BlurScore;
-                    result.ExposureScore = frameResult.ExposureScore;
+                    altResult.Flattened.Dispose();
+                    sub.Dispose();
+                    flat = new Mat(src, rect).Clone();
                 }
+                using (flat)
+                using (var finished = FinishPageProcessing(flat, frameResult, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance))
+                {
+                    WriteTiff(outPath, finished, meta, frameResult.WasBinarized);
+                }
+                result.OutputFilePaths.Add(outPath);
+
+                result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
+                result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
+                result.BlurScore = frameResult.BlurScore;
+                result.ExposureScore = frameResult.ExposureScore;
             }
 
             result.Success = true;
@@ -710,8 +752,9 @@ public partial class ImageProcessor
     /// <summary>Writes a processed page as TIFF, tagging it with the batch's chosen DPI and
     /// Software/DateTime/Artist metadata so the file's own properties are correct instead of
     /// absent (Explorer/Photoshop default an untagged TIFF to 96 DPI, which has nothing to do
-    /// with what was actually captured). This only sets metadata tags — it does not resample or
-    /// add pixel detail.
+    /// with what was actually captured). This only sets metadata tags — <paramref name="mat"/>'s
+    /// pixel dimensions are expected to already reflect the chosen DPI by the time this is
+    /// called (see <see cref="ResizeForDpi"/>, applied upstream in every caller).
     ///
     /// Writes pixel data and every tag in one single-pass LibTiff.NET "w"-mode session — same
     /// approach <see cref="WriteBitonalTiff"/> already used, now used here too. This method used
@@ -1048,6 +1091,14 @@ public partial class ImageProcessor
         return new Rect(minX, minY, Math.Max(1, maxX - minX), Math.Max(1, maxY - minY));
     }
 
+    /// <summary>Manual-crop-quad path only: the operator already drew the exact page boundary
+    /// in Crop Review, so there's nothing for Method 4 to auto-detect here — this still runs
+    /// deskew/book-curve-dewarp/line-mesh (all opt-in/low-risk geometric touch-ups on top of an
+    /// already-correct crop) before handing off to <see cref="FinishPageProcessing"/> for the
+    /// shared tail (finger/bleedthrough/enhance/manual-adjust/QC/resize/binarize). The automatic
+    /// (non-manual-override) capture path no longer calls this — see
+    /// <see cref="ProcessAutoDetected"/>, which runs the Method 4 single-pass flatten instead of
+    /// TryAutoCrop/TryDeskew/TryApplyDewarp/TryApplyLineMesh.</summary>
     private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var working = input.Clone();
@@ -1066,6 +1117,20 @@ public partial class ImageProcessor
         // on the user's own annotated Trapezoid_Image001 screenshot, which has no book
         // curvature at all. See TryApplyLineMesh's own doc comment.
         working = TryApplyLineMesh(working, result) ?? working;
+
+        return FinishPageProcessing(working, result, binarizeEnabled, dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+    }
+
+    /// <summary>Shared tail of every page-processing path (Method 4 auto-detect AND the manual-
+    /// crop-quad path above): finger removal, bleedthrough suppression, enhancement/sharpen,
+    /// optional manual (operator) adjustments, quality checks, DPI resample, and optional
+    /// binarization — every real, independently-valuable feature that has nothing to do with
+    /// HOW the page's geometric boundary/curvature correction was produced. Takes ownership of
+    /// <paramref name="working"/> (disposes intermediate Mats as it reassigns the local, exactly
+    /// as the old inline tail in <see cref="ProcessSinglePage"/> did) and returns the final Mat
+    /// for the caller to write out.</summary>
+    private Mat FinishPageProcessing(Mat working, ProcessingResult result, bool binarizeEnabled, int dpi, bool bleedthroughEnabled, bool hasManualAdjustments, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
+    {
         working = TryRemoveFingers(working, result) ?? working;
         // Before enhancement/sharpen so a sharpen pass doesn't crisp up leftover ghosting, and
         // before binarization so Sauvola's own local threshold isn't skewed by it either.
@@ -1088,6 +1153,12 @@ public partial class ImageProcessor
         // blur/exposure scores are meaningless once thresholded to pure black-and-white, so
         // binarization runs last, after QC rather than before it.
         RunQualityChecks(working, result);
+        // Resize before binarization (not after): DespeckleBinary's blob-size floor is scaled
+        // against actual pixel density, so it needs to see the image at its final pixel grid,
+        // not the pre-resize one. Everything before this point (crop/deskew/dewarp/mesh/QC)
+        // deliberately runs at native capture resolution, where all of this class's other
+        // pixel-footprint tunables (Sharpen's sigma, CLAHE tile size, etc.) were tuned.
+        working = ResizeForDpi(working, dpi);
         working = TryApplyBinarization(working, result, binarizeEnabled, dpi);
 
         return working;
@@ -1674,7 +1745,7 @@ public partial class ImageProcessor
                 // straight-line corner refinement alone. RectifyWithBoundaryCurves never throws
                 // and returns null whenever it can't trust the evidence, so falling back to the
                 // corner-only path is always safe.
-                var boundaryRectified = RectifyWithBoundaryCurves(src, detection.Quad, BoundaryCurveBandPx, BoundaryCurveMinInliers, BoundaryCurveMaxOffsetFraction);
+                var boundaryRectified = RectifyWithBoundaryCurves(src, detection.Quad, BoundaryCurveBandPx, BoundaryCurveMinInliers, BoundaryCurveMaxOffsetFraction, BoundaryCurveNegligibleOffsetPx);
                 if (boundaryRectified != null)
                 {
                     cropped = boundaryRectified;
@@ -2487,7 +2558,7 @@ public partial class ImageProcessor
     /// curve, or a fitted curve implies an implausibly large bend — callers should fall back to
     /// <see cref="RefineQuadCorners"/> + <see cref="WarpQuad"/> in that case, exactly as if this
     /// method didn't exist.</summary>
-    private static Mat? RectifyWithBoundaryCurves(Mat src, Point2f[] quad, double bandPx, int minInliers, double maxOffsetFraction)
+    private static Mat? RectifyWithBoundaryCurves(Mat src, Point2f[] quad, double bandPx, int minInliers, double maxOffsetFraction, double negligibleOffsetPx = 0.0)
     {
         if (quad.Length != 4) return null;
         try
@@ -2510,6 +2581,15 @@ public partial class ImageProcessor
             // area sanity gate.
             if (t.MaxAbsOffset > height * maxOffsetFraction || bo.MaxAbsOffset > height * maxOffsetFraction
                 || le.MaxAbsOffset > width * maxOffsetFraction || ri.MaxAbsOffset > width * maxOffsetFraction)
+                return null;
+
+            // All 4 edges are already within noise-floor of straight — skip paying for a full
+            // Cv2.Remap pass to "correct" what's indistinguishable from Canny jitter. Return the
+            // unmodified source so the caller's own null-fallback path (WarpQuad) still runs,
+            // but without this method itself compounding resample blur for nothing.
+            if (negligibleOffsetPx > 0
+                && t.MaxAbsOffset <= negligibleOffsetPx && bo.MaxAbsOffset <= negligibleOffsetPx
+                && le.MaxAbsOffset <= negligibleOffsetPx && ri.MaxAbsOffset <= negligibleOffsetPx)
                 return null;
 
             var (tl, tr, br, bl) = (quad[0], quad[1], quad[2], quad[3]);
@@ -4027,6 +4107,32 @@ public partial class ImageProcessor
         return Rank(candidate) > Rank(current) ? candidate : current;
     }
 
+    // ───────────── DPI RESAMPLE ─────────────
+
+    /// <summary>Resamples pixel dimensions so a higher DPI selection actually produces a larger
+    /// output file, not just a different resolution tag. The camera has no true native optical
+    /// DPI to resample from/to — see <see cref="BaselineDpi"/>'s own doc comment — so this
+    /// scales relative to that chosen reference point instead: <paramref name="dpi"/> at or
+    /// below <see cref="BaselineDpi"/> leaves pixels untouched (this setting never discards real
+    /// captured detail by downsampling), anything above it upsamples proportionally
+    /// (dpi/BaselineDpi in each dimension). Runs after every geometric/enhancement step, right
+    /// before binarization, so all of this class's other pixel-footprint-tuned steps
+    /// (Sharpen's sigma, CLAHE tile size, edge-detection bands, etc.) keep operating at the
+    /// resolution they were actually tuned against.</summary>
+    private static Mat ResizeForDpi(Mat src, int dpi)
+    {
+        if (dpi <= BaselineDpi) return src;
+
+        var scale = dpi / (double)BaselineDpi;
+        var newWidth = Math.Max(1, (int)Math.Round(src.Cols * scale));
+        var newHeight = Math.Max(1, (int)Math.Round(src.Rows * scale));
+
+        var resized = new Mat();
+        Cv2.Resize(src, resized, new Size(newWidth, newHeight), 0, 0, InterpolationFlags.Cubic);
+        src.Dispose();
+        return resized;
+    }
+
     // ───────────── BINARIZATION ─────────────
 
     /// <summary>Applies Sauvola binarization if enabled, and reports what happened via
@@ -4151,7 +4257,10 @@ public partial class ImageProcessor
     /// filtering specifically because it preserves genuine thin strokes while dropping isolated
     /// noise pixels, since it filters by connected blob size rather than a fixed spatial
     /// footprint. The area floor scales with DPI (~4px² at 300 DPI) since "how many pixels make
-    /// up a real stroke fragment" is a resolution-relative question, not an absolute one.</summary>
+    /// up a real stroke fragment" is a resolution-relative question, not an absolute one.
+    /// Scaled against BaselineDpi (the DPI that leaves pixel dimensions unresampled — see
+    /// ResizeForDpi) rather than a hardcoded 300, so the floor tracks the actual pixel density
+    /// of the bilevel image being despeckled, not just the nominal tag value.</summary>
     private static Mat DespeckleBinary(Mat bilevel, int dpi)
     {
         using var inverted = new Mat();
@@ -4162,7 +4271,7 @@ public partial class ImageProcessor
         using var centroids = new Mat();
         var labelCount = Cv2.ConnectedComponentsWithStats(inverted, labels, stats, centroids, PixelConnectivity.Connectivity8);
 
-        var scale = dpi / 300.0;
+        var scale = dpi / (double)BaselineDpi;
         var minBlobPixels = Math.Max(2, (int)Math.Round(4.0 * scale * scale));
 
         var keep = new bool[labelCount];

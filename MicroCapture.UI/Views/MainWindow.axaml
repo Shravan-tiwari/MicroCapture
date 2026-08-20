@@ -52,13 +52,13 @@
                     <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (B&amp;W)"
                               ToolTip.Tip="Thresholds every processed page to pure black-and-white (Sauvola local threshold) and writes it as a true 1-bit CCITT G4 TIFF — much smaller files and crisper OCR input, but loses all color/grayscale content. Not reversible after export."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding UseAltBoundaryPipeline}" Content="Alt Boundary Pipeline (Beta)"
-                              ToolTip.Tip="Uses an alternative edge-detection and page-flatten algorithm instead of the default one. Detects its own two-page splits automatically. Not compatible with Fixed Frames."
+                    <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough Suppression"
+                              ToolTip.Tip="Softens show-through from text/images printed on the reverse side of a thin page. Not effective on colored-image bleedthrough — grayscale/text show-through only."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
                               Width="90" ToolTip.Tip="Default export format for the next batch"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
-                              Width="90" ToolTip.Tip="DPI tagged on every processed TIFF in this batch (resolution metadata only — does not change captured pixel detail)">
+                              Width="90" ToolTip.Tip="DPI tagged on every processed TIFF in this batch. 150 is the baseline (native captured pixel size); higher values upsample the output — 600 DPI is roughly 4x the pixel dimensions of 150 DPI.">
                         <ComboBox.ItemTemplate>
                             <DataTemplate>
                                 <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>

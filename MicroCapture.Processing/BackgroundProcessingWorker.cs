@@ -83,7 +83,6 @@ public class BackgroundProcessingWorker
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
-                    bool useAltPipeline = job.Batch?.UseAltBoundaryPipeline ?? false;
                     var metadata = new TiffMetadata(job.Batch?.Dpi ?? 300, job.Batch?.Operator, job.Timestamp);
                     // Batch.CameraCalibration snapshots whichever lens calibration was active
                     // at Start Batch (see Batch.CameraCalibrationId's own comment) — parse its
@@ -94,10 +93,10 @@ public class BackgroundProcessingWorker
                     LensCalibration? lensCalibration = calibrationEntity != null
                         ? ImageProcessor.ParseLensCalibration($"{calibrationEntity.CameraMatrix};{calibrationEntity.DistCoeffs};{calibrationEntity.ImageWidth},{calibrationEntity.ImageHeight}")
                         : null;
-                    bool bleedthroughEnabled = false;
+                    bool bleedthroughEnabled = job.Batch?.BleedthroughEnabled ?? false;
                     var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, useAltPipeline, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, useAltPipeline, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance);
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {
