@@ -50,6 +50,15 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private bool _isCalibrating;
     [ObservableProperty] private FrameCalibrationViewModel? _calibrationViewModel;
     [ObservableProperty] private LensCalibrationViewModel? _lensCalibrationViewModel;
+
+    /// <summary>True when the live camera feed's own panel should be shown — false while any
+    /// of the sibling panels that share its grid cell (calibration, Crop Review) are active.
+    /// The live view keeps running underneath regardless (see ActiveCropReview's own remarks);
+    /// this only controls which panel is visually on top.</summary>
+    public bool IsShowingLiveView => !IsCalibrating && ActiveCropReview == null;
+
+    partial void OnIsCalibratingChanged(bool value) => OnPropertyChanged(nameof(IsShowingLiveView));
+    partial void OnActiveCropReviewChanged(CropReviewViewModel? value) => OnPropertyChanged(nameof(IsShowingLiveView));
     // Run OCR and Export Batch must never overlap — both touch the same jobs' OCR/export
     // status, and a PDF export runs OCR itself first if it isn't already done.
     [ObservableProperty]
@@ -68,7 +77,7 @@ public partial class MainWindowViewModel : ViewModelBase
     // option) is the baseline — the camera has no fixed native optical DPI, so pixel dimensions
     // are left untouched there, and every higher selection upsamples proportionally (never
     // downsamples away real captured detail). See ImageProcessor.BaselineDpi/ResizeForDpi.
-    [ObservableProperty] private int _selectedDpi = 300;
+    [ObservableProperty] private int _selectedDpi = 150;
     public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
 
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
@@ -745,6 +754,7 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
         if (IsCalibrating) { StatusText = "Finish or cancel calibration before capturing."; return; }
+        if (ActiveCropReview != null) { StatusText = "Finish or cancel crop review before capturing."; return; }
         if (!IsConnected) { StatusText = "Camera not connected"; return; }
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
@@ -787,6 +797,7 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
         if (IsCalibrating) { StatusText = "Finish or cancel calibration before capturing."; return; }
+        if (ActiveCropReview != null) { StatusText = "Finish or cancel crop review before capturing."; return; }
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
         var pageStr = PageCount.ToString("D6");
@@ -1039,12 +1050,17 @@ public partial class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(HasSelection));
     }
 
+    // Non-null while Crop Review is open — MainWindow.axaml hosts a CropReviewWindow view bound
+    // to this, replacing the live camera view in place (same pattern as CalibrationViewModel/
+    // LensCalibrationViewModel's own inline panels) instead of opening a separate popup window.
+    [ObservableProperty] private CropReviewViewModel? _activeCropReview;
+
     private void OpenCropReview(string jobId, IReadOnlyList<string>? selectionForBulkApply, bool openInAdjustMode = false)
     {
-        if (string.IsNullOrEmpty(jobId)) { Console.WriteLine($"[ReviewCrop] JobId is empty"); return; }
-        Console.WriteLine($"[ReviewCrop] Opening crop review for {jobId}");
-        var cropWindow = new CropReviewWindow();
-        Console.WriteLine($"[ReviewCrop] CropReviewWindow created");
+        if (string.IsNullOrEmpty(jobId)) return;
+
+        ActiveCropReview?.Dispose();
+
         var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
         if (openInAdjustMode) cropReviewViewModel.IsAdjustMode = true;
         // Give the thumbnail immediate feedback on save instead of leaving it looking
@@ -1055,40 +1071,29 @@ public partial class MainWindowViewModel : ViewModelBase
             if (thumbnail != null) thumbnail.Status = "Reprocessing…";
             ClearSelection();
         };
-        cropWindow.DataContext = cropReviewViewModel;
-        Console.WriteLine($"[ReviewCrop] CropReviewViewModel set as DataContext");
-        
-        // Show as a top-level window (since we don't have a direct reference to MainWindow here easily without injection, 
-        // we'll just show it non-modal, or we can use Avalonia's Application.Current)
-        if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop &&
-            desktop.MainWindow != null)
-        {
-            Console.WriteLine("[ReviewCrop] Calling Show");
+        cropReviewViewModel.ReviewClosed += (_, _) => CloseCropReview();
 
-            // Don't use modal dialog for this test
-            cropWindow.WindowStartupLocation =
-                Avalonia.Controls.WindowStartupLocation.CenterScreen;
-
-            // Remove Topmost for now
-            cropWindow.Show();
-
-            Console.WriteLine("[ReviewCrop] Show returned");
-        }
-        else
-        {
-            Console.WriteLine($"[ReviewCrop] Calling Show (desktop context not available)");
-            cropWindow.WindowStartupLocation = Avalonia.Controls.WindowStartupLocation.CenterScreen;
-            cropWindow.Topmost = true;
-            cropWindow.Show();
-            Console.WriteLine($"[ReviewCrop] Show called");
-        }
+        ActiveCropReview = cropReviewViewModel;
     }
 
-    /// <summary>Number of fixed frames the active batch is currently calibrated with, or 1 for
-    /// an ordinary (non-fixed-frame) batch — used to decide how many placeholder thumbnails one
-    /// capture should produce.</summary>
+    private void CloseCropReview()
+    {
+        var current = ActiveCropReview;
+        ActiveCropReview = null;
+        current?.Dispose();
+    }
+
+    /// <summary>Number of output pages one capture is expected to produce, for the current
+    /// batch's mode — used to decide how many placeholder thumbnails one shutter press should
+    /// create. Fixed frames and split-book-pages are mutually exclusive (see
+    /// OnUseFixedFramesChanged/OnSplitBookPagesChanged), so at most one of these branches ever
+    /// applies; both produce N&gt;1 files per capture (ImageProcessor.ProcessFixedFrames /
+    /// Process's split branch), each of which needs its own thumbnail slot or only the first
+    /// output file ever gets shown (see JobCompleted's FrameIndex-indexed lookup into
+    /// result.OutputFilePaths).</summary>
     private int GetCurrentFixedFrameCount()
     {
+        if (SplitBookPages) return 2;
         if (!IsFixedFrameBatch || _currentBatchId == null) return 1;
         var batch = _dbContext.Batches.Find(_currentBatchId);
         if (batch?.UseFixedFrames != true || string.IsNullOrWhiteSpace(batch.FixedFrames)) return 1;

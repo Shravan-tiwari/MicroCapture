@@ -35,6 +35,18 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private CropPoint[]? _detectedLeftQuad;
     private CropPoint[]? _detectedRightQuad;
 
+    // Method 4's raw traced boundary (top/bottom curve, left/right side edge, gutter line), in
+    // the original image's own pixel coordinates — kept separately from the 4-corner quads above
+    // so the overlay can draw what Method 4 actually found, while the draggable quad (derived
+    // from these same traces, see BuildQuadFromMethod4) remains the thing the operator edits and
+    // Save persists. Null when the job has a saved manual crop (no detection ran) or detection
+    // failed to load/decode the image.
+    [ObservableProperty] private CropPoint[]? _method4TopCurve;
+    [ObservableProperty] private CropPoint[]? _method4BottomCurve;
+    [ObservableProperty] private CropPoint[]? _method4LeftCurve;
+    [ObservableProperty] private CropPoint[]? _method4RightCurve;
+    [ObservableProperty] private CropPoint[]? _method4GutterLine;
+
     // A previously-saved manual dewarp curve, if any — seeded into DewarpTopPoints/BottomPoints
     // the first time the operator opens the curve editor this session. _dewarpTouched tracks
     // whether they actually did, so Save doesn't write dewarp data nobody looked at.
@@ -272,7 +284,6 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 using var stream = File.OpenRead(job.OriginalFilePath);
                 var bmp = new Bitmap(stream);
                 var batch = _dbContext.Batches.Find(job.BatchId);
-                var isSplit = batch?.SplitBookPages == true;
                 var hasSavedCrop = job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox);
                 var savedDewarp = job.DewarpManualOverrideApplied && !string.IsNullOrWhiteSpace(job.DewarpCurve)
                     ? ImageProcessor.ParseDewarpCurve(job.DewarpCurve!)
@@ -289,6 +300,20 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 double detectedSplit = 50.0;
                 double detectedConfidence = 0.0;
                 double highConfidenceThreshold = 0.5;
+                CropPoint[]? topCurve = null;
+                CropPoint[]? bottomCurve = null;
+                CropPoint[]? leftCurve = null;
+                CropPoint[]? rightCurve = null;
+                CropPoint[]? gutterLine = null;
+
+                // What the batch's own automatic pipeline (ImageProcessor.Process) would decide
+                // for THIS specific image, not just the batch-level checkbox — see
+                // DetectAutoSplit's own remarks. A saved crop's own shape (one box vs. two)
+                // still wins for a job the operator already reviewed; this only drives what gets
+                // detected/previewed for a job that hasn't been reviewed yet.
+                var isSplit = hasSavedCrop
+                    ? !string.IsNullOrWhiteSpace(job.RightCropBox)
+                    : new ImageProcessor().DetectAutoSplit(_imagePath, batch?.SplitBookPages == true);
 
                 if (hasSavedCrop)
                 {
@@ -307,12 +332,19 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                     highConfidenceThreshold = processor.CropConfidenceThreshold;
                     if (isSplit)
                     {
-                        var twoPage = processor.DetectSplitPageBoundaries(_imagePath);
-                        if (twoPage.HasValue)
+                        var spread = processor.DetectSpreadBoundaryMethod4(_imagePath);
+                        if (spread.HasValue)
                         {
-                            var (left, right) = twoPage.Value;
-                            detectedLeftQuad = left.Quad ?? RectCorners(left.X, left.Y, left.Width, left.Height);
-                            detectedRightQuad = right.Quad ?? RectCorners(right.X, right.Y, right.Width, right.Height);
+                            var b = spread.Value;
+                            topCurve = ToCurve(b.TopFinal);
+                            bottomCurve = ToCurve(b.BottomFinal);
+                            leftCurve = ToCurve(b.Left.Columns, b.Left.RowLo, columnIsX: false);
+                            rightCurve = ToCurve(b.Right.Columns, b.Right.RowLo, columnIsX: false);
+                            gutterLine = b.Gutter.Line.Select(p => new CropPoint(p.Column, p.Row)).ToArray();
+
+                            var gutterMidCol = (b.Gutter.TopNotch.Column + b.Gutter.BottomNotch.Column) / 2.0;
+                            detectedLeftQuad = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth, xMax: gutterMidCol);
+                            detectedRightQuad = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth, xMin: gutterMidCol);
                         }
                         else
                         {
@@ -321,11 +353,17 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                     }
                     else
                     {
-                        var boundary = processor.DetectDocumentBoundary(_imagePath);
-                        detectedCorners = boundary?.Quad ?? (boundary is { } b
-                            ? RectCorners(b.X, b.Y, b.Width, b.Height)
-                            : null);
-                        detectedConfidence = boundary?.Confidence ?? 0.0;
+                        var single = processor.DetectSinglePageBoundaryMethod4(_imagePath);
+                        if (single.HasValue)
+                        {
+                            var b = single.Value;
+                            topCurve = ToCurve(b.TopFinal);
+                            bottomCurve = ToCurve(b.BottomFinal);
+                            leftCurve = ToCurve(b.Left.Columns, b.Left.RowLo, columnIsX: false);
+                            rightCurve = ToCurve(b.Right.Columns, b.Right.RowLo, columnIsX: false);
+                            detectedCorners = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth);
+                            detectedConfidence = highConfidenceThreshold;
+                        }
                     }
                 }
 
@@ -348,6 +386,11 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                         _detectedLeftQuad = detectedLeftQuad;
                         _detectedRightQuad = detectedRightQuad;
                         _savedDewarp = savedDewarp;
+                        Method4TopCurve = topCurve;
+                        Method4BottomCurve = bottomCurve;
+                        Method4LeftCurve = leftCurve;
+                        Method4RightCurve = rightCurve;
+                        Method4GutterLine = gutterLine;
 
                         if (hasSavedCrop && savedCorners != null)
                         {
@@ -428,6 +471,60 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
 
     private static CropPoint[] RectCorners(double x, double y, double w, double h) =>
         new[] { new CropPoint(x, y), new CropPoint(x + w, y), new CropPoint(x + w, y + h), new CropPoint(x, y + h) };
+
+    /// <summary>Converts a Method 4 per-column trace (<c>AltSpreadBoundary.TopFinal</c>/
+    /// <c>BottomFinal</c>, one row-value per column starting at column 0) into dense
+    /// <see cref="CropPoint"/>s in original-image pixel space, for the overlay to draw as a
+    /// polyline.</summary>
+    private static CropPoint[] ToCurve(double[] rowPerColumn) =>
+        rowPerColumn.Select((row, col) => new CropPoint(col, row)).ToArray();
+
+    /// <summary>Converts a Method 4 side-edge trace (<c>AltSideEdgeTrace.Columns</c>, one
+    /// x-position per row starting at <paramref name="rowLo"/>) into dense pixel-space points.
+    /// <paramref name="columnIsX"/> is always false here (kept for symmetry with
+    /// <see cref="ToCurve(double[])"/> — the side trace is naturally row-indexed, x is the
+    /// value), named so a call site reads as "x is the column value, not the loop index".</summary>
+    private static CropPoint[] ToCurve(double[] xPerRow, int rowLo, bool columnIsX) =>
+        xPerRow.Select((x, i) => new CropPoint(x, rowLo + i)).ToArray();
+
+    /// <summary>Collapses Method 4's raw traced curves down to the 4-corner quad the existing
+    /// draggable-crop UI expects, by sampling the top/bottom curves and left/right side traces
+    /// at the requested column range's endpoints. <paramref name="xMin"/>/<paramref name="xMax"/>
+    /// restrict the sample to one half of a spread (left half: xMax = gutter column, right half:
+    /// xMin = gutter column); omitted for a single page, which uses the traces' own full extent.
+    /// This is a starting point for editing, not the shape shown to the operator — the overlay
+    /// draws the real curves separately (see Method4TopCurve etc.).</summary>
+    private static CropPoint[] BuildQuadFromMethod4(
+        CropPoint[]? topCurve, CropPoint[]? bottomCurve, CropPoint[]? leftCurve, CropPoint[]? rightCurve,
+        int imageWidth, double? xMin = null, double? xMax = null)
+    {
+        var lo = Math.Clamp((int)Math.Round(xMin ?? 0), 0, imageWidth - 1);
+        var hi = Math.Clamp((int)Math.Round(xMax ?? (imageWidth - 1)), lo, imageWidth - 1);
+
+        double TopAt(int x) => topCurve != null && x < topCurve.Length ? topCurve[x].Y : 0;
+        double BottomAt(int x) => bottomCurve != null && x < bottomCurve.Length ? bottomCurve[x].Y : 0;
+
+        // Side traces are row-indexed (one x-value per row), not column-indexed — use their own
+        // median x as a stable left/right bound rather than trying to look up a single row.
+        var leftX = leftCurve is { Length: > 0 } lc ? lc.Average(p => p.X) : lo;
+        var rightX = rightCurve is { Length: > 0 } rc ? rc.Average(p => p.X) : hi;
+        leftX = Math.Max(leftX, lo);
+        rightX = Math.Min(rightX, hi);
+        if (rightX <= leftX) { leftX = lo; rightX = hi; }
+
+        var topLeftY = TopAt((int)Math.Round(leftX));
+        var topRightY = TopAt((int)Math.Round(rightX));
+        var bottomLeftY = BottomAt((int)Math.Round(leftX));
+        var bottomRightY = BottomAt((int)Math.Round(rightX));
+
+        return new[]
+        {
+            new CropPoint(leftX, topLeftY),
+            new CropPoint(rightX, topRightY),
+            new CropPoint(rightX, bottomRightY),
+            new CropPoint(leftX, bottomLeftY),
+        };
+    }
 
     /// <summary>Called by the window while a corner is being dragged: snaps to a nearby real
     /// edge when one is close enough, then clamps the result so the quad can never become
@@ -713,20 +810,31 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         SchedulePreviewUpdate();
     }
 
+    /// <summary>Raised on Cancel, and after a successful Save (alongside <see cref="Saved"/>) —
+    /// tells the host (MainWindowViewModel, when this view model is embedded in place of the
+    /// live camera view) to swap back to the live view. Named independently of Saved since a
+    /// listener may care about "review is done, close it" without also handling the
+    /// reprocessing side-effect Saved exists for.</summary>
+    public event EventHandler? ReviewClosed;
+
     [RelayCommand]
-    private void Cancel(Window window)
+    private void Cancel()
     {
-        window?.Close();
+        ReviewClosed?.Invoke(this, EventArgs.Empty);
     }
 
     [RelayCommand]
-    private async Task Save(Window window)
+    private async Task Save()
     {
-        if (Image == null) { window?.Close(); return; }
+        if (Image == null) { ReviewClosed?.Invoke(this, EventArgs.Empty); return; }
 
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)
         {
+            var previousLeftBox = job.LeftCropBox;
+            var previousRightBox = job.RightCropBox;
+            var wasAlreadyManual = job.ManualOverrideApplied;
+
             if (IsSplitBookPages && IsTwoQuadSplit)
             {
                 job.LeftCropBox = FormatCorners(LeftQuad);
@@ -744,7 +852,14 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 job.RightCropBox = null;
             }
 
-            job.ManualOverrideApplied = true;
+            // Only pin this job to the legacy manual-crop pipeline (see ImageProcessor.Process's
+            // manualOverride branch) if the operator actually changed the crop geometry from
+            // what was already there — a job that already had a saved manual crop stays manual
+            // regardless (re-saving without touching it is still an explicit confirm of a manual
+            // shape), but a fresh, never-reviewed job that gets opened and saved untouched should
+            // stay on the automatic Method 4 path, not silently lose it forever.
+            var geometryChanged = job.LeftCropBox != previousLeftBox || job.RightCropBox != previousRightBox;
+            job.ManualOverrideApplied = wasAlreadyManual || geometryChanged;
 
             job.RotationDegrees = RotationDegrees;
             job.FlipHorizontal = FlipHorizontal;
@@ -791,7 +906,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             Saved?.Invoke(this, EventArgs.Empty);
         }
 
-        window?.Close();
+        ReviewClosed?.Invoke(this, EventArgs.Empty);
     }
 
     /// <summary>True only when this window was opened for a real multi-selection (via the

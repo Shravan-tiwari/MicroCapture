@@ -1380,6 +1380,46 @@ public partial class ImageProcessor
         return count;
     }
 
+    /// <summary>Single-page counterpart of <see cref="AltSpreadBoundary"/> — same top/bottom/
+    /// left/right trace fields, minus the gutter (a single page has no spine to notch). Everything
+    /// here is in the source image's own pixel coordinates.</summary>
+    public readonly record struct AltSinglePageBoundary(
+        AltEdgePoint[] TopRaw, double[] TopBridged, double[] TopFinal,
+        AltEdgePoint[] BottomRaw, double[] BottomBridged, double[] BottomFinal,
+        AltSideEdgeTrace Left, AltSideEdgeTrace Right,
+        int TopBridgedCount, int BottomBridgedCount);
+
+    /// <summary>Pure detection for a single (non-spread) page — same Phase 1-3 trace pipeline as
+    /// <see cref="AltDetectSpreadBoundary"/> minus the gutter notch step, matching
+    /// <see cref="AltFlattenSinglePage"/>'s own inline detection exactly (including its
+    /// hasRealGutter:false / image-center anchor for Method 4's span search — see that method's
+    /// own remarks). Does not crop or flatten anything.</summary>
+    public AltSinglePageBoundary AltDetectSinglePageBoundary(Mat img)
+    {
+        using var gray = new Mat();
+        Cv2.CvtColor(img, gray, ColorConversionCodes.BGR2GRAY);
+        using var gy = new Mat();
+        Cv2.Sobel(gray, gy, MatType.CV_32F, 0, 1, ksize: 3);
+        using var gx = new Mat();
+        Cv2.Sobel(gray, gx, MatType.CV_32F, 1, 0, ksize: 3);
+
+        var topRaw = AltTraceTopBottomEdge(img, gy, fromTop: true);
+        var bottomRaw = AltTraceTopBottomEdge(img, gy, fromTop: false);
+
+        var topBridged = AltRejectAndBridgeLowConfidenceRuns(topRaw, gy);
+        var bottomBridged = AltRejectAndBridgeLowConfidenceRuns(bottomRaw, gy);
+
+        var topBridgedCount = CountBridged(topRaw, topBridged);
+        var bottomBridgedCount = CountBridged(bottomRaw, bottomBridged);
+
+        var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
+        var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
+
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, img.Cols / 2, hasRealGutter: false);
+
+        return new AltSinglePageBoundary(topRaw, topBridged, topSmooth, bottomRaw, bottomBridged, bottomSmooth, method4.Left, method4.Right, topBridgedCount, bottomBridgedCount);
+    }
+
     // --- Phase 3: Sav-Gol smoothing ---
 
     /// <summary>Smoothing window (samples) for <see cref="AltSavGolFilter"/>, applied to the
@@ -1995,31 +2035,11 @@ public partial class ImageProcessor
     /// flatten math itself is symmetric, it just needs two edges to blend between).</summary>
     public AltFlattenResult AltFlattenSinglePage(Mat img)
     {
-        using var gray = new Mat();
-        Cv2.CvtColor(img, gray, ColorConversionCodes.BGR2GRAY);
-        using var gy = new Mat();
-        Cv2.Sobel(gray, gy, MatType.CV_32F, 0, 1, ksize: 3);
-        using var gx = new Mat();
-        Cv2.Sobel(gray, gx, MatType.CV_32F, 1, 0, ksize: 3);
-
-        var topRaw = AltTraceTopBottomEdge(img, gy, fromTop: true);
-        var bottomRaw = AltTraceTopBottomEdge(img, gy, fromTop: false);
-        var topBridged = AltRejectAndBridgeLowConfidenceRuns(topRaw, gy);
-        var bottomBridged = AltRejectAndBridgeLowConfidenceRuns(bottomRaw, gy);
-        var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
-        var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
-
-        // No real gutter/spine for a single page — Method 4's own span/symmetry math still
-        // needs SOME anchor column between the two sides for the symmetry check, so use the
-        // image center, matching the notebook's own fallback for "no better gutter estimate
-        // exists" (gutter_x_global = Wf // 2). hasRealGutter: false keeps that center column OUT
-        // of the span search itself (DetectMethod4Span falls back to widest-run instead of
-        // anchoring at a fake gutter) — see AltTraceSideEdgeMethod4Pair's own doc comment for
-        // the confirmed real-fixture bug this avoids (a single page's mask can have a merged run
-        // that straddles the image center without being anywhere near the true page edges).
-        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, img.Cols / 2, hasRealGutter: false);
-        var left = method4.Left;
-        var right = method4.Right;
+        var boundary = AltDetectSinglePageBoundary(img);
+        var topSmooth = boundary.TopFinal;
+        var bottomSmooth = boundary.BottomFinal;
+        var left = boundary.Left;
+        var right = boundary.Right;
 
         // Same median-based robust outer-bound clamp used for spread pages (see AltFlattenSpread
         // — Max()/Min() were confirmed non-robust to a jittery trace on real fixtures). A

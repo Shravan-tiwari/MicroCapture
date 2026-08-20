@@ -20,6 +20,10 @@ public class StatusSeverityConverter : IValueConverter
     private static readonly IBrush Warning = new SolidColorBrush(Color.Parse("#d99a3d"));
     private static readonly IBrush Fail = new SolidColorBrush(Color.Parse("#e5484d"));
     private static readonly IBrush Neutral = new SolidColorBrush(Color.Parse("#8a8f98"));
+    // A capture actively being processed — distinct from Neutral (which otherwise also covers
+    // "no status yet"/unrecognized strings) so "in progress" reads as a visibly different state
+    // from "nothing has happened" or "processed", not the same grey dot as both.
+    private static readonly IBrush InProgress = new SolidColorBrush(Color.Parse("#5e6ad2"));
 
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
@@ -38,6 +42,10 @@ public class StatusSeverityConverter : IValueConverter
 
         if (status.StartsWith('✓') || status is "Processed" or "READY TO CAPTURE" or "AUTO CAPTURE ACTIVE")
             return Success;
+
+        if (status is "Processing" or "Recapturing" or "Reprocessing…"
+            || status.Contains("Processing", StringComparison.OrdinalIgnoreCase))
+            return InProgress;
 
         return Neutral;
     }

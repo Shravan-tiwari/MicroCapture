@@ -225,6 +225,22 @@ public partial class MainWindow : Window
         }
     }
 
+    private void OnThumbnailSelectClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (sender is Button btn && btn.DataContext is MicroCapture.UI.ViewModels.ThumbnailItem item
+                && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
+            {
+                vm.ToggleThumbnailSelection(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Thumbnail] OnThumbnailSelectClick failed: {ex}");
+        }
+    }
+
     private async void OnDeleteThumbnailClick(object? sender, RoutedEventArgs e)
     {
         try

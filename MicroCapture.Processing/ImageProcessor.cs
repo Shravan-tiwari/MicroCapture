@@ -644,7 +644,7 @@ public partial class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, bool passthroughFixedFrames = true)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -688,6 +688,22 @@ public partial class ImageProcessor
 
                 var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
                 var outPath = Path.Combine(outputDirectory, outName);
+
+                if (passthroughFixedFrames)
+                {
+                    // Fixed frames are a calibrated, operator-trusted capture region on a
+                    // copy-stand rig — the operator's intent is "save exactly what's in this
+                    // rectangle," not run boundary detection/crop/dewarp/enhancement on top of
+                    // it. No Method 4, no FinishPageProcessing tail (finger removal,
+                    // bleedthrough, CLAHE, sharpen, binarize) — just crop to the calibrated rect
+                    // and resample to the target DPI so the TIFF's pixel dimensions match its
+                    // resolution tag (see ResizeForDpi/WriteTiff's own doc comments).
+                    using var cropped = new Mat(src, rect).Clone();
+                    using var resized = ResizeForDpi(cropped, meta.Dpi);
+                    WriteTiff(outPath, resized, meta, binarized: false);
+                    result.OutputFilePaths.Add(outPath);
+                    continue;
+                }
 
                 // Method 4 single-page flatten within a padded search region around the
                 // calibrated rectangle — a fixed frame is always a single page (no per-shot
@@ -2727,6 +2743,65 @@ public partial class ImageProcessor
         catch
         {
             return 50.0;
+        }
+    }
+
+    /// <summary>The real split-vs-single decision <see cref="Process"/> itself makes for a fresh
+    /// (non-manual-override) capture — see the <c>autoSplit</c> local at the top of <see
+    /// cref="Process"/>. Unlike <see cref="DetectGutterSplitPercent"/> (confidence only), this also
+    /// checks <c>AbsoluteDropLevels</c>, so it's the only faithful way to know, from outside
+    /// <see cref="Process"/>, whether Method 4 would treat a given image as a spread.</summary>
+    public bool DetectAutoSplit(string imagePath, bool splitPagesRequested)
+    {
+        if (!File.Exists(imagePath)) return splitPagesRequested;
+        try
+        {
+            using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
+            if (src.Empty()) return splitPagesRequested;
+            var gutter = DetectGutter(src, GutterMinFlankMarginFraction);
+            return splitPagesRequested
+                || (gutter.Confidence >= GutterConfidenceThreshold && gutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold);
+        }
+        catch
+        {
+            return splitPagesRequested;
+        }
+    }
+
+    /// <summary>Path-based wrapper around <see cref="AltDetectSpreadBoundary"/> for callers (Crop
+    /// Review's preview) that only have a file path, not an OpenCvSharp <see cref="Mat"/> — mirrors
+    /// the existing <see cref="DetectDocumentBoundary"/>/<see cref="DetectSplitPageBoundaries"/>
+    /// path-based convention. Returns null on any load/decode failure.</summary>
+    public AltSpreadBoundary? DetectSpreadBoundaryMethod4(string imagePath)
+    {
+        if (!File.Exists(imagePath)) return null;
+        try
+        {
+            using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
+            if (src.Empty()) return null;
+            return AltDetectSpreadBoundary(src);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Path-based wrapper around <see cref="AltDetectSinglePageBoundary"/>, mirroring
+    /// <see cref="DetectSpreadBoundaryMethod4"/> for the single-page case. Returns null on any
+    /// load/decode failure.</summary>
+    public AltSinglePageBoundary? DetectSinglePageBoundaryMethod4(string imagePath)
+    {
+        if (!File.Exists(imagePath)) return null;
+        try
+        {
+            using var src = Cv2.ImRead(imagePath, ImreadModes.Color);
+            if (src.Empty()) return null;
+            return AltDetectSinglePageBoundary(src);
+        }
+        catch
+        {
+            return null;
         }
     }
 

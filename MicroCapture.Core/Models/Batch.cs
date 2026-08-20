@@ -40,7 +40,7 @@ public class Batch
     // Written into every processed TIFF's resolution tag (dots per inch) for this batch, AND
     // used to resample pixel dimensions — see ImageProcessor.BaselineDpi/ResizeForDpi for the
     // baseline/scaling convention (150 = native captured size, higher values upsample).
-    public int Dpi { get; set; } = 300;
+    public int Dpi { get; set; } = 150;
 
     // Corrects spine-curvature distortion on bound-book captures (the page bulging away from
     // flat near the gutter) — a per-column vertical remap, distinct from the perspective/quad

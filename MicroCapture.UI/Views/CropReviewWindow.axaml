@@ -1,12 +1,9 @@
-<Window xmlns="https://github.com/avaloniaui"
+<UserControl xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:conv="using:MicroCapture.UI.Converters"
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
-        Title="Crop Review"
-        Width="1280" Height="760"
-        WindowStartupLocation="CenterScreen"
         Background="{StaticResource CanvasBrush}">
     <Grid RowDefinitions="*, Auto">
         <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
@@ -166,12 +163,10 @@
                 <!-- Action Buttons -->
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
                     <Button Content="Reset" Command="{Binding ResetCommand}" Classes="secondary"/>
-                    <Button Content="Cancel" Command="{Binding CancelCommand}"
-                            CommandParameter="{Binding $parent[Window]}" Classes="secondary"/>
-                    <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}"
-                            CommandParameter="{Binding $parent[Window]}" Classes="primary"/>
+                    <Button Content="Cancel" Command="{Binding CancelCommand}" Classes="secondary"/>
+                    <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}" Classes="primary"/>
                 </StackPanel>
             </Grid>
         </Border>
     </Grid>
-</Window>
+</UserControl>

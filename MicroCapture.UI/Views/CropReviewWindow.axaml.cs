@@ -1,9 +1,11 @@
 using System;
 using System.Linq;
 using Avalonia;
+using Avalonia.Collections;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
@@ -12,7 +14,7 @@ using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
 
-public partial class CropReviewWindow : Window
+public partial class CropReviewWindow : UserControl
 {
     private enum DragTarget
     {
@@ -32,6 +34,14 @@ public partial class CropReviewWindow : Window
     private static readonly Color RightQuadColor = Color.Parse("#828fff");
     private static readonly Color TopCurveColor = Color.Parse("#5e6ad2");
     private static readonly Color BottomCurveColor = Color.Parse("#d99a3d");
+    // Method 4's raw detected trace (drawn underneath the editable quad, see RenderOverlay) —
+    // distinct, higher-saturation colors so it reads as "what was actually detected" versus the
+    // editable shape's own softer accent colors.
+    private static readonly Color Method4TopColor = Color.Parse("#22c55e");
+    private static readonly Color Method4BottomColor = Color.Parse("#22c55e");
+    private static readonly Color Method4LeftColor = Color.Parse("#06b6d4");
+    private static readonly Color Method4RightColor = Color.Parse("#06b6d4");
+    private static readonly Color Method4GutterColor = Color.Parse("#f472b6");
 
     private DragTarget _activeDrag = DragTarget.None;
 
@@ -51,14 +61,21 @@ public partial class CropReviewWindow : Window
                     or nameof(vm.SplitPercent) or nameof(vm.Image) or nameof(vm.IsSplitBookPages)
                     or nameof(vm.LeftQuad) or nameof(vm.RightQuad) or nameof(vm.IsTwoQuadSplit)
                     or nameof(vm.IsDewarpMode) or nameof(vm.DewarpTopPoints) or nameof(vm.DewarpBottomPoints)
-                    or nameof(vm.DewarpBackdropImage) or nameof(vm.IsAdjustMode))
+                    or nameof(vm.DewarpBackdropImage) or nameof(vm.IsAdjustMode)
+                    or nameof(vm.Method4TopCurve) or nameof(vm.Method4BottomCurve)
+                    or nameof(vm.Method4LeftCurve) or nameof(vm.Method4RightCurve) or nameof(vm.Method4GutterLine))
                 {
                     RenderOverlay();
                 }
             };
             vm.ConfirmBulkApplyRequested += async (s, request) =>
             {
-                var confirmed = await ConfirmDialog.AskAsync(this, request.Message, "Apply Adjustments");
+                // No longer a Window itself (embedded in MainWindow, see MainWindow.axaml's
+                // ActiveCropReview host) — ConfirmDialog needs an actual owner Window for
+                // centering/modality, so resolve the containing top-level instead of using
+                // `this`.
+                var confirmed = TopLevel.GetTopLevel(this) is Window owner
+                    && await ConfirmDialog.AskAsync(owner, request.Message, "Apply Adjustments");
                 request.OnAnswered(confirmed);
             };
         }
@@ -271,8 +288,20 @@ public partial class CropReviewWindow : Window
         {
             RenderDewarpCurve(canvas, vm.DewarpTopPoints, imgRect, scale, TopCurveColor);
             RenderDewarpCurve(canvas, vm.DewarpBottomPoints, imgRect, scale, BottomCurveColor);
+            return;
         }
-        else if (vm.IsSplitBookPages && vm.IsTwoQuadSplit)
+
+        // Method 4's own raw trace, drawn first (underneath the editable quad below) — this is
+        // what the detector actually found, distinct from the 4-corner quad the operator drags,
+        // which is only a starting approximation of it. Null for a job with a saved manual crop
+        // (no detection ran) or when detection failed.
+        RenderMethod4Trace(canvas, vm.Method4TopCurve, imgRect, scale, Method4TopColor);
+        RenderMethod4Trace(canvas, vm.Method4BottomCurve, imgRect, scale, Method4BottomColor);
+        RenderMethod4Trace(canvas, vm.Method4LeftCurve, imgRect, scale, Method4LeftColor);
+        RenderMethod4Trace(canvas, vm.Method4RightCurve, imgRect, scale, Method4RightColor);
+        RenderMethod4Trace(canvas, vm.Method4GutterLine, imgRect, scale, Method4GutterColor);
+
+        if (vm.IsSplitBookPages && vm.IsTwoQuadSplit)
         {
             RenderQuad(canvas, vm.LeftQuad, imgRect, scale, LeftQuadColor);
             RenderQuad(canvas, vm.RightQuad, imgRect, scale, RightQuadColor);
@@ -285,6 +314,26 @@ public partial class CropReviewWindow : Window
         {
             RenderQuad(canvas, new[] { vm.TopLeft, vm.TopRight, vm.BottomRight, vm.BottomLeft }, imgRect, scale, SingleQuadColor);
         }
+    }
+
+    /// <summary>Draws one of Method 4's raw detected traces (top/bottom edge, left/right side,
+    /// or gutter line) as a plain polyline through its already-dense points — no spline
+    /// interpolation needed (unlike <see cref="RenderDewarpCurve"/>'s sparse control points,
+    /// these already have one point per column/row) and no drag handles, since this is a
+    /// read-only "here's what was detected" reference, not something the operator edits
+    /// directly.</summary>
+    private static void RenderMethod4Trace(Canvas canvas, CropPoint[]? points, Rect imgRect, double scale, Color color)
+    {
+        if (points == null || points.Length < 2) return;
+
+        var canvasPoints = points.Select(p => new Point(imgRect.X + p.X * scale, imgRect.Y + p.Y * scale)).ToList();
+        canvas.Children.Add(new Polyline
+        {
+            Points = canvasPoints,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2,
+            StrokeDashArray = new AvaloniaList<double> { 4, 3 }
+        });
     }
 
     /// <summary>Draws one curve (top or bottom edge) as a smooth spline through its control
@@ -395,10 +444,13 @@ public partial class CropReviewWindow : Window
         canvas.Children.Add(handle);
     }
 
-    protected override void OnClosed(EventArgs e)
+    protected override void OnUnloaded(RoutedEventArgs e)
     {
+        // MainWindowViewModel disposes the view model itself when it clears ActiveCropReview
+        // (see OpenCropReview/CloseCropReview) — this is a defensive backstop in case this
+        // control is ever removed from the tree some other way.
         (DataContext as CropReviewViewModel)?.Dispose();
-        base.OnClosed(e);
+        base.OnUnloaded(e);
     }
 
     private void InitializeComponent()

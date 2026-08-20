@@ -83,7 +83,7 @@ public class BackgroundProcessingWorker
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
-                    var metadata = new TiffMetadata(job.Batch?.Dpi ?? 300, job.Batch?.Operator, job.Timestamp);
+                    var metadata = new TiffMetadata(job.Batch?.Dpi ?? 150, job.Batch?.Operator, job.Timestamp);
                     // Batch.CameraCalibration snapshots whichever lens calibration was active
                     // at Start Batch (see Batch.CameraCalibrationId's own comment) — parse its
                     // stored camera-matrix/distortion-coefficient strings back into the DTO
