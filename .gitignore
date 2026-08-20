@@ -28,3 +28,7 @@ __pycache__/
 /Temp/
 /Thumbnails/
 /Captures/
+
+# Installer build output/tools
+/installer/output/
+/installer/tools/
