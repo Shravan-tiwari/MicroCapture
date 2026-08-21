@@ -112,8 +112,16 @@ public class BatchExportService
                         {
                             using var img = SKImage.FromBitmap(bitmap);
                             using var data = img.Encode(normalizedFormat == "JPG" ? SKEncodedImageFormat.Jpeg : SKEncodedImageFormat.Png, 95);
-                            using var outStream = File.OpenWrite(targetPath);
-                            data.SaveTo(outStream);
+                            // SKImage.Encode never writes a DPI/density field for either format —
+                            // patch it in afterward (same fix WriteJpeg already applies to the
+                            // direct-capture JPG path) so exported JPG/PNG pages don't silently
+                            // read back as 96 DPI regardless of what was actually captured.
+                            var bytes = data.ToArray();
+                            if (normalizedFormat == "JPG")
+                                ImageProcessor.StampJfifDensity(bytes, job.Dpi);
+                            else
+                                ImageProcessor.StampPngDensity(ref bytes, job.Dpi);
+                            File.WriteAllBytes(targetPath, bytes);
                         }
                     }
                     else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff")

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Globalization;
 using System.IO;
 using BitMiracle.LibTiff.Classic;
@@ -937,7 +938,11 @@ public partial class ImageProcessor
     /// than re-encoding — is safe as long as the expected marker bytes are verified first.
     /// Layout: FFD8 (SOI) FFE0 (APP0) LenHi LenLo "JFIF\0" VerMajor VerMinor Units(1) XDensity(2,
     /// big-endian) YDensity(2, big-endian) ... units=1 means "dots per inch".</summary>
-    private static void StampJfifDensity(byte[] jpegBytes, int dpi)
+    // Internal (not private): BatchExportService's JPG/PNG export branch encodes through
+    // SkiaSharp directly (a different path from WriteJpeg's OpenCV encode above, needed there
+    // since PDF/JPG/PNG export re-encodes an already-processed source image rather than a fresh
+    // OpenCV Mat) and calls this same stamping logic so exported JPGs don't lose their DPI either.
+    internal static void StampJfifDensity(byte[] jpegBytes, int dpi)
     {
         const int unitsOffset = 13; // FFD8 FFE0 LenHi LenLo 'J''F''I''F'\0 VerMajor VerMinor
         if (jpegBytes.Length < unitsOffset + 5) return;
@@ -951,6 +956,69 @@ public partial class ImageProcessor
         jpegBytes[unitsOffset + 2] = (byte)(clampedDpi & 0xFF);
         jpegBytes[unitsOffset + 3] = (byte)(clampedDpi >> 8);
         jpegBytes[unitsOffset + 4] = (byte)(clampedDpi & 0xFF);
+    }
+
+    /// <summary>PNG has no equivalent of JPEG's JFIF density field baked into a fixed early
+    /// offset — physical resolution instead lives in an optional pHYs ancillary chunk (pixels per
+    /// meter, not inch — PNG's own unit choice) that SkiaSharp's SKImage.Encode never writes,
+    /// silently dropping DPI for every PNG export the same way JPG would without
+    /// <see cref="StampJfifDensity"/>. Unlike JFIF's fixed-offset patch, PNG chunks are
+    /// variable-length and CRC32-checked, so this inserts a fresh pHYs chunk (rather than
+    /// patching bytes in place) immediately after the mandatory IHDR chunk (always the first
+    /// chunk after PNG's 8-byte signature, per the PNG spec) — the standard, spec-legal
+    /// placement, since pHYs may appear anywhere before the first IDAT.</summary>
+    internal static void StampPngDensity(ref byte[] pngBytes, int dpi)
+    {
+        const int signatureLength = 8; // 89 50 4E 47 0D 0A 1A 0A
+        if (pngBytes.Length < signatureLength + 8) return;
+        ReadOnlySpan<byte> pngSignature = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        if (!pngBytes.AsSpan(0, signatureLength).SequenceEqual(pngSignature)) return;
+
+        // IHDR is always immediately after the signature, and its total on-disk size (Length(4) +
+        // Type(4) + 13-byte payload + CRC(4)) is fixed since IHDR's payload is a constant 13 bytes.
+        const int ihdrChunkSize = 4 + 4 + 13 + 4;
+        var ihdrTypeSpan = pngBytes.AsSpan(signatureLength + 4, 4);
+        if (ihdrTypeSpan[0] != (byte)'I' || ihdrTypeSpan[1] != (byte)'H' || ihdrTypeSpan[2] != (byte)'D' || ihdrTypeSpan[3] != (byte)'R') return;
+        var insertAt = signatureLength + ihdrChunkSize;
+        if (pngBytes.Length < insertAt) return;
+
+        var pixelsPerMeter = (uint)Math.Round(Math.Clamp(dpi, 1, 100000) / 0.0254);
+        var payload = new byte[9];
+        BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(0, 4), pixelsPerMeter); // X pixels per unit
+        BinaryPrimitives.WriteUInt32BigEndian(payload.AsSpan(4, 4), pixelsPerMeter); // Y pixels per unit
+        payload[8] = 1; // unit specifier = meters
+
+        var chunkType = new byte[] { (byte)'p', (byte)'H', (byte)'Y', (byte)'s' };
+        var crcInput = new byte[chunkType.Length + payload.Length];
+        chunkType.CopyTo(crcInput, 0);
+        payload.CopyTo(crcInput, chunkType.Length);
+        var crc = Crc32(crcInput);
+
+        var chunk = new byte[4 + 4 + payload.Length + 4];
+        BinaryPrimitives.WriteUInt32BigEndian(chunk.AsSpan(0, 4), (uint)payload.Length);
+        chunkType.CopyTo(chunk, 4);
+        payload.CopyTo(chunk, 8);
+        BinaryPrimitives.WriteUInt32BigEndian(chunk.AsSpan(8 + payload.Length, 4), crc);
+
+        var result = new byte[pngBytes.Length + chunk.Length];
+        pngBytes.AsSpan(0, insertAt).CopyTo(result);
+        chunk.CopyTo(result, insertAt);
+        pngBytes.AsSpan(insertAt).CopyTo(result.AsSpan(insertAt + chunk.Length));
+        pngBytes = result;
+    }
+
+    /// <summary>Standard zlib/PNG CRC-32 (polynomial 0xEDB88320), computed the reference way
+    /// (no lookup-table precompute, since this runs once per export, not per pixel).</summary>
+    private static uint Crc32(byte[] data)
+    {
+        uint crc = 0xFFFFFFFF;
+        foreach (var b in data)
+        {
+            crc ^= b;
+            for (var i = 0; i < 8; i++)
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
+        }
+        return crc ^ 0xFFFFFFFF;
     }
 
     /// <summary>Decides between <see cref="WriteTiff"/> and <see cref="WriteJpeg"/> for one
