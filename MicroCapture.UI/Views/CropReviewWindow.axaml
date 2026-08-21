@@ -14,7 +14,7 @@
                 <Grid Name="ContainerGrid">
                     <Image Name="TargetImage"
                            Source="{Binding Image}"
-                           IsVisible="{Binding !IsDewarpMode}"
+                           IsVisible="{Binding ShowFullSpreadTarget}"
                            Stretch="Uniform"
                            HorizontalAlignment="Center"
                            VerticalAlignment="Center"/>
@@ -29,8 +29,20 @@
                            Stretch="Uniform"
                            HorizontalAlignment="Center"
                            VerticalAlignment="Center"/>
+                    <!-- Adjust mode judges rotation/tone/color against the actual cropped page,
+                         shown large, instead of the full uncropped spread — PreviewImage is the
+                         same live-adjusted render the small LIVE PREVIEW panel already computes
+                         (RenderPreviewInto), just shown at full size here so changes are
+                         actually visible rather than needing to be judged from a thumbnail. -->
+                    <Image Name="AdjustTargetImage"
+                           Source="{Binding PreviewImage}"
+                           IsVisible="{Binding IsAdjustMode}"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
                     <Canvas Name="OverlayCanvas"
                             Background="Transparent"
+                            IsVisible="{Binding ShowFullSpreadTarget}"
                             HorizontalAlignment="Stretch"
                             VerticalAlignment="Stretch"/>
                     <TextBlock Text="{Binding LoadErrorMessage}"

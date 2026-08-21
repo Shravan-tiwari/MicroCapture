@@ -77,6 +77,7 @@ await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
 await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
+await TestCropReviewAdjustModeRotationReachesExport();
 await TestFinalizeSearchablePdfActuallyEmbedsOcrText();
 TestManualAdjustmentsAreNoOpAtDefaults();
 TestManualAdjustmentsRotateAndFlip();
@@ -1860,6 +1861,126 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
     {
         var pdfInfo = new FileInfo(pdfFiles[0]);
         Check("Real UI flow: exported PDF is non-trivial in size", pdfInfo.Length > 1000);
+    }
+
+    await RunPumped(() => vm.ShutdownAsync());
+}
+
+async Task TestCropReviewAdjustModeRotationReachesExport()
+{
+    Console.WriteLine("\n-- Crop Review Adjust mode: a 90-degree rotation actually reaches the exported file --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb);
+        seedDb.Projects.Add(new Project { Name = "ADJTEST", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "ADJTEST";
+    vm.BatchCode = "ADJTEST";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+    await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null));
+    PumpUntil(() => vm.RecentCaptures.Count == 1);
+    var jobId = vm.RecentCaptures[0].JobId;
+    PumpUntil(() => vm.RecentCaptures[0].Status != "Processing", timeoutMs: 20000);
+    Check("Adjust flow: capture auto-processes before we touch it", vm.RecentCaptures[0].Status.StartsWith("Processed"));
+
+    // Avalonia's headless test platform (see UseHeadless above) stubs out real bitmap
+    // decoding — cropVm.Image/ImageWidth/ImageHeight come from Avalonia's own Bitmap type and
+    // read back as a fake 1x1 in this harness, even though the real packaged app (real Skia
+    // renderer) decodes correctly. Get the true "before" dimensions via SkiaSharp's own
+    // decoder instead, which has no such headless-mode stubbing, so this test's oracle is
+    // independent of Avalonia's rendering stack entirely.
+    int widthBeforeRotate, heightBeforeRotate;
+    using (var probeDb = new AppDbContext(dbPath))
+    {
+        var probeJob = await probeDb.CaptureJobs.AsNoTracking().FirstAsync(j => j.Id == jobId);
+        using var directDecode = SKBitmap.Decode(probeJob.OriginalFilePath);
+        widthBeforeRotate = directDecode.Width;
+        heightBeforeRotate = directDecode.Height;
+        Console.WriteLine($"  [info] Original capture dimensions (via SkiaSharp): {widthBeforeRotate}x{heightBeforeRotate}");
+    }
+
+    using var reviewDb = new AppDbContext(dbPath);
+    var reviewQueue = new CaptureQueueService(reviewDb);
+    var cropVm = new CropReviewViewModel(jobId, reviewDb, reviewQueue);
+    PumpUntil(() => cropVm.Image != null);
+
+    // Exactly what the "Adjust" button + Rotate control do in the real UI: flip into Adjust
+    // mode, then apply a 90-degree rotation via the same command RotateClockwiseCommand fires.
+    cropVm.IsAdjustMode = true;
+    cropVm.RotateClockwiseCommand.Execute(null);
+    Dispatcher.UIThread.RunJobs();
+    Check("Adjust flow: RotationDegrees is 90 after one clockwise rotate", cropVm.RotationDegrees == 90);
+
+    var cropReviewWindow = new CropReviewWindow { DataContext = cropVm };
+    await RunPumped(() => cropVm.SaveCommand.ExecuteAsync(cropReviewWindow));
+
+    // The real worker (owned by vm, polling once a second) should pick this back up on its
+    // own — wait on the actual DB status (what BatchExportService itself checks), not the
+    // in-memory thumbnail label, which can lag behind the worker's own DB commit.
+    string? statusAfterWait = null;
+    PumpUntil(() =>
+    {
+        using var pollDb = new AppDbContext(dbPath);
+        statusAfterWait = pollDb.CaptureJobs.AsNoTracking().First(j => j.Id == jobId).ProcessingStatus;
+        return statusAfterWait is "Completed" or "Failed";
+    }, timeoutMs: 20000);
+
+    using (var checkDb = new AppDbContext(dbPath))
+    {
+        var job = await checkDb.CaptureJobs.FirstAsync(j => j.Id == jobId);
+        Check("Adjust flow: HasManualAdjustments was actually persisted as true", job.HasManualAdjustments);
+        Check("Adjust flow: RotationDegrees (90) was actually persisted", job.RotationDegrees == 90);
+        Check($"Adjust flow: job reprocessed to Completed (was: {statusAfterWait})", job.ProcessingStatus == "Completed");
+
+        Console.WriteLine($"  [info] job.ProcessedFilePath = '{job.ProcessedFilePath}'");
+        if (!string.IsNullOrWhiteSpace(job.ProcessedFilePath))
+        {
+            var outputFile = job.ProcessedFilePath.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (outputFile != null && File.Exists(outputFile))
+            {
+                var outInfo = new FileInfo(outputFile);
+                Console.WriteLine($"  [info] outputFile = '{outputFile}', size={outInfo.Length} bytes");
+                using var rotated = Cv2.ImRead(outputFile, ImreadModes.Unchanged);
+                // The rotation is applied to the auto-detected CROP, not the raw 3840x2160
+                // capture — a landscape original (widthBeforeRotate > heightBeforeRotate) crops
+                // to some landscape-ish region, and a 90-degree rotation of that crop should
+                // come out portrait (taller than wide), the same orientation flip a full-image
+                // rotation would show. That orientation flip — not an exact pixel-dimension
+                // match to the pre-crop original — is what actually proves the rotation reached
+                // the processed file on disk, not just the DB row.
+                Console.WriteLine($"  [info] Original: {widthBeforeRotate}x{heightBeforeRotate} (landscape); processed output after crop+90deg-rotate: {rotated.Width}x{rotated.Height}");
+                Check("Adjust flow: processed output came out portrait (taller than wide) — proves the 90-degree rotation was actually applied",
+                    rotated.Height > rotated.Width);
+            }
+        }
+
+        if (job.ProcessingStatus == "Completed")
+        {
+            var exporter = new BatchExportService(checkDb);
+            var batch = await checkDb.Batches.FirstAsync(b => b.BatchCode == "ADJTEST");
+            var exportDir = await exporter.ExportBatchAsync(batch.Id, workDir, "PNG");
+            var exportedFiles = Directory.GetFiles(exportDir, "*.png");
+            Check("Adjust flow: export produced exactly one file", exportedFiles.Length == 1);
+            if (exportedFiles.Length == 1)
+            {
+                using var exported = Cv2.ImRead(exportedFiles[0], ImreadModes.Unchanged);
+                Console.WriteLine($"  [info] Exported file: {exported.Width}x{exported.Height}");
+                Check("Adjust flow: EXPORTED file also reflects the rotation (this is the exact reported bug)",
+                    exported.Height > exported.Width);
+            }
+        }
+        else
+        {
+            Console.WriteLine("  [skip] Export checks skipped — job never reached Completed.");
+        }
     }
 
     await RunPumped(() => vm.ShutdownAsync());

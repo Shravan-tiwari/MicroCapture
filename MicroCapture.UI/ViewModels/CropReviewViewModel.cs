@@ -123,11 +123,19 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
 
     public string DewarpEditButtonLabel => IsDewarpMode ? "Done Adjusting Curve" : "Adjust Curve";
 
+    // The main panel's full-spread image + drag overlay are only meaningful while the operator
+    // is actually working with crop/split geometry — Dewarp mode already swaps in its own
+    // backdrop, and Adjust mode swaps in the live-adjusted cropped-page preview (see
+    // CropReviewWindow.axaml's AdjustTargetImage) instead, since judging rotation/tone/color
+    // against the full uncropped spread was confusing and made changes hard to actually see.
+    public bool ShowFullSpreadTarget => !IsDewarpMode && !IsAdjustMode;
+
     partial void OnIsDewarpModeChanged(bool value)
     {
         OnPropertyChanged(nameof(IsLineSplitMode));
         OnPropertyChanged(nameof(IsQuadSplitMode));
         OnPropertyChanged(nameof(DewarpEditButtonLabel));
+        OnPropertyChanged(nameof(ShowFullSpreadTarget));
         SchedulePreviewUpdate();
     }
 
@@ -163,6 +171,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     partial void OnIsAdjustModeChanged(bool value)
     {
         OnPropertyChanged(nameof(AdjustEditButtonLabel));
+        OnPropertyChanged(nameof(ShowFullSpreadTarget));
         SchedulePreviewUpdate();
     }
 
@@ -882,35 +891,49 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)
         {
-            var previousLeftBox = job.LeftCropBox;
-            var previousRightBox = job.RightCropBox;
-            var wasAlreadyManual = job.ManualOverrideApplied;
+            // Adjust mode never touches crop/split geometry — TopLeft/TopRight/BottomRight/
+            // BottomLeft (and the split quads) only exist to drive the Crop/Split UI, and their
+            // current values reflect whatever detection or a prior save last put there, not
+            // necessarily anything the operator has looked at or confirmed this session. Saving
+            // from Adjust mode used to unconditionally recompute and overwrite LeftCropBox/
+            // RightCropBox from those same values regardless of which mode was active — a no-op
+            // in the common case, but a real risk of persisting a stale/not-yet-settled crop box
+            // any time Adjust is used without the operator also reviewing Crop/Split first
+            // (confirmed to produce a degenerate, effectively-empty crop in one reproduction).
+            // Skipping the crop write entirely when only adjustments changed removes that risk
+            // — geometry is only ever written by an actual Crop/Split save.
+            if (!IsAdjustMode)
+            {
+                var previousLeftBox = job.LeftCropBox;
+                var previousRightBox = job.RightCropBox;
+                var wasAlreadyManual = job.ManualOverrideApplied;
 
-            if (IsSplitBookPages && IsTwoQuadSplit)
-            {
-                job.LeftCropBox = FormatCorners(LeftQuad);
-                job.RightCropBox = FormatCorners(RightQuad);
-            }
-            else if (IsSplitBookPages)
-            {
-                var leftWidth = Math.Clamp((int)(ImageWidth * (SplitPercent / 100.0)), 1, ImageWidth - 1);
-                job.LeftCropBox = $"0,0,{leftWidth},{ImageHeight}";
-                job.RightCropBox = $"{leftWidth},0,{ImageWidth - leftWidth},{ImageHeight}";
-            }
-            else
-            {
-                job.LeftCropBox = FormatCorners(TopLeft, TopRight, BottomRight, BottomLeft);
-                job.RightCropBox = null;
-            }
+                if (IsSplitBookPages && IsTwoQuadSplit)
+                {
+                    job.LeftCropBox = FormatCorners(LeftQuad);
+                    job.RightCropBox = FormatCorners(RightQuad);
+                }
+                else if (IsSplitBookPages)
+                {
+                    var leftWidth = Math.Clamp((int)(ImageWidth * (SplitPercent / 100.0)), 1, ImageWidth - 1);
+                    job.LeftCropBox = $"0,0,{leftWidth},{ImageHeight}";
+                    job.RightCropBox = $"{leftWidth},0,{ImageWidth - leftWidth},{ImageHeight}";
+                }
+                else
+                {
+                    job.LeftCropBox = FormatCorners(TopLeft, TopRight, BottomRight, BottomLeft);
+                    job.RightCropBox = null;
+                }
 
-            // Only pin this job to the legacy manual-crop pipeline (see ImageProcessor.Process's
-            // manualOverride branch) if the operator actually changed the crop geometry from
-            // what was already there — a job that already had a saved manual crop stays manual
-            // regardless (re-saving without touching it is still an explicit confirm of a manual
-            // shape), but a fresh, never-reviewed job that gets opened and saved untouched should
-            // stay on the automatic Method 4 path, not silently lose it forever.
-            var geometryChanged = job.LeftCropBox != previousLeftBox || job.RightCropBox != previousRightBox;
-            job.ManualOverrideApplied = wasAlreadyManual || geometryChanged;
+                // Only pin this job to the legacy manual-crop pipeline (see ImageProcessor.Process's
+                // manualOverride branch) if the operator actually changed the crop geometry from
+                // what was already there — a job that already had a saved manual crop stays manual
+                // regardless (re-saving without touching it is still an explicit confirm of a manual
+                // shape), but a fresh, never-reviewed job that gets opened and saved untouched should
+                // stay on the automatic Method 4 path, not silently lose it forever.
+                var geometryChanged = job.LeftCropBox != previousLeftBox || job.RightCropBox != previousRightBox;
+                job.ManualOverrideApplied = wasAlreadyManual || geometryChanged;
+            }
 
             job.RotationDegrees = RotationDegrees;
             job.FlipHorizontal = FlipHorizontal;
