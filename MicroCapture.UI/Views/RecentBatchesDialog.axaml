@@ -3,6 +3,7 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         x:Class="MicroCapture.UI.Views.RecentBatchesDialog"
         Title="Recent Batches"
+        Icon="/Assets/microcapture-icon.png"
         Width="560" Height="520"
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource CanvasBrush}">

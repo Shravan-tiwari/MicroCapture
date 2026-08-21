@@ -3,6 +3,7 @@
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         x:Class="MicroCapture.UI.Views.FinalizeBatchDialog"
         Title="Finalize Batch"
+        Icon="/Assets/microcapture-icon.png"
         Width="760" Height="620"
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource CanvasBrush}">

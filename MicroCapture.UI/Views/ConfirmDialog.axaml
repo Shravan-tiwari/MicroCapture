@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="MicroCapture.UI.Views.ConfirmDialog"
         Title="Confirm"
+        Icon="/Assets/microcapture-icon.png"
         Width="420" SizeToContent="Height"
         CanResize="False"
         WindowStartupLocation="CenterOwner"

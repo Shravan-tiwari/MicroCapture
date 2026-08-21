@@ -10,7 +10,8 @@
         mc:Ignorable="d" d:DesignWidth="1400" d:DesignHeight="800"
         x:Class="MicroCapture.UI.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Title="Micrographics Capture Software"
+        Title="MicroCapture"
+        Icon="/Assets/microcapture-icon.png"
         Width="1400" Height="800"
         MinWidth="960" MinHeight="640"
         Background="{StaticResource CanvasBrush}">
