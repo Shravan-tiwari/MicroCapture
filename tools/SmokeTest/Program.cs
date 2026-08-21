@@ -1839,7 +1839,18 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
         vm.RecentCaptures[0].Thumbnail != thumbBeforeReprocess);
     Check("Real UI flow: status reflects the reprocess completed", vm.RecentCaptures[0].Status.StartsWith("Processed"));
 
-    await RunPumped(() => vm.ExportBatchCommand.ExecuteAsync(null));
+    // ExportBatchCommand no longer exists — exporting now happens inside the Finalize Batch
+    // dialog (FinalizeBatchViewModel.ExportAsync), which needs a real Window owner for
+    // ShowDialog and so can't be driven headlessly here. Exercise the same underlying
+    // BatchExportService call the dialog makes instead, which is what this test actually cares
+    // about verifying (export still works after Crop Review's reprocess), not the toolbar
+    // button/dialog UI itself.
+    using (var exportDb = new AppDbContext(dbPath))
+    {
+        var batch = await exportDb.Batches.FirstAsync(b => b.BatchCode == "UITEST");
+        var exporter = new BatchExportService(exportDb);
+        await exporter.ExportBatchAsync(batch.Id, workDir, "PDF");
+    }
     Check("Real UI flow: export completed and left output in the isolated temp directory, not ~/Pictures",
         Directory.GetFiles(workDir, "*.pdf", SearchOption.AllDirectories).Length > 0);
 

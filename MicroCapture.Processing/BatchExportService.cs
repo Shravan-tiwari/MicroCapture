@@ -21,7 +21,22 @@ public class BatchExportService
         _dbContext = dbContext;
     }
 
-    public async Task<string> ExportBatchAsync(string batchId, string outputDirectory, string format)
+    /// <param name="orderedJobIds">Overrides the default export order/page-set — when provided,
+    /// exports exactly these <see cref="CaptureJob"/> IDs, in this order, instead of
+    /// <see cref="CaptureQueueService.GetCompletedJobsForBatch"/>'s default (all non-superseded
+    /// completed jobs, sorted by <see cref="CaptureJob.PageNumber"/>). This only affects THIS
+    /// export's page order/inclusion — it never writes back to PageNumber or any other
+    /// persisted field, so it can't collide with PageNumber's other roles (recapture/supersede
+    /// identity — see CaptureJob.PageNumber's own remarks). Used by the Finalize Batch dialog's
+    /// reorder/delete UI, which is deliberately export-scoped only.</param>
+    /// <param name="customFileName">Overrides the auto-generated
+    /// <c>{batchPrefix}_{timestamp}.pdf</c> / export-subfolder name with this exact name
+    /// (extension appended/subfolder-suffix still applied as normal) when provided.</param>
+    /// <param name="customOutputDirectory">Overrides <paramref name="outputDirectory"/> when
+    /// provided — lets the Finalize dialog's destination picker route the export somewhere other
+    /// than the batch's default project folder.</param>
+    public async Task<string> ExportBatchAsync(string batchId, string outputDirectory, string format,
+        IReadOnlyList<string>? orderedJobIds = null, string? customFileName = null, string? customOutputDirectory = null)
     {
         var normalizedFormat = format.Trim().ToUpperInvariant();
         if (normalizedFormat is not ("PDF" or "TIFF" or "JPG" or "PNG"))
@@ -39,26 +54,38 @@ public class BatchExportService
         if (batch.Captures == null || batch.Captures.Count == 0)
             throw new Exception("Batch contains no capture jobs.");
 
-        // QC is advisory until a dedicated QC-review screen exists. Do not silently
-        // discard a successfully produced image solely due to an automatic heuristic.
-        // A recapture landing while the prior attempt is still InProgress can otherwise
-        // leave both attempts "Completed" for the same page — exclude anything marked
-        // Superseded and keep only the latest attempt per page as a second safety net.
-        var jobsToExport = CaptureQueueService.GetCompletedJobsForBatch(batch.Captures);
-
         if (batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
             throw new InvalidOperationException("Images are still being processed.");
+
+        List<CaptureJob> jobsToExport;
+        if (orderedJobIds != null)
+        {
+            var byId = batch.Captures.ToDictionary(j => j.Id);
+            jobsToExport = orderedJobIds.Where(byId.ContainsKey).Select(id => byId[id]).ToList();
+        }
+        else
+        {
+            // QC is advisory until a dedicated QC-review screen exists. Do not silently
+            // discard a successfully produced image solely due to an automatic heuristic.
+            // A recapture landing while the prior attempt is still InProgress can otherwise
+            // leave both attempts "Completed" for the same page — exclude anything marked
+            // Superseded and keep only the latest attempt per page as a second safety net.
+            jobsToExport = CaptureQueueService.GetCompletedJobsForBatch(batch.Captures);
+        }
 
         if (jobsToExport.Count == 0)
             throw new Exception("No successfully processed images found to export in this batch.");
 
         string batchPrefix = SanitizeFileName(string.IsNullOrEmpty(batch.Name) ? batch.Id : batch.Name);
-        
+        outputDirectory = customOutputDirectory ?? outputDirectory;
+
         Directory.CreateDirectory(outputDirectory);
 
         if (normalizedFormat == "PDF")
         {
-            string pdfFileName = $"{batchPrefix}_{DateTime.Now:yyyyMMdd_HHmmss}.pdf";
+            string pdfFileName = string.IsNullOrWhiteSpace(customFileName)
+                ? $"{batchPrefix}_{DateTime.Now:yyyyMMdd_HHmmss}.pdf"
+                : SanitizeFileName(customFileName) + ".pdf";
             string pdfFilePath = Path.Combine(outputDirectory, pdfFileName);
             string temporaryPath = pdfFilePath + ".partial";
 
@@ -83,6 +110,7 @@ public class BatchExportService
             }
             File.Move(temporaryPath, pdfFilePath, true);
             batch.Status = "Exported";
+            DeleteOriginals(jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -91,7 +119,9 @@ public class BatchExportService
         else
         {
             // TIFF, JPG, PNG -> Export to subfolder
-            string subDirName = $"{batchPrefix}_{normalizedFormat}_{DateTime.Now:yyyyMMdd_HHmmss}";
+            string subDirName = string.IsNullOrWhiteSpace(customFileName)
+                ? $"{batchPrefix}_{normalizedFormat}_{DateTime.Now:yyyyMMdd_HHmmss}"
+                : SanitizeFileName(customFileName);
             string exportDir = Path.Combine(outputDirectory, subDirName);
             Directory.CreateDirectory(exportDir);
 
@@ -149,10 +179,35 @@ public class BatchExportService
                 job.ExportStatus = "Completed";
             }
             batch.Status = "Exported";
+            DeleteOriginals(jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return exportDir;
+        }
+    }
+
+    /// <summary>Deletes each exported job's original capture file, now that the batch's final
+    /// output has been produced and Crop Review no longer needs it. Originals are deliberately
+    /// kept until this point (see BackgroundProcessingWorker, which used to delete them right
+    /// after processing — moved here since Crop Review re-crops from OriginalFilePath and needs
+    /// it to survive for as long as the operator might still revisit the batch before finalizing
+    /// it). Each deletion is independently try/caught so one locked/missing file can't stop the
+    /// rest from being cleaned up, and a failure here never fails the export itself — the export
+    /// already succeeded by the time this runs.</summary>
+    private static void DeleteOriginals(List<CaptureJob> jobs)
+    {
+        foreach (var job in jobs)
+        {
+            try
+            {
+                if (File.Exists(job.OriginalFilePath))
+                    File.Delete(job.OriginalFilePath);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Could not delete original '{job.OriginalFilePath}' after export: {ex.Message}");
+            }
         }
     }
 

@@ -39,12 +39,6 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _documentStatus = "—";
     [ObservableProperty] private string _captureReadiness = "NOT READY";
     [ObservableProperty] private bool _splitBookPages = false;
-    // Active batch's export format — editable anytime, persisted immediately to
-    // Batch.PreferredExportFormat (see OnExportFormatChanged below), same pattern as DPI. Also
-    // doubles as "the format the next Start Batch will use" before any batch is active, since
-    // there's no separate active batch to diverge from yet.
-    [ObservableProperty] private string _exportFormat = "PDF";
-    partial void OnExportFormatChanged(string value) => PersistBatchSettingAsync(b => b.PreferredExportFormat = value);
 
     // Fixed-frame capture: UseFixedFrames is the pre-batch checkbox intent (what the *next*
     // Start Batch will do); IsFixedFrameBatch reflects whether the currently *active* batch
@@ -64,15 +58,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
     partial void OnIsCalibratingChanged(bool value) => OnPropertyChanged(nameof(IsShowingLiveView));
     partial void OnActiveCropReviewChanged(CropReviewViewModel? value) => OnPropertyChanged(nameof(IsShowingLiveView));
-    // Run OCR and Export Batch must never overlap — both touch the same jobs' OCR/export
-    // status, and a PDF export runs OCR itself first if it isn't already done.
+    // Run OCR and Finalize's own export step must never overlap — both touch the same jobs'
+    // OCR/export status, and a searchable-PDF finalize runs OCR itself first if it isn't
+    // already done. IsExporting is set by the Finalize dialog around its own export call.
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RunOcrCommand))]
-    [NotifyCanExecuteChangedFor(nameof(ExportBatchCommand))]
     private bool _isOcrRunning;
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RunOcrCommand))]
-    [NotifyCanExecuteChangedFor(nameof(ExportBatchCommand))]
     private bool _isExporting;
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
 
@@ -99,7 +92,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // already-processed jobs in the batch (they keep their original format).
         // This is just a "remember my last choice" convenience.
     }
-    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG" };
+    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG", "PNG" };
 
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
     // in the background queue, off the capture path, so toggling this never affects shutter
@@ -537,6 +530,71 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Hydrates every UI-observable field from an already-saved <see cref="Batch"/> row
+    /// — the shared core of both "resume the batch matching the typed Project/Batch Code" (see
+    /// <see cref="StartBatchAsync"/>) and "reopen a batch picked from Recent Batches" (see
+    /// <see cref="OpenRecentBatchesAsync"/>). <paramref name="batch"/> must have its
+    /// <see cref="Batch.Project"/> and <see cref="Batch.Captures"/> navigation properties already
+    /// loaded.</summary>
+    private async Task LoadBatchIntoUiAsync(Batch batch)
+    {
+        _currentProjectId = batch.ProjectId;
+        _activeProjectCode = batch.Project?.Name ?? ProjectCode;
+        _activeBatchCode = batch.BatchCode;
+        _outputDirectory = batch.Project?.OutputDirectory ?? _outputDirectory;
+        _currentBatchId = batch.Id;
+        PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
+        // These assignments hydrate the observable properties FROM the already-saved batch
+        // row — without suppression, each one's OnXChanged would immediately
+        // PersistBatchSettingAsync straight back to the very row it was just read from
+        // (redundant at best; racy at worst, since _currentBatchId above is already set by the
+        // time these run).
+        _suppressPersist = true;
+        try
+        {
+            ProjectCode = _activeProjectCode;
+            BatchCode = _activeBatchCode;
+            IsFixedFrameBatch = batch.UseFixedFrames;
+            RefreshFixedFrameCache(batch);
+            SelectedDpi = batch.Dpi;
+            DewarpEnabled = batch.DewarpEnabled;
+            BinarizeEnabled = batch.BinarizeEnabled;
+            BleedthroughEnabled = batch.BleedthroughEnabled;
+        }
+        finally
+        {
+            _suppressPersist = false;
+        }
+        await LoadRecentCapturesFromBatchAsync(batch);
+    }
+
+    /// <summary>Opens the Recent Batches picker and, if the operator picks one, reopens it —
+    /// unconditionally flipping its Status back to "Active" (even if it was Completed/Exported)
+    /// so a previously-finalized batch becomes fully resumable again, same as any in-progress
+    /// batch. One unified reopen behavior, no separate read-only mode, per product decision.</summary>
+    [RelayCommand]
+    private async Task OpenRecentBatchesAsync(Avalonia.Controls.Window? owner)
+    {
+        if (owner == null) return;
+        var picked = await MicroCapture.UI.Views.RecentBatchesDialog.PickAsync(owner, _dbContext);
+        if (picked == null) return;
+
+        var batch = await _dbContext.Batches
+            .Include(b => b.Project)
+            .Include(b => b.Captures)
+            .FirstOrDefaultAsync(b => b.Id == picked.Id);
+        if (batch == null) return;
+
+        if (batch.Status != "Active")
+        {
+            batch.Status = "Active";
+            await _dbContext.SaveChangesAsync();
+        }
+
+        await LoadBatchIntoUiAsync(batch);
+        StatusText = $"Reopened batch '{batch.BatchCode}' for project '{_activeProjectCode}' at page {PageCount}";
+    }
+
     [RelayCommand]
     private async Task StartBatchAsync()
     {
@@ -582,29 +640,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (batch != null)
             {
-                _currentBatchId = batch.Id;
-                PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
-                // These assignments hydrate the observable properties FROM the already-saved
-                // batch row — without suppression, each one's OnXChanged would immediately
-                // PersistBatchSettingAsync straight back to the very row it was just read from
-                // (redundant at best; racy at worst, since _currentBatchId above is already set
-                // by the time these run).
-                _suppressPersist = true;
-                try
-                {
-                    IsFixedFrameBatch = batch.UseFixedFrames;
-                    RefreshFixedFrameCache(batch);
-                    ExportFormat = batch.PreferredExportFormat;
-                    SelectedDpi = batch.Dpi;
-                    DewarpEnabled = batch.DewarpEnabled;
-                    BinarizeEnabled = batch.BinarizeEnabled;
-                    BleedthroughEnabled = batch.BleedthroughEnabled;
-                }
-                finally
-                {
-                    _suppressPersist = false;
-                }
-                await LoadRecentCapturesFromBatchAsync(batch);
+                await LoadBatchIntoUiAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
             else
@@ -621,7 +657,6 @@ public partial class MainWindowViewModel : ViewModelBase
                     BatchCode = batchCode,
                     Operator = Environment.UserName,
                     SplitBookPages = SplitBookPages && !UseFixedFrames,
-                    PreferredExportFormat = ExportFormat,
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
                     BinarizeEnabled = BinarizeEnabled,
@@ -817,17 +852,26 @@ public partial class MainWindowViewModel : ViewModelBase
             .GroupBy(job => job.PageNumber)
             .Select(group => group.OrderByDescending(job => job.Timestamp).First())
             .OrderByDescending(job => job.PageNumber)
-            .Take(20);
+            .Take(100);
 
         foreach (var job in latestPerPage)
         {
-            if (!File.Exists(job.OriginalFilePath)) continue;
+            // Prefer the persisted per-page thumbnail (survives the original capture file
+            // being deleted once processing succeeds — see AddThumbnail/BackgroundProcessingWorker)
+            // over re-decoding the original, which is only reachable for jobs still
+            // Pending/InProgress at resume time. Falls back to the original for jobs captured
+            // before persisted thumbnails existed (no thumbnail file on disk yet).
+            var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, batch.BatchCode, job.PageNumber);
+            var sourcePath = File.Exists(thumbPath) ? thumbPath
+                : File.Exists(job.OriginalFilePath) ? job.OriginalFilePath
+                : null;
+            if (sourcePath == null) continue;
             try
             {
-                // This reloads the raw capture, not each frame's actual processed crop — an
-                // existing limitation shared with ordinary batches (resume never re-fetches
-                // per-frame derivatives), not something new here.
-                var bytes = await Task.Run(() => File.ReadAllBytes(job.OriginalFilePath));
+                // This reloads the raw capture (or its persisted thumbnail), not each frame's
+                // actual processed crop — an existing limitation shared with ordinary batches
+                // (resume never re-fetches per-frame derivatives), not something new here.
+                var bytes = await Task.Run(() => File.ReadAllBytes(sourcePath));
                 var status = job.ProcessingStatus == "Completed" ? "Processed"
                     : job.ProcessingStatus == "Failed" ? "Processing failed"
                     : "Processing";
@@ -850,7 +894,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Thumbnail load failed for '{job.OriginalFilePath}': {ex}");
+                Console.Error.WriteLine($"Thumbnail load failed for '{sourcePath}': {ex}");
             }
         }
     }
@@ -1066,48 +1110,47 @@ public partial class MainWindowViewModel : ViewModelBase
         return summary;
     }
 
-    [RelayCommand(CanExecute = nameof(CanRunOcrOrExport))]
-    private async Task ExportBatchAsync()
+    /// <summary>Opens the Finalize Batch dialog — review/reorder/delete pages, choose export
+    /// format, filename, destination, and whether to embed searchable OCR text, then export.
+    /// Replaces the old standalone Export Batch button/format dropdown (see
+    /// FinalizeBatchDialog/FinalizeBatchViewModel for the actual export logic, which subsumes
+    /// what this method used to do directly).</summary>
+    [RelayCommand]
+    private async Task OpenFinalizeBatchAsync(Avalonia.Controls.Window? owner)
     {
+        if (owner == null) return;
         if (_currentBatchId == null)
         {
-            StatusText = "Start a batch first before exporting.";
+            StatusText = "Start a batch first before finalizing.";
             return;
         }
 
-        IsExporting = true;
-        try
-        {
-            // Only PDF export ever reads OCR text (a near-invisible searchable text layer) —
-            // TIFF/JPG/PNG export never touches it, so skip straight to export for those.
-            var isPdf = string.Equals(ExportFormat, "PDF", StringComparison.OrdinalIgnoreCase);
-            var missingOcrText = false;
-            if (isPdf)
-            {
-                StatusText = "Preparing searchable text...";
-                var summary = await RunOcrForCurrentBatchAsync();
-                missingOcrText = summary is { CliMissing: true } or { Failed: > 0 };
-            }
+        var batch = await _dbContext.Batches
+            .Include(b => b.Captures)
+            .FirstOrDefaultAsync(b => b.Id == _currentBatchId);
+        if (batch == null) return;
 
-            StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
-            var exportService = new MicroCapture.Processing.BatchExportService(_dbContext);
-            var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
+        if (batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
+        {
+            StatusText = "Images are still processing — wait for thumbnails to show Processed, then finalize.";
+            return;
+        }
 
-            StatusText = missingOcrText
-                ? $"Exported: {Path.GetFileName(exportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
-                : $"Exported successfully: {Path.GetFileName(exportPath)}";
-        }
-        catch (InvalidOperationException ex) when (ex.Message == "Images are still being processed.")
+        var result = await MicroCapture.UI.Views.FinalizeBatchDialog.RunAsync(owner, _dbContext, batch, _outputDirectory);
+        if (result == null) return;
+
+        StatusText = result.MissingOcrText
+            ? $"Exported: {Path.GetFileName(result.ExportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
+            : $"Exported successfully: {Path.GetFileName(result.ExportPath)}";
+
+        // Refresh OcrStatus on whatever thumbnails are currently visible, same as RunOcrForCurrentBatchAsync does.
+        var refreshed = await _dbContext.CaptureJobs.AsNoTracking()
+            .Where(j => j.BatchId == _currentBatchId)
+            .ToDictionaryAsync(j => j.Id, j => j.OcrStatus);
+        foreach (var thumbnail in RecentCaptures)
         {
-            StatusText = "Images are still processing — wait for thumbnails to show Processed, then export.";
-        }
-        catch (Exception ex)
-        {
-            StatusText = $"Export failed: {ex.Message}";
-        }
-        finally
-        {
-            IsExporting = false;
+            if (refreshed.TryGetValue(thumbnail.JobId, out var ocrStatus))
+                thumbnail.OcrStatus = ocrStatus;
         }
     }
 
@@ -1267,10 +1310,25 @@ public partial class MainWindowViewModel : ViewModelBase
                         Status = isRecapture ? "Recapturing" : "Processing",
                         FilePath = filePath
                     });
+
+                    // Persist this page's thumbnail to disk, independent of the original
+                    // capture file's own lifetime (BackgroundProcessingWorker deletes it once
+                    // processing succeeds) — so LoadRecentCapturesFromBatchAsync can still show
+                    // a thumbnail for this page on a later resume, even after that deletion.
+                    try
+                    {
+                        var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, _activeBatchCode, pageNumber);
+                        Directory.CreateDirectory(MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, _activeBatchCode));
+                        thumb.Save(thumbPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Could not persist thumbnail for page {pageNumber}: {ex.Message}");
+                    }
                 }
 
-                // Keep last 20 thumbnails to avoid memory buildup
-                while (RecentCaptures.Count > 20)
+                // Keep last 100 thumbnails to avoid memory buildup
+                while (RecentCaptures.Count > 100)
                 {
                     var old = RecentCaptures[^1];
                     old.Thumbnail?.Dispose();

@@ -131,16 +131,12 @@ public class BackgroundProcessingWorker
                         // readers (BatchExportService.GetProcessedFilesForJob) don't need to
                         // glob a "Processed" subfolder that no longer exists.
                         await queueService.SetProcessedFilePathAsync(job.Id, string.Join(";", result.OutputFilePaths));
-                        // Delete the original capture file after successful processing
-                        try
-                        {
-                            if (File.Exists(job.OriginalFilePath))
-                                File.Delete(job.OriginalFilePath);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.Error.WriteLine($"Could not delete original '{job.OriginalFilePath}' after processing: {ex.Message}");
-                        }
+                        // The original capture file is deliberately NOT deleted here — Crop
+                        // Review needs it to still exist for as long as the batch might be
+                        // re-cropped from scratch (see CropReviewViewModel, which loads from
+                        // job.OriginalFilePath and silently fails if it's gone). Originals are
+                        // cleaned up later, once the batch has actually been exported — see
+                        // BatchExportService/FinalizeBatchViewModel.
                         // OCR no longer runs automatically here — it's expensive (a subprocess
                         // per file, up to ~30s each) and often wasted work on pages that get
                         // recaptured or deleted before the batch is finalized. It now runs

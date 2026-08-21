@@ -1,0 +1,87 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.FinalizeBatchDialog"
+        x:DataType="vm:FinalizeBatchViewModel"
+        Title="Finalize Batch"
+        Width="760" Height="620"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource CanvasBrush}">
+    <Border Classes="panel" Margin="18" Padding="20">
+        <Grid RowDefinitions="Auto, *, Auto, Auto" ColumnDefinitions="2*, 1*">
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Text="FINALIZE BATCH"
+                       Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+
+            <!-- Page list: reorder / delete -->
+            <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="10" Margin="0,0,10,0">
+                <ScrollViewer>
+                    <ItemsControl ItemsSource="{Binding Pages}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:FinalizePageRow">
+                                <Border Background="{StaticResource Surface1Brush}" CornerRadius="6" Padding="8" Margin="0,0,0,6">
+                                    <Grid ColumnDefinitions="Auto, *, Auto">
+                                        <Border Grid.Column="0" Width="60" Height="60" CornerRadius="4" ClipToBounds="True"
+                                                Background="{StaticResource Surface2Brush}" Margin="0,0,10,0">
+                                            <Image Source="{Binding Thumbnail}" Stretch="Uniform"/>
+                                        </Border>
+                                        <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="13"
+                                                   Foreground="{StaticResource InkBrush}"
+                                                   Text="{Binding PageNumber, StringFormat='Page {0}'}"/>
+                                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                                            <Button Content="↑" Width="28"
+                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).MoveUpCommand}"
+                                                    CommandParameter="{Binding}" Classes="secondary"/>
+                                            <Button Content="↓" Width="28"
+                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).MoveDownCommand}"
+                                                    CommandParameter="{Binding}" Classes="secondary"/>
+                                            <Button Content="✕" Width="28"
+                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).DeletePageCommand}"
+                                                    CommandParameter="{Binding}" Classes="iconDanger"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Border>
+
+            <!-- Export options -->
+            <StackPanel Grid.Row="1" Grid.Column="1" Spacing="14">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="FORMAT" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding SelectedFormat}" HorizontalAlignment="Stretch"/>
+                </StackPanel>
+
+                <CheckBox IsChecked="{Binding EmbedSearchableText}" Content="Searchable text (OCR)"
+                          IsVisible="{Binding IsPdfFormat}"
+                          ToolTip.Tip="Embeds a near-invisible OCR text layer so the PDF's text is selectable/searchable. Runs OCR on any page that doesn't have it yet, which can take a while for a large batch."
+                          Foreground="{StaticResource InkMutedBrush}"/>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="FILE NAME" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding FileName}" Background="{StaticResource Surface2Brush}"
+                             Foreground="{StaticResource InkBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="DESTINATION" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding DestinationDirectory}" IsReadOnly="True" Background="{StaticResource Surface2Brush}"
+                             Foreground="{StaticResource InkMutedBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <Button Content="Browse…" Classes="secondary" HorizontalAlignment="Stretch"
+                            Command="{Binding BrowseDestinationCommand}" CommandParameter="{Binding $parent[Window]}"/>
+                </StackPanel>
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding StatusText}"
+                       TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,14,0,0"/>
+
+            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal"
+                        HorizontalAlignment="Right" Margin="0,14,0,0" Spacing="10">
+                <Button Content="Cancel" Classes="secondary" Command="{Binding CancelCommand}"/>
+                <Button Content="Export" Classes="primary" Command="{Binding ExportCommand}"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

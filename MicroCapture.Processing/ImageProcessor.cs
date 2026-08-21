@@ -932,6 +932,17 @@ public partial class ImageProcessor
         File.WriteAllBytes(path, bytes);
     }
 
+    /// <summary>PNG counterpart of <see cref="WriteJpeg"/> — same DPI-tag concern (OpenCV's PNG
+    /// encoder writes no density chunk either), fixed the same way <see cref="StampPngDensity"/>
+    /// already fixes it for BatchExportService's own PNG export path.</summary>
+    private static void WritePng(string path, Mat mat, TiffMetadata metadata)
+    {
+        if (!Cv2.ImEncode(".png", mat, out var bytes))
+            throw new IOException($"Could not encode PNG: {path}");
+        StampPngDensity(ref bytes, metadata.Dpi);
+        File.WriteAllBytes(path, bytes);
+    }
+
     /// <summary>OpenCV's JPEG encoder has no DPI/density parameter (unlike its TIFF encoder,
     /// see WriteTiff's XRESOLUTION/YRESOLUTION tags) — without this, every JPG-format capture
     /// would silently lose its DPI, and any tool reading physical page size from the file would
@@ -1042,14 +1053,20 @@ public partial class ImageProcessor
     /// already can't collide with the original regardless of extension.</summary>
     private static string WritePageOutput(string outputDirectory, string fileNameNoExt, Mat mat, TiffMetadata metadata, bool binarized, string captureFormat, string? singlePageInputPath = null)
     {
+        // Binarized (pure black-and-white) output is always written as TIFF regardless of
+        // captureFormat — see this method's own class-level remarks on WritePageOutput's
+        // original JPG-vs-TIFF decision; PNG is excluded from that override for the same reason.
         var useJpeg = !binarized && string.Equals(captureFormat, "JPG", StringComparison.OrdinalIgnoreCase);
-        var extension = useJpeg ? ".jpg" : ".tif";
+        var usePng = !binarized && string.Equals(captureFormat, "PNG", StringComparison.OrdinalIgnoreCase);
+        var extension = useJpeg ? ".jpg" : usePng ? ".png" : ".tif";
         var finalFileName = singlePageInputPath != null
             ? SinglePageOutputFileName(singlePageInputPath, extension)
             : fileNameNoExt + extension;
         var path = Path.Combine(outputDirectory, finalFileName);
         if (useJpeg)
             WriteJpeg(path, mat, metadata);
+        else if (usePng)
+            WritePng(path, mat, metadata);
         else
             WriteTiff(path, mat, metadata, binarized);
         return path;

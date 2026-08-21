@@ -41,6 +41,9 @@
                     <TextBox Text="{Binding BatchCode}" Watermark="Batch Code" Width="120"
                              Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
                              BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <Button Content="Recent" Classes="secondary" Command="{Binding OpenRecentBatchesCommand}"
+                            CommandParameter="{Binding $parent[Window]}"
+                            ToolTip.Tip="Reopen a previous batch — including ones already finalized — instead of retyping its Project/Batch Code"/>
                     <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages"
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <CheckBox IsChecked="{Binding UseFixedFrames}" Content="Use Fixed Frames"
@@ -55,8 +58,6 @@
                     <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough Suppression"
                               ToolTip.Tip="Softens show-through from text/images printed on the reverse side of a thin page. Not effective on colored-image bleedthrough — grayscale/text show-through only."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding ExportFormat}"
-                              Width="90" ToolTip.Tip="Export format for this batch — editable anytime, used whenever Export Batch runs"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
                               Width="90" ToolTip.Tip="DPI stamped on each capture as it's taken — the output is resampled to actually measure this many pixels per inch against the rig's real, measured resolution. Changing this affects only captures taken from now on.">
                         <ComboBox.ItemTemplate>
@@ -66,7 +67,7 @@
                         </ComboBox.ItemTemplate>
                     </ComboBox>
                     <ComboBox ItemsSource="{Binding AvailableCaptureFormats}" SelectedItem="{Binding SelectedCaptureFormat}"
-                              Width="90" ToolTip.Tip="Output file format for each capture (TIFF or JPG). Sticky per capture — carries over to the next shot and remembers your last choice across app restarts, not tied to the batch's other settings. Binarized (black-and-white) output is always written as TIFF regardless of this setting."/>
+                              Width="90" ToolTip.Tip="Output file format for each capture (TIFF, JPG, or PNG). Sticky per capture — carries over to the next shot and remembers your last choice across app restarts, not tied to the batch's other settings. Binarized (black-and-white) output is always written as TIFF regardless of this setting."/>
                     <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
                             Margin="6,0,0,0"/>
                     <Button Classes="secondary" Command="{Binding CalibrateFramesCommand}"
@@ -78,7 +79,9 @@
                             IsVisible="{Binding IsConnected}"/>
                     <Button Classes="secondary" Command="{Binding RunOcrCommand}" Content="Run OCR"
                             ToolTip.Tip="Run OCR now on this batch's finished pages, so searchable text is ready ahead of a PDF export"/>
-                    <Button Classes="secondary" Command="{Binding ExportBatchCommand}" Content="Export Batch"/>
+                    <Button Classes="primary" Command="{Binding OpenFinalizeBatchCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Content="Finalize"
+                            ToolTip.Tip="Review, reorder, and export this batch's pages — choose format, filename, destination, and whether to embed searchable text"/>
                 </WrapPanel>
 
                 <!-- Center: Page Count -->
