@@ -89,6 +89,7 @@ public class CaptureQueueService
         EnsureColumn("CameraCalibrations", "MeasuredPixelHeight", "REAL NULL");
         EnsureColumn("CaptureJobs", "ProcessedFilePath", "TEXT NULL");
         EnsureColumn("CaptureJobs", "CaptureFormat", "TEXT NOT NULL DEFAULT 'TIFF'");
+        EnsureColumn("CaptureJobs", "Dpi", "INTEGER NOT NULL DEFAULT 150");
     }
 
     private void EnsureCameraCalibrationsTable()
@@ -151,7 +152,7 @@ public class CaptureQueueService
         }
     }
 
-    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF")
+    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF", int dpi = 150)
     {
         var job = new CaptureJob
         {
@@ -160,7 +161,8 @@ public class CaptureQueueService
             PageNumber = pageNumber,
             Timestamp = DateTime.UtcNow,
             ProcessingStatus = "Pending",
-            CaptureFormat = captureFormat
+            CaptureFormat = captureFormat,
+            Dpi = dpi
         };
 
         _dbContext.CaptureJobs.Add(job);

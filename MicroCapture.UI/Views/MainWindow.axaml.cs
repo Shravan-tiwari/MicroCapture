@@ -135,23 +135,6 @@ public partial class MainWindow : Window
         catch { }
     }
 
-    private void OnExportFormatButtonClick(object? sender, RoutedEventArgs e)
-    {
-        try
-        {
-            if (DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
-            {
-                var formats = new[] { "PDF", "TIFF", "JPG", "PNG" };
-                var current = vm.ExportFormat ?? "PDF";
-                var idx = Array.IndexOf(formats, current);
-                var next = formats[(idx + 1) % formats.Length];
-                vm.ExportFormat = next;
-                Console.WriteLine($"Cycled export format -> {next}");
-            }
-        }
-        catch (Exception ex) { Console.WriteLine($"ExportFormat click failed: {ex}"); }
-    }
-
     // Set by OnThumbnailPointerPressed (which does receive KeyModifiers) just before the
     // Button's own Click fires, so OnThumbnailClick below can tell a plain click from a
     // ctrl/shift-click without RoutedEventArgs carrying modifier state itself.

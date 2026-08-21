@@ -39,7 +39,12 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _documentStatus = "—";
     [ObservableProperty] private string _captureReadiness = "NOT READY";
     [ObservableProperty] private bool _splitBookPages = false;
+    // Active batch's export format — editable anytime, persisted immediately to
+    // Batch.PreferredExportFormat (see OnExportFormatChanged below), same pattern as DPI. Also
+    // doubles as "the format the next Start Batch will use" before any batch is active, since
+    // there's no separate active batch to diverge from yet.
     [ObservableProperty] private string _exportFormat = "PDF";
+    partial void OnExportFormatChanged(string value) => PersistBatchSettingAsync(b => b.PreferredExportFormat = value);
 
     // Fixed-frame capture: UseFixedFrames is the pre-batch checkbox intent (what the *next*
     // Start Batch will do); IsFixedFrameBatch reflects whether the currently *active* batch
@@ -69,14 +74,14 @@ public partial class MainWindowViewModel : ViewModelBase
     [NotifyCanExecuteChangedFor(nameof(RunOcrCommand))]
     [NotifyCanExecuteChangedFor(nameof(ExportBatchCommand))]
     private bool _isExporting;
-    [ObservableProperty] private string _defaultExportFormat = "PDF";
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
 
-    // DPI is fixed per batch (like fixed frames/split), not changeable per export — every page
-    // processed under this batch gets tagged with it AND resampled to it. 150 (the smallest
-    // option) is the baseline — the camera has no fixed native optical DPI, so pixel dimensions
-    // are left untouched there, and every higher selection upsamples proportionally (never
-    // downsamples away real captured detail). See ImageProcessor.BaselineDpi/ResizeForDpi.
+    // DPI is stamped onto each capture at the moment it's taken (see CaptureAsync/RecaptureAsync
+    // passing SelectedDpi into EnqueueCaptureAsync) — changing this dropdown mid-batch affects
+    // only captures taken afterward, not pages already shot. 150 (the smallest option) is the
+    // baseline — the camera has no fixed native optical DPI, so pixel dimensions are left
+    // untouched there, and every higher selection upsamples proportionally (never downsamples
+    // away real captured detail). See ImageProcessor.BaselineDpi/ResizeForDpi.
     [ObservableProperty] private int _selectedDpi = 150;
     public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
 
@@ -616,7 +621,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     BatchCode = batchCode,
                     Operator = Environment.UserName,
                     SplitBookPages = SplitBookPages && !UseFixedFrames,
-                    PreferredExportFormat = DefaultExportFormat,
+                    PreferredExportFormat = ExportFormat,
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
                     BinarizeEnabled = BinarizeEnabled,
@@ -631,7 +636,6 @@ public partial class MainWindowViewModel : ViewModelBase
                 RecentCaptures.Clear();
                 IsFixedFrameBatch = false;
                 RefreshFixedFrameCache(null);
-                ExportFormat = DefaultExportFormat;
                 StatusText = $"Batch '{batchCode}' started for project '{projectCode}'";
 
                 if (UseFixedFrames)
@@ -873,7 +877,7 @@ public partial class MainWindowViewModel : ViewModelBase
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
 
             // Record in durable queue
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
 
             // Add thumbnail
             AddThumbnail(job.Id, filePath, PageCount);
@@ -912,7 +916,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             await _queueService.SupersedePageAsync(_currentBatchId, PageCount);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
 
             // Update thumbnail for the recaptured page
             var existing = RecentCaptures.Where(t => t.PageNumber == PageCount).ToList();
@@ -998,38 +1002,6 @@ public partial class MainWindowViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Autofocus failed: {ex.Message}";
-        }
-    }
-
-    [RelayCommand]
-    private async Task CaptureRawAsync()
-    {
-        if (!IsConnected) { StatusText = "Connect the camera before capturing."; return; }
-        try
-        {
-            StatusText = "Capturing unprocessed image...";
-            var timestamp = DateTime.Now.ToString("yyyyMMddHHmmssfff");
-            var filePath = await _cameraService.CaptureAsync(_outputDirectory, $"raw_{timestamp}");
-
-            if (!File.Exists(filePath))
-            {
-                StatusText = "Raw capture failed — file not found.";
-                return;
-            }
-
-            var (width, height) = await Task.Run(() => Processing.ImageProcessor.GetImagePixelDimensions(filePath));
-            if (width <= 0 || height <= 0)
-            {
-                StatusText = "Raw capture failed — could not read dimensions.";
-                return;
-            }
-
-            var filename = Path.GetFileName(filePath);
-            StatusText = $"✓ Raw captured: {filename} ({width}×{height}px) — Open in image editor to measure calibration target's pixel coordinates.";
-        }
-        catch (Exception ex)
-        {
-            StatusText = $"Raw capture failed: {ex.Message}";
         }
     }
 

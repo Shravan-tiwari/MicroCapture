@@ -61,5 +61,13 @@ public class CaptureJob
     // of this value — see ImageProcessor's WriteTiff/WriteJpeg selection logic.
     public string CaptureFormat { get; set; } = "TIFF";
 
+    // Sticky per-capture DPI, stamped at capture-enqueue time from whatever the toolbar's DPI
+    // dropdown showed at that moment (see MainWindowViewModel.SelectedDpi) — same pattern as
+    // CaptureFormat above. This makes DPI genuinely forward-only: changing the dropdown mid-batch
+    // affects only captures taken afterward, not pages already shot and sitting in the processing
+    // queue. BackgroundProcessingWorker reads this field (not Batch.Dpi) for both the TIFF
+    // resolution tag and the ResizeForDpi target. 150 default matches BaselineDpi.
+    public int Dpi { get; set; } = 150;
+
     public Batch? Batch { get; set; }
 }

@@ -55,18 +55,16 @@
                     <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough Suppression"
                               ToolTip.Tip="Softens show-through from text/images printed on the reverse side of a thin page. Not effective on colored-image bleedthrough — grayscale/text show-through only."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding DefaultExportFormat}"
-                              Width="90" ToolTip.Tip="Default export format for the next batch"/>
+                    <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding ExportFormat}"
+                              Width="90" ToolTip.Tip="Export format for this batch — editable anytime, used whenever Export Batch runs"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
-                              Width="90" ToolTip.Tip="DPI tagged on every processed TIFF in this batch. 150 is the baseline (native captured pixel size); higher values upsample the output — 600 DPI is roughly 4x the pixel dimensions of 150 DPI.">
+                              Width="90" ToolTip.Tip="DPI stamped on each capture as it's taken. 150 is the baseline (native captured pixel size); higher values upsample the output — 600 DPI is roughly 4x the pixel dimensions of 150 DPI. Changing this affects only captures taken from now on.">
                         <ComboBox.ItemTemplate>
                             <DataTemplate>
                                 <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <Button Content="Raw" Command="{Binding CaptureRawCommand}" Classes="secondary" Padding="8,6"
-                            ToolTip.Tip="Capture unprocessed image for DPI measurement"/>
                     <ComboBox ItemsSource="{Binding AvailableCaptureFormats}" SelectedItem="{Binding SelectedCaptureFormat}"
                               Width="90" ToolTip.Tip="Output file format for each capture (TIFF or JPG). Sticky per capture — carries over to the next shot and remembers your last choice across app restarts, not tied to the batch's other settings. Binarized (black-and-white) output is always written as TIFF regardless of this setting."/>
                     <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
@@ -78,13 +76,6 @@
                             Content="Calibrate Lens"
                             ToolTip.Tip="One-time camera lens distortion calibration against a printed ChArUco board — corrects barrel/pincushion distortion before any other geometric correction runs"
                             IsVisible="{Binding IsConnected}"/>
-                    <Button Classes="secondary" Width="96" Margin="10,0,0,0" Click="OnExportFormatButtonClick"
-                            ToolTip.Tip="Export format">
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
-                            <TextBlock Text="{Binding ExportFormat}" />
-                            <TextBlock Text="▾" FontSize="11" Opacity="0.7" Foreground="{StaticResource InkSubtleBrush}"/>
-                        </StackPanel>
-                    </Button>
                     <Button Classes="secondary" Command="{Binding RunOcrCommand}" Content="Run OCR"
                             ToolTip.Tip="Run OCR now on this batch's finished pages, so searchable text is ready ahead of a PDF export"/>
                     <Button Classes="secondary" Command="{Binding ExportBatchCommand}" Content="Export Batch"/>

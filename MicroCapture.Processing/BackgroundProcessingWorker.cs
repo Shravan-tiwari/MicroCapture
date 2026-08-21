@@ -85,7 +85,11 @@ public class BackgroundProcessingWorker
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
-                    var metadata = new TiffMetadata(job.Batch?.Dpi ?? 150, job.Batch?.Operator, job.Timestamp);
+                    // job.Dpi (not job.Batch?.Dpi) — DPI is stamped onto each capture at the
+                    // moment it's taken (see MainWindowViewModel.CaptureAsync), so a batch-wide
+                    // DPI change after this page was captured can never retroactively change what
+                    // this specific page renders at.
+                    var metadata = new TiffMetadata(job.Dpi, job.Batch?.Operator, job.Timestamp);
                     // Batch.CameraCalibration snapshots whichever lens calibration was active
                     // at Start Batch (see Batch.CameraCalibrationId's own comment) — parse its
                     // stored camera-matrix/distortion-coefficient strings back into the DTO
@@ -96,9 +100,14 @@ public class BackgroundProcessingWorker
                         ? ImageProcessor.ParseLensCalibration($"{calibrationEntity.CameraMatrix};{calibrationEntity.DistCoeffs};{calibrationEntity.ImageWidth},{calibrationEntity.ImageHeight}")
                         : null;
                     // The rig's real physically-measured DPI (see ImageProcessor.MeasuredDpi).
-                    // If calibration exists and gives a real measurement, use it.
-                    // Otherwise, use the operator's selected DPI as the baseline — this ensures
-                    // no upsampling happens when there's no real measurement, only the tag.
+                    // If calibration exists and gives a real measurement, use it. Otherwise fall
+                    // back to BaselineDpi (150) — the same "no real measurement, so treat the
+                    // capture as already at the reference resolution" fallback MeasuredDpi itself
+                    // uses. This must NOT be job.Dpi/job.Batch?.Dpi (the operator's TARGET output
+                    // DPI): ResizeForDpi's scale is targetDpi/measuredDpi, so using the target as
+                    // its own "measured" baseline collapses the scale to 1.0 and silently skips
+                    // resampling — confirmed root cause of uncalibrated batches not upsampling at
+                    // all regardless of the DPI the operator selected.
                     double measuredDpi;
                     if (calibrationEntity?.TargetWidthInches > 0 && calibrationEntity?.TargetHeightInches > 0
                         && calibrationEntity?.MeasuredPixelWidth.HasValue == true && calibrationEntity?.MeasuredPixelHeight.HasValue == true)
@@ -107,7 +116,7 @@ public class BackgroundProcessingWorker
                     }
                     else
                     {
-                        measuredDpi = job.Batch?.Dpi ?? 150;
+                        measuredDpi = ImageProcessor.BaselineDpi;
                     }
                     bool bleedthroughEnabled = job.Batch?.BleedthroughEnabled ?? false;
                     var result = useFixedFrames
