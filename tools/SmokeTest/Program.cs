@@ -2025,12 +2025,23 @@ async Task TestFinalizeSearchablePdfActuallyEmbedsOcrText()
             File.WriteAllBytes(imagePath, data.ToArray());
         }
 
-        var job = await queue.EnqueueCaptureAsync(batchId, imagePath, 1, "PNG", 150);
+        // A real batch's OriginalFilePath (raw capture) and ProcessedFilePath (the derivative
+        // ImageProcessor writes) are always two distinct files — DeleteOriginals only ever
+        // touches the former. Using the same path for both here would make the sidecar-cleanup
+        // check below pass or fail for the wrong reason (DeleteOriginals deleting the shared
+        // file out from under GetProcessedFilesForJob's Tier 1 existence check, before
+        // DeleteOcrSidecars ever runs), so this test copies the source into a second,
+        // differently-named file to stand in for the processed derivative, exactly like a real
+        // batch's layout.
+        var originalPath = Path.Combine(workDir, "ocrsource_original.png");
+        File.Copy(imagePath, originalPath);
+
+        var job = await queue.EnqueueCaptureAsync(batchId, originalPath, 1, "PNG", 150);
         jobId = job.Id;
         // Simulate the background worker's own post-processing bookkeeping without running the
         // full ImageProcessor pipeline (which would re-crop/binarize/etc. and isn't the point of
-        // this test) — mark it Completed and point ProcessedFilePath at the same source image,
-        // exactly like GetProcessedFilesForJob's Tier 1 expects.
+        // this test) — mark it Completed and point ProcessedFilePath at the separate "processed"
+        // file, exactly like GetProcessedFilesForJob's Tier 1 expects.
         job.ProcessingStatus = "Completed";
         job.ProcessedFilePath = imagePath;
         await db.SaveChangesAsync();
@@ -2115,6 +2126,18 @@ async Task TestFinalizeSearchablePdfActuallyEmbedsOcrText()
             Check("Export step: at least 2 distinct text placements exist (per-word positioning, not one blob)",
                 tmMatrices.Distinct().Count() >= 2);
         }
+
+        // The .txt/.tsv OCR sidecars are working files only, meaningful up to the moment
+        // DrawSearchText read them above — left behind, they'd just clutter the batch's source
+        // folder alongside the actual images. Confirm BatchExportService actually cleans them
+        // up, the same way it already deletes the original capture file.
+        var job = await db.CaptureJobs.AsNoTracking().FirstAsync(j => j.Id == jobId);
+        var txtPathAfterExport = Path.ChangeExtension(job.ProcessedFilePath, ".txt");
+        var tsvPathAfterExport = Path.ChangeExtension(job.ProcessedFilePath, ".tsv");
+        Console.WriteLine($"  [info] job.ProcessedFilePath after export = '{job.ProcessedFilePath}'");
+        Console.WriteLine($"  [info] checking txt='{txtPathAfterExport}' exists={File.Exists(txtPathAfterExport)}, tsv='{tsvPathAfterExport}' exists={File.Exists(tsvPathAfterExport)}");
+        Check("Cleanup: .txt sidecar was deleted after export", !File.Exists(txtPathAfterExport));
+        Check("Cleanup: .tsv sidecar was deleted after export", !File.Exists(tsvPathAfterExport));
     }
 }
 

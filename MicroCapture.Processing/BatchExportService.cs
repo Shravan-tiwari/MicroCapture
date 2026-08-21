@@ -111,6 +111,7 @@ public class BatchExportService
             File.Move(temporaryPath, pdfFilePath, true);
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
+            DeleteOcrSidecars(jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -180,6 +181,7 @@ public class BatchExportService
             }
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
+            DeleteOcrSidecars(jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -207,6 +209,34 @@ public class BatchExportService
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"Could not delete original '{job.OriginalFilePath}' after export: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Deletes the .txt/.tsv OCR sidecars OcrProcessor writes next to each job's
+    /// processed derivative(s) — working files only, meaningful up to the moment DrawSearchText
+    /// reads them to embed searchable text in a PDF export. Left behind after that, they just
+    /// clutter the batch's output folder alongside the actual image files. Same
+    /// independently-try/caught, never-fails-the-export pattern as <see cref="DeleteOriginals"/>.</summary>
+    private static void DeleteOcrSidecars(List<CaptureJob> jobs)
+    {
+        foreach (var job in jobs)
+        {
+            foreach (var processedFile in GetProcessedFilesForJob(job))
+            {
+                foreach (var ext in new[] { ".txt", ".tsv" })
+                {
+                    var sidecarPath = Path.ChangeExtension(processedFile, ext);
+                    try
+                    {
+                        if (File.Exists(sidecarPath))
+                            File.Delete(sidecarPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Could not delete OCR sidecar '{sidecarPath}' after export: {ex.Message}");
+                    }
+                }
             }
         }
     }
