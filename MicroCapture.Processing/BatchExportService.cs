@@ -315,19 +315,48 @@ public class BatchExportService
 
     private static void DrawSearchText(SKCanvas canvas, string imagePath)
     {
+        // Skia embeds this nearly transparent text in the PDF content stream. It preserves
+        // search/copy capability without affecting the visible scanned image.
+        using var paint = new SKPaint { Color = new SKColor(255, 255, 255, 1), IsAntialias = false };
+
+        // Preferred: per-word boxes from OcrProcessor's tsv output, drawn directly on top of
+        // each word at its real position/size — this is what makes the text actually
+        // selectable/clickable like a normal scanned PDF, not just found by Ctrl+F. Without
+        // this, the old approach (a single block of 1pt-font lines crammed at the page's
+        // top-left corner) was searchable but had no usable per-word hit target to click or
+        // drag-select — confirmed the actual reported bug ("ctrl+f works but clickable text
+        // don't"). BeginPage(bitmap.Width, bitmap.Height) means this canvas's coordinate space
+        // is 1 unit = 1 pixel of the same decoded image OCR ran against, so tsv pixel
+        // coordinates need no scaling.
+        var tsvPath = Path.ChangeExtension(imagePath, ".tsv");
+        var words = OcrProcessor.ReadWordBoxes(tsvPath);
+        if (words.Count > 0)
+        {
+            foreach (var word in words)
+            {
+                if (word.Width <= 0 || word.Height <= 0) continue;
+                using var font = new SKFont { Size = word.Height };
+                // Skia's DrawText baseline convention needs the y coordinate at the text's
+                // baseline, not its top — approximate the baseline as the box's bottom edge,
+                // close enough at invisible-text sizes where exact typographic metrics don't
+                // matter, only the click target's position/size.
+                canvas.DrawText(word.Text, word.Left, word.Top + word.Height, SKTextAlign.Left, font, paint);
+            }
+            return;
+        }
+
+        // Fallback for a page with no tsv (OCR ran with an older build, or the tsv failed to
+        // parse/persist) — old single-blob behavior, still searchable even if not clickable.
         var textPath = Path.ChangeExtension(imagePath, ".txt");
         if (!File.Exists(textPath)) return;
         var text = File.ReadAllText(textPath);
         if (string.IsNullOrWhiteSpace(text)) return;
 
-        // Skia embeds this nearly transparent text in the PDF content stream. It
-        // preserves search/copy capability without affecting the scanned image.
-        using var paint = new SKPaint { Color = new SKColor(255, 255, 255, 1), IsAntialias = false };
-        using var font = new SKFont { Size = 1 };
+        using var fallbackFont = new SKFont { Size = 1 };
         var y = 1f;
         foreach (var line in text.Replace("\r", string.Empty).Split('\n'))
         {
-            canvas.DrawText(line, 1, y, SKTextAlign.Left, font, paint);
+            canvas.DrawText(line, 1, y, SKTextAlign.Left, fallbackFont, paint);
             y += 1.2f;
         }
     }

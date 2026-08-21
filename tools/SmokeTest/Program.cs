@@ -77,6 +77,7 @@ await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
 await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
+await TestFinalizeSearchablePdfActuallyEmbedsOcrText();
 TestManualAdjustmentsAreNoOpAtDefaults();
 TestManualAdjustmentsRotateAndFlip();
 TestManualAdjustmentsBrightnessContrastDirection();
@@ -1862,6 +1863,138 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
     }
 
     await RunPumped(() => vm.ShutdownAsync());
+}
+
+// ---------- Finalize's "searchable PDF" path (BatchOcrService + BatchExportService) ----------
+
+async Task TestFinalizeSearchablePdfActuallyEmbedsOcrText()
+{
+    Console.WriteLine("\n-- Finalize's PDF export actually embeds OCR text as real, extractable PDF text --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    string batchId;
+    string jobId;
+    using (var db = new AppDbContext(dbPath))
+    {
+        var queue = new CaptureQueueService(db);
+        var project = new Project { Name = "OCRTEST", OutputDirectory = workDir };
+        db.Projects.Add(project);
+        await db.SaveChangesAsync();
+        var batch = new Batch { ProjectId = project.Id, Name = "OCRTEST", BatchCode = "OCRTEST", Operator = "test" };
+        db.Batches.Add(batch);
+        await db.SaveChangesAsync();
+        batchId = batch.Id;
+
+        // A real page with two separate, large, high-contrast, machine-readable words, spaced
+        // well apart vertically — Tesseract needs actual legible glyphs to produce non-empty OCR
+        // output, and two distant words make a per-word positioned text layer distinguishable
+        // from the old single-blob-crammed-at-top-left approach.
+        var imagePath = Path.Combine(workDir, "ocrsource.png");
+        using (var bitmap = new SKBitmap(800, 400))
+        {
+            using var canvas = new SKCanvas(bitmap);
+            canvas.Clear(SKColors.White);
+            using var paint = new SKPaint { Color = SKColors.Black, IsAntialias = true };
+            using var font = new SKFont(SKTypeface.Default, 48);
+            canvas.DrawText("ALPHAWORD", 20, 100, SKTextAlign.Left, font, paint);
+            canvas.DrawText("BETAWORD", 20, 300, SKTextAlign.Left, font, paint);
+            using var img = SKImage.FromBitmap(bitmap);
+            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
+            File.WriteAllBytes(imagePath, data.ToArray());
+        }
+
+        var job = await queue.EnqueueCaptureAsync(batchId, imagePath, 1, "PNG", 150);
+        jobId = job.Id;
+        // Simulate the background worker's own post-processing bookkeeping without running the
+        // full ImageProcessor pipeline (which would re-crop/binarize/etc. and isn't the point of
+        // this test) — mark it Completed and point ProcessedFilePath at the same source image,
+        // exactly like GetProcessedFilesForJob's Tier 1 expects.
+        job.ProcessingStatus = "Completed";
+        job.ProcessedFilePath = imagePath;
+        await db.SaveChangesAsync();
+    }
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var ocrService = new BatchOcrService(db);
+        var summary = await ocrService.RunOcrForBatchAsync(batchId);
+        Check("OCR step: tesseract CLI was found (test environment has it installed)", !summary.CliMissing);
+        Check("OCR step: exactly one page completed OCR", summary.Completed == 1 && summary.Failed == 0);
+
+        var job = await db.CaptureJobs.FirstAsync(j => j.Id == jobId);
+        var txtPath = Path.ChangeExtension(job.ProcessedFilePath, ".txt");
+        Check("OCR step: .txt sidecar was actually written next to the processed image", File.Exists(txtPath));
+        if (File.Exists(txtPath))
+        {
+            var ocrText = File.ReadAllText(txtPath);
+            Console.WriteLine($"  [info] OCR read back: \"{ocrText.Trim()}\"");
+            Check("OCR step: recognized text contains both known words",
+                ocrText.Contains("ALPHAWORD", StringComparison.OrdinalIgnoreCase) && ocrText.Contains("BETAWORD", StringComparison.OrdinalIgnoreCase));
+        }
+
+        var tsvPath = Path.ChangeExtension(job.ProcessedFilePath, ".tsv");
+        Check("OCR step: .tsv word-box sidecar was actually written next to the processed image", File.Exists(tsvPath));
+        if (File.Exists(tsvPath))
+        {
+            var boxes = OcrProcessor.ReadWordBoxes(tsvPath);
+            Console.WriteLine($"  [info] Parsed {boxes.Count} word box(es): {string.Join(", ", boxes.Select(b => $"'{b.Text}'@({b.Left},{b.Top},{b.Width}x{b.Height})"))}");
+            Check("OCR step: tsv parses into exactly two word boxes", boxes.Count == 2);
+            Check("OCR step: the two word boxes are far apart vertically (not crammed at top-left)",
+                boxes.Count == 2 && Math.Abs(boxes[0].Top - boxes[1].Top) > 100);
+        }
+    }
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var exporter = new BatchExportService(db);
+        // Match FinalizeBatchViewModel.ExportAsync exactly — it always passes orderedJobIds
+        // (from the dialog's Pages list), never relies on ExportBatchAsync's own default
+        // ordering/selection query, so exercise that same code path here.
+        var pdfPath = await exporter.ExportBatchAsync(batchId, workDir, "PDF", orderedJobIds: new[] { jobId });
+        Check("Export step: PDF was produced", File.Exists(pdfPath));
+
+        if (File.Exists(pdfPath))
+        {
+            var pdfBytes = File.ReadAllBytes(pdfPath);
+            var pdfText = System.Text.Encoding.Latin1.GetString(pdfBytes);
+            var hasToUnicode = pdfText.Contains("/ToUnicode");
+            Check("Export step: PDF includes a ToUnicode CMap (required for text to be copyable, not just glyph IDs)",
+                hasToUnicode);
+
+            // The content stream is FlateDecode-compressed, so the real BT/Tm/Tj operators
+            // aren't visible in the raw bytes — decompress every stream and count distinct text
+            // placement matrices ("Tm") instead of just checking "Tj" is present anywhere. Two
+            // separate Tm's (one per word, at genuinely different positions) is what proves this
+            // is a real per-word positioned text layer, not the old single blob crammed into one
+            // corner — which would show exactly one Tm no matter how many lines of text it drew.
+            var tmMatrices = new List<string>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(pdfText, @"stream\r?\n(.*?)endstream", System.Text.RegularExpressions.RegexOptions.Singleline))
+            {
+                byte[] raw;
+                try
+                {
+                    raw = System.Text.Encoding.Latin1.GetBytes(m.Groups[1].Value);
+                }
+                catch { continue; }
+                try
+                {
+                    using var input = new MemoryStream(raw);
+                    using var zlib = new System.IO.Compression.ZLibStream(input, System.IO.Compression.CompressionMode.Decompress);
+                    using var output = new MemoryStream();
+                    zlib.CopyTo(output);
+                    var decoded = System.Text.Encoding.Latin1.GetString(output.ToArray());
+                    if (!decoded.Contains("Tj")) continue;
+                    foreach (System.Text.RegularExpressions.Match tm in System.Text.RegularExpressions.Regex.Matches(decoded, @"[\d.\-]+ [\d.\-]+ [\d.\-]+ [\d.\-]+ [\d.\-]+ [\d.\-]+ Tm"))
+                        tmMatrices.Add(tm.Value);
+                }
+                catch { /* not a zlib stream (e.g. the font binary) — skip */ }
+            }
+            Console.WriteLine($"  [info] Found {tmMatrices.Count} text-placement (Tm) operator(s) across the PDF's content streams: {string.Join(" | ", tmMatrices)}");
+            Check("Export step: at least 2 distinct text placements exist (per-word positioning, not one blob)",
+                tmMatrices.Distinct().Count() >= 2);
+        }
+    }
 }
 
 // ---------- manual adjustments (rotate/flip/tone/color/sharpen) ----------

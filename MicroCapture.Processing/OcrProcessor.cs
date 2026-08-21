@@ -7,6 +7,12 @@ using Tesseract;
 
 namespace MicroCapture.Processing;
 
+/// <summary>One recognized word and its pixel-space bounding box in the source image
+/// (Tesseract's TSV <c>left/top/width/height</c> columns), used to draw the invisible PDF
+/// text layer directly on top of each word instead of as a single tiny, unclickable blob —
+/// see <see cref="BatchExportService"/>'s DrawSearchText.</summary>
+public readonly record struct OcrWordBox(string Text, int Left, int Top, int Width, int Height);
+
 public class OcrProcessor
 {
     private readonly string _tessDataPath;
@@ -166,12 +172,23 @@ public class OcrProcessor
                     }
                 }
 
-                // Run tesseract writing output to a temp base name to avoid write-permission issues
+                // Run tesseract writing output to a temp base name to avoid write-permission issues.
+                // Requesting txt+tsv output via "-c tessedit_create_X=1" variables, NOT the named
+                // configfiles ("... txt tsv"): those configfiles live under
+                // $TESSDATA_PREFIX/configs/, and this app's bundled tessdata folder ships only
+                // eng.traineddata with no configs/ subdirectory — passing them as positional
+                // configfile names made tesseract log "read_params_file: Can't open txt/tsv" and
+                // silently fall back to its plain-txt-only default, so no tsv was ever produced
+                // (confirmed via the debug log). The -c variable form needs no config file at
+                // all. The tsv is what lets DrawSearchText draw each word's invisible PDF text
+                // directly on top of its real position/size, instead of one 1pt-font blob
+                // crammed in the page's top-left corner (searchable via Ctrl+F, but not
+                // selectable/clickable — confirmed the actual reported bug).
                 var tempBase = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = tesseractPath,
-                    Arguments = $"\"{imagePath}\" \"{tempBase}\" -l eng",
+                    Arguments = $"\"{imagePath}\" \"{tempBase}\" -l eng -c tessedit_create_txt=1 -c tessedit_create_tsv=1",
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -240,6 +257,25 @@ public class OcrProcessor
                         throw new InvalidOperationException($"Tesseract CLI failed (exit {proc.ExitCode}): {err}");
                 }
 
+                // Persist the tsv sidecar (per-word boxes) next to the txt one, at the same
+                // {imagePath-without-extension}.tsv naming BatchExportService.GetWordBoxesPath
+                // expects — best-effort: a missing/unparseable tsv just means DrawSearchText
+                // falls back to its old single-blob behavior for this page, not a hard failure.
+                var tempTsv = tempBase + ".tsv";
+                var tsvFileName = Path.ChangeExtension(imagePath, ".tsv");
+                if (File.Exists(tempTsv))
+                {
+                    try
+                    {
+                        File.Copy(tempTsv, tsvFileName, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Could not persist OCR word-box tsv for '{imagePath}': {ex.Message}");
+                    }
+                    try { File.Delete(tempTsv); } catch { }
+                }
+
                 var tempTxt = tempBase + ".txt";
                 if (File.Exists(tempTxt))
                 {
@@ -298,6 +334,41 @@ public class OcrProcessor
             Console.Error.WriteLine($"Tesseract managed wrapper failed: {ex}");
             throw;
         }
+    }
+
+    /// <summary>Parses a tsv sidecar written by <see cref="ProcessImage"/> into per-word boxes.
+    /// Tesseract's tsv has one row per hierarchy level (page/block/paragraph/line/word); only
+    /// level 5 rows (individual words) carry real text, so every other level is skipped. Returns
+    /// an empty list (never throws) if the file is missing or malformed — the caller falls back
+    /// to the plain-text single-blob behavior in that case.</summary>
+    public static List<OcrWordBox> ReadWordBoxes(string tsvPath)
+    {
+        var boxes = new List<OcrWordBox>();
+        if (!File.Exists(tsvPath)) return boxes;
+
+        try
+        {
+            var lines = File.ReadAllLines(tsvPath);
+            for (var i = 1; i < lines.Length; i++) // row 0 is the header
+            {
+                var cols = lines[i].Split('\t');
+                // level, page_num, block_num, par_num, line_num, word_num, left, top, width, height, conf, text
+                if (cols.Length < 12) continue;
+                if (cols[0] != "5") continue; // only word-level rows have real recognized text
+                var text = cols[11];
+                if (string.IsNullOrWhiteSpace(text)) continue;
+                if (!int.TryParse(cols[6], out var left) || !int.TryParse(cols[7], out var top)
+                    || !int.TryParse(cols[8], out var width) || !int.TryParse(cols[9], out var height))
+                    continue;
+                boxes.Add(new OcrWordBox(text, left, top, width, height));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Could not parse OCR word-box tsv '{tsvPath}': {ex.Message}");
+        }
+
+        return boxes;
     }
 
     private static bool IsTesseractCliAvailable(out string path)
