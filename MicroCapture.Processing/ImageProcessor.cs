@@ -80,14 +80,18 @@ public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Wi
 public partial class ImageProcessor
 {
     // --- Configuration ---
-    // The DPI at which a capture's pixel dimensions are left unresampled — the camera has no
-    // fixed native optical DPI concept (a real print/scan DPI would require sensor size +
-    // capture distance + lens geometry, none of which is calibrated anywhere in this app), so
-    // this is a chosen reference point, not a measured one. AvailableDpiOptions' smallest value
-    // (150) is deliberately the baseline: every higher selection upsamples toward more pixels,
-    // and nothing ever downsamples away real captured detail just because of this setting. See
-    // ResizeForDpi.
-    public const int BaselineDpi = 150;
+    // The DPI at which a capture's pixel dimensions are left unresampled when no per-rig
+    // CameraCalibration measurement exists yet (see MeasuredDpi's fallback below) — used as
+    // measuredDpi's default in ResizeForDpi's scale = targetDpi / measuredDpi. This used to be
+    // a placeholder 150 with no physical basis, which produced pages roughly 2x their real
+    // physical size (confirmed: an 11.75" magazine page came out measuring ~22.3" at the
+    // selected DPI). Now set from an actual physical measurement of the rig — an 11.75" ruler
+    // captured 3343px tall at 150 DPI selected (i.e. unresampled, scale=1.0 under the old
+    // constant): 3343 / 11.75 ≈ 284.5 DPI, rounded to 285. This is still just a fallback for
+    // when no CameraCalibration row exists — a real calibration (LensCalibrationViewModel's
+    // Measure DPI flow) always takes precedence via MeasuredDpi, and should be preferred for any
+    // rig this specific measurement doesn't describe (different lens/distance/camera).
+    public const int BaselineDpi = 285;
 
     /// <summary>Real, physically-measured pixels-per-inch for the rig a job's batch was
     /// captured under, derived from <see cref="CameraCalibration.TargetWidthInches"/>/

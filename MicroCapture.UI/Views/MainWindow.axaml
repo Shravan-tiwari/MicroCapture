@@ -58,7 +58,7 @@
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding ExportFormat}"
                               Width="90" ToolTip.Tip="Export format for this batch — editable anytime, used whenever Export Batch runs"/>
                     <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
-                              Width="90" ToolTip.Tip="DPI stamped on each capture as it's taken. 150 is the baseline (native captured pixel size); higher values upsample the output — 600 DPI is roughly 4x the pixel dimensions of 150 DPI. Changing this affects only captures taken from now on.">
+                              Width="90" ToolTip.Tip="DPI stamped on each capture as it's taken — the output is resampled to actually measure this many pixels per inch against the rig's real, measured resolution. Changing this affects only captures taken from now on.">
                         <ComboBox.ItemTemplate>
                             <DataTemplate>
                                 <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>
