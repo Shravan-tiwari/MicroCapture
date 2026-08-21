@@ -62,6 +62,7 @@ public partial class LensCalibrationViewModel : ViewModelBase
     [ObservableProperty] private double? _measuredPixelWidth;
     [ObservableProperty] private double? _measuredPixelHeight;
     [ObservableProperty] private string _dpiStatusText = "Enter the calibration target's physical width/height, then Measure DPI.";
+    [ObservableProperty] private string _rawCaptureStatusText = "Click to capture an unprocessed raw image for manual DPI measurement.";
 
     /// <summary>Read-only preview of the DPI this calibration would compute, shown next to the
     /// input fields — same averaging formula as ImageProcessor.MeasuredDpi, duplicated here
@@ -142,6 +143,45 @@ public partial class LensCalibrationViewModel : ViewModelBase
         {
             IsBusy = false;
             ComputeCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    [RelayCommand]
+    private async Task CaptureRawAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            RawCaptureStatusText = "Capturing unprocessed image...";
+            var path = await _cameraService.CaptureAsync(_outputDirectory, $"raw_capture_{DateTime.Now:yyyyMMddHHmmssfff}");
+
+            if (!File.Exists(path))
+            {
+                RawCaptureStatusText = "Capture failed — file not found.";
+                Log.Insert(0, "Raw capture failed: file not found.");
+                return;
+            }
+
+            var (width, height) = await Task.Run(() => ImageProcessor.GetImagePixelDimensions(path));
+            if (width <= 0 || height <= 0)
+            {
+                RawCaptureStatusText = "Capture failed — could not read dimensions.";
+                Log.Insert(0, "Raw capture failed: could not read image dimensions.");
+                return;
+            }
+
+            RawCaptureStatusText = $"✓ Saved: {Path.GetFileName(path)} ({width}×{height}px) — Open in image editor to measure pixel coordinates.";
+            Log.Insert(0, $"Raw capture saved: {Path.GetFileName(path)} ({width}×{height}px)");
+        }
+        catch (Exception ex)
+        {
+            Log.Insert(0, $"Raw capture failed: {ex.Message}");
+            RawCaptureStatusText = "Raw capture failed — see log below.";
+        }
+        finally
+        {
+            IsBusy = false;
         }
     }
 
