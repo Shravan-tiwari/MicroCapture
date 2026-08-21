@@ -296,8 +296,36 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         Sharpness = job.Sharpness;
         WhiteBalance = job.WhiteBalance;
 
-        // Load the image and run detection on a background thread to avoid blocking the UI
-        // when opening the dialog.
+        // Decode and show the image immediately, before running any boundary detection. Method 4
+        // detection below (DetectSpreadBoundaryMethod4/DetectSinglePageBoundaryMethod4) plus
+        // DetectEdgePoints and CropPreviewRenderer.Create are OpenCV passes that can take
+        // several seconds — or hang — on a difficult image. Previously Image was only ever set
+        // at the end of that whole pipeline, on the UI-thread Post below, so the window stayed
+        // completely blank the entire time no matter how long the operator waited, with no
+        // partial content to indicate anything was happening. Decoding just the bitmap is fast
+        // and independent of detection, so it goes first and is posted to the UI thread right
+        // away.
+        try
+        {
+            using var quickStream = File.OpenRead(job.OriginalFilePath);
+            var quickBmp = new Bitmap(quickStream);
+            Dispatcher.UIThread.Post(() =>
+            {
+                Image = quickBmp;
+                ImageWidth = (int)quickBmp.Size.Width;
+                ImageHeight = (int)quickBmp.Size.Height;
+                BoundaryHintText = "Detecting page boundary…";
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[CropReviewViewModel] Quick image decode failed: {ex}");
+            LoadErrorMessage = $"Could not load this page: {ex.Message}";
+            return;
+        }
+
+        // Now run detection on a background thread — this fills in the crop overlay/curves
+        // once ready, without having delayed the image itself above.
         Task.Run(() =>
         {
             try

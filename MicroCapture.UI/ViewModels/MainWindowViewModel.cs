@@ -576,30 +576,41 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task OpenRecentBatchesAsync(Avalonia.Controls.Window? owner)
     {
         if (owner == null) return;
-        var picked = await MicroCapture.UI.Views.RecentBatchesDialog.PickAsync(owner, _dbContext);
-        if (picked == null) return;
-
-        // Clear the tracker before re-querying: this _dbContext has been tracking every
-        // CaptureJob/Batch it has ever touched this session (see CaptureQueueService.
-        // EnqueueCaptureAsync), so a plain Include query below would silently return those
-        // frozen-at-creation-time instances — e.g. every job still showing "Pending" even
-        // though the background worker (using its own separate context/connection) finished
-        // them long ago — instead of the batch's real current state.
-        _dbContext.ChangeTracker.Clear();
-        var batch = await _dbContext.Batches
-            .Include(b => b.Project)
-            .Include(b => b.Captures)
-            .FirstOrDefaultAsync(b => b.Id == picked.Id);
-        if (batch == null) return;
-
-        if (batch.Status != "Active")
+        try
         {
-            batch.Status = "Active";
-            await _dbContext.SaveChangesAsync();
-        }
+            var picked = await MicroCapture.UI.Views.RecentBatchesDialog.PickAsync(owner, _dbContext);
+            if (picked == null) return;
 
-        await LoadBatchIntoUiAsync(batch);
-        StatusText = $"Reopened batch '{batch.BatchCode}' for project '{_activeProjectCode}' at page {PageCount}";
+            // Clear the tracker before re-querying: this _dbContext has been tracking every
+            // CaptureJob/Batch it has ever touched this session (see CaptureQueueService.
+            // EnqueueCaptureAsync), so a plain Include query below would silently return those
+            // frozen-at-creation-time instances — e.g. every job still showing "Pending" even
+            // though the background worker (using its own separate context/connection) finished
+            // them long ago — instead of the batch's real current state.
+            _dbContext.ChangeTracker.Clear();
+            var batch = await _dbContext.Batches
+                .Include(b => b.Project)
+                .Include(b => b.Captures)
+                .FirstOrDefaultAsync(b => b.Id == picked.Id);
+            if (batch == null) return;
+
+            if (batch.Status != "Active")
+            {
+                batch.Status = "Active";
+                await _dbContext.SaveChangesAsync();
+            }
+
+            await LoadBatchIntoUiAsync(batch);
+            StatusText = $"Reopened batch '{batch.BatchCode}' for project '{_activeProjectCode}' at page {PageCount}";
+        }
+        catch (Exception ex)
+        {
+            // Without this, an exception here (e.g. a SQLite busy/lock error racing the
+            // background worker's own writes) unwound the whole async command silently — the
+            // dialog never appeared and nothing told the operator why ("Recent" looked entirely
+            // dead). Surfacing it at least gives a visible, diagnosable failure instead of none.
+            StatusText = $"Could not open Recent Batches: {ex.Message}";
+        }
     }
 
     [RelayCommand]
@@ -1152,12 +1163,13 @@ public partial class MainWindowViewModel : ViewModelBase
             .FirstOrDefaultAsync(b => b.Id == _currentBatchId);
         if (batch == null) return;
 
-        if (batch.Captures.Any(j => j.ProcessingStatus is "Pending" or "InProgress"))
-        {
-            StatusText = "Images are still processing — wait for thumbnails to show Processed, then finalize.";
-            return;
-        }
-
+        // Previously this blocked opening the dialog at all while any page was Pending/
+        // InProgress, showing "images are still processing" and returning — which is exactly
+        // what made Finalize look like it did nothing, since the operator had no way to see
+        // *when* processing actually finished short of retrying the click blind. The dialog
+        // itself now polls (see FinalizeBatchViewModel's _refreshTimer) and shows the same
+        // "still processing" state live, updating the moment pages complete — so it's always
+        // safe to open, even with nothing completed yet.
         var result = await MicroCapture.UI.Views.FinalizeBatchDialog.RunAsync(owner, _dbContext, batch, _outputDirectory);
         if (result == null) return;
 
@@ -1311,26 +1323,59 @@ public partial class MainWindowViewModel : ViewModelBase
     private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false)
     {
         var frameCount = GetCurrentFixedFrameCount();
-        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+
+        // Insert the placeholder row(s) synchronously, on this (UI) thread, before returning —
+        // NOT via Dispatcher.UIThread.Post. AddThumbnail is called right after EnqueueCaptureAsync
+        // writes the job to the DB as "Pending", and BackgroundProcessingWorker's poll loop can
+        // pick that job up and finish it within milliseconds. JobCompleted's handler (below)
+        // matches on RecentCaptures.Where(t => t.FilePath == result.OriginalFilePath) to know
+        // which thumbnail to update — if that handler's own Dispatcher.Post ran before this
+        // method's deferred Post got its turn, the match found nothing and the "Processing"
+        // status update was silently lost forever, with no later event to correct it (confirmed
+        // root cause of thumbnails that never advance past "Processing"). Inserting the row here,
+        // before this method returns, guarantees it already exists by the time any worker
+        // callback for this job's FilePath can possibly run.
+        var placeholders = new List<ThumbnailItem>(frameCount);
+        for (var i = frameCount - 1; i >= 0; i--)
+        {
+            var thumbnail = new ThumbnailItem
+            {
+                JobId = jobId,
+                PageNumber = pageNumber,
+                FrameIndex = i,
+                BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
+                Status = isRecapture ? "Recapturing" : "Processing",
+                FilePath = filePath
+            };
+            RecentCaptures.Insert(0, thumbnail);
+            placeholders.Add(thumbnail);
+        }
+
+        // Keep last 100 thumbnails to avoid memory buildup
+        while (RecentCaptures.Count > 100)
+        {
+            var old = RecentCaptures[^1];
+            old.Thumbnail?.Dispose();
+            RecentCaptures.RemoveAt(RecentCaptures.Count - 1);
+        }
+
+        // Decoding the capture into a small preview bitmap can take a moment on a large TIFF —
+        // do that off the UI thread and fill it in once ready, without delaying the placeholder
+        // insertion above.
+        Task.Run(() =>
         {
             try
             {
                 var bytes = File.ReadAllBytes(filePath);
-
-                // Inserted in reverse so frame 0 ends up first/leftmost in the strip.
-                for (var i = frameCount - 1; i >= 0; i--)
+                foreach (var thumbnail in placeholders)
                 {
                     using var stream = new MemoryStream(bytes);
                     var thumb = Bitmap.DecodeToWidth(stream, 120);
-                    RecentCaptures.Insert(0, new ThumbnailItem
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                     {
-                        JobId = jobId,
-                        PageNumber = pageNumber,
-                        FrameIndex = i,
-                        Thumbnail = thumb,
-                        BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
-                        Status = isRecapture ? "Recapturing" : "Processing",
-                        FilePath = filePath
+                        var old = thumbnail.Thumbnail;
+                        thumbnail.Thumbnail = thumb;
+                        old?.Dispose();
                     });
 
                     // Persist this page's thumbnail to disk, independent of the original
@@ -1347,14 +1392,6 @@ public partial class MainWindowViewModel : ViewModelBase
                     {
                         Console.Error.WriteLine($"Could not persist thumbnail for page {pageNumber}: {ex.Message}");
                     }
-                }
-
-                // Keep last 100 thumbnails to avoid memory buildup
-                while (RecentCaptures.Count > 100)
-                {
-                    var old = RecentCaptures[^1];
-                    old.Thumbnail?.Dispose();
-                    RecentCaptures.RemoveAt(RecentCaptures.Count - 1);
                 }
             }
             catch (Exception ex)

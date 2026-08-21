@@ -1,12 +1,15 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Microsoft.EntityFrameworkCore;
 using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
@@ -41,6 +44,8 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     private readonly AppDbContext _dbContext;
     private readonly Batch _batch;
     private readonly string _defaultOutputDirectory;
+    private readonly DispatcherTimer? _refreshTimer;
+    private bool _everHadPages;
 
     public ObservableCollection<FinalizePageRow> Pages { get; } = new();
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
@@ -66,6 +71,19 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         SelectedFormat = string.IsNullOrWhiteSpace(batch.PreferredExportFormat) ? "PDF" : batch.PreferredExportFormat;
         DestinationDirectory = outputDirectory;
         FileName = MicroCapture.Core.FileNaming.Sanitize(string.IsNullOrEmpty(batch.Name) ? batch.BatchCode : batch.Name) + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+        // LoadPages() originally ran exactly once, against the Batch.Captures snapshot handed in
+        // by MainWindowViewModel.OpenFinalizeBatchAsync at the moment the dialog opened. If any
+        // page was still Pending/InProgress at that instant, it was excluded from Pages forever
+        // for this dialog session — even after BackgroundProcessingWorker (a separate DB
+        // connection) finished it moments later — because nothing here ever re-queried. That's
+        // why the "wait for thumbnails to show Processed" message never went away: the operator
+        // could wait indefinitely and this dialog would never notice. Poll instead, same pattern
+        // as CropReviewViewModel's own _previewTimer, stopping once every page has actually
+        // finished processing (Completed or Failed) so it isn't left running for no reason.
+        _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _refreshTimer.Tick += async (_, _) => await RefreshPagesAsync();
+        _refreshTimer.Start();
     }
 
     /// <summary>Design-time constructor.</summary>
@@ -79,6 +97,52 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     public void LoadPages()
     {
         var jobs = CaptureQueueService.GetCompletedJobsForBatch(_batch.Captures);
+        ApplyPages(jobs);
+    }
+
+    /// <summary>Re-queries the DB (not the <see cref="_batch"/>.Captures snapshot captured when
+    /// the dialog opened) for this batch's now-current job statuses, so a page that finishes
+    /// processing while the dialog is already open gets picked up — see the constructor's
+    /// comment for why a one-shot <see cref="LoadPages"/> alone left the dialog permanently
+    /// stuck showing "still processing" for any page not yet Completed at open time. Stops
+    /// polling once nothing is left Pending/InProgress, since there's nothing further to wait
+    /// for at that point.</summary>
+    private async Task RefreshPagesAsync()
+    {
+        if (_dbContext == null!) return; // design-time instance
+        List<CaptureJob> allJobs;
+        try
+        {
+            allJobs = await _dbContext.CaptureJobs.AsNoTracking()
+                .Where(j => j.BatchId == _batch.Id)
+                .ToListAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[FinalizeBatchViewModel] Refresh failed: {ex.Message}");
+            return;
+        }
+
+        var stillProcessing = allJobs.Any(j => j.ProcessingStatus is "Pending" or "InProgress");
+        var completed = CaptureQueueService.GetCompletedJobsForBatch(allJobs);
+        // Only re-render the list when the completed set actually changed — otherwise this
+        // would wipe out the operator's in-progress reorder every second.
+        var currentIds = Pages.Select(p => p.JobId).ToList();
+        var newIds = completed.Select(j => j.Id).ToList();
+        if (!currentIds.SequenceEqual(newIds))
+        {
+            ApplyPages(completed);
+        }
+
+        if (!stillProcessing)
+        {
+            _refreshTimer?.Stop();
+        }
+    }
+
+    private void ApplyPages(List<CaptureJob> jobs)
+    {
+        foreach (var row in Pages) row.Thumbnail?.Dispose();
         Pages.Clear();
         foreach (var job in jobs)
         {
@@ -95,7 +159,11 @@ public partial class FinalizeBatchViewModel : ViewModelBase
             }
             Pages.Add(new FinalizePageRow { JobId = job.Id, PageNumber = job.PageNumber, Thumbnail = thumb });
         }
-        StatusText = Pages.Count == 0 ? "No completed pages to finalize yet." : $"{Pages.Count} page(s) ready.";
+        _everHadPages = _everHadPages || Pages.Count > 0;
+        StatusText = Pages.Count == 0
+            ? (_everHadPages ? "No completed pages to finalize yet." : "Images are still processing — wait for thumbnails to show Processed.")
+            : $"{Pages.Count} page(s) ready.";
+        ExportCommand.NotifyCanExecuteChanged();
     }
 
     private bool CanMove(FinalizePageRow? row) => row != null && !IsBusy;
@@ -178,6 +246,7 @@ public partial class FinalizeBatchViewModel : ViewModelBase
             missingOcrText = missingOcrText || (IsPdfFormat && !EmbedSearchableText);
 
             Result = new FinalizeResult(exportPath, missingOcrText && IsPdfFormat);
+            _refreshTimer?.Stop();
             CloseRequested?.Invoke(this, EventArgs.Empty);
         }
         catch (InvalidOperationException ex) when (ex.Message == "Images are still being processed.")
@@ -198,6 +267,7 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     private void Cancel()
     {
         Result = null;
+        _refreshTimer?.Stop();
         CloseRequested?.Invoke(this, EventArgs.Empty);
     }
 }

@@ -33,8 +33,16 @@ public class AppDbContext : DbContext
         return System.IO.Path.Join(path, "MicroCapture.db");
     }
 
+    // "Default Timeout" sets SQLite's busy_timeout (seconds) on every connection this context
+    // opens, so a query here that lands while BackgroundProcessingWorker's separate connection
+    // is mid-write waits and retries instead of throwing SQLITE_BUSY immediately. Without this,
+    // EnsureColumn's own "PRAGMA busy_timeout=5000" (CaptureQueueService) only ever applied to
+    // the one connection instance used during startup migrations — every other query (e.g.
+    // RecentBatchesViewModel.LoadAsync) opened its own connection with SQLite's 0-second default,
+    // so an unlucky read during a concurrent worker write threw uncaught, silently no-opping
+    // whatever command triggered it (confirmed cause of "Recent" appearing to do nothing).
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseSqlite($"Data Source={DbPath}");
+        => options.UseSqlite($"Data Source={DbPath};Default Timeout=5");
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
