@@ -228,6 +228,13 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     public int ImageWidth { get; private set; }
     public int ImageHeight { get; private set; }
 
+    // Set whenever the page's source image can't be loaded (job not found, or its original
+    // capture file is gone — e.g. this page belongs to a batch that was already exported,
+    // which deletes originals — see BatchExportService.DeleteOriginals). Previously a failure
+    // here just left the whole panel silently blank forever with no feedback at all; the XAML
+    // shows this text in the image area whenever Image is still null.
+    [ObservableProperty] private string? _loadErrorMessage;
+
     public CropReviewViewModel()
     {
         // Design-time constructor.
@@ -251,9 +258,23 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             RenderPreview();
         };
 
+        // ChangeTracker.Clear() first: this _dbContext is the same long-lived instance that
+        // tracked this exact job when it was first enqueued (CaptureQueueService.
+        // EnqueueCaptureAsync), so a plain Find() here can return that original in-memory
+        // instance untouched by anything the background worker's separate context wrote since
+        // — see OpenRecentBatchesAsync's identical fix for the full explanation.
+        _dbContext.ChangeTracker.Clear();
         var job = _dbContext.CaptureJobs.Find(jobId);
-        if (job == null || !File.Exists(job.OriginalFilePath))
+        if (job == null)
+        {
+            LoadErrorMessage = "This page could not be found — it may have been deleted.";
             return;
+        }
+        if (!File.Exists(job.OriginalFilePath))
+        {
+            LoadErrorMessage = "This page's original image is no longer available (the batch may already be finalized/exported).";
+            return;
+        }
 
         _imagePath = job.OriginalFilePath;
         _batchId = job.BatchId;
@@ -375,6 +396,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                     try
                     {
                         Image = bmp;
+                        LoadErrorMessage = null;
                         ImageWidth = imageWidth;
                         ImageHeight = imageHeight;
                         IsSplitBookPages = isSplit;
@@ -457,6 +479,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[CropReviewViewModel] Background crop review load failed: {ex}");
+                Dispatcher.UIThread.Post(() => LoadErrorMessage = $"Could not load this page: {ex.Message}");
             }
         });
     }

@@ -56,7 +56,14 @@ public partial class RecentBatchesViewModel : ViewModelBase
 
     public async Task LoadAsync()
     {
+        // AsNoTracking: this AppDbContext is the same long-lived instance MainWindowViewModel
+        // uses for every capture (see CaptureQueueService.EnqueueCaptureAsync), so every
+        // CaptureJob it has ever created is already sitting in its identity map. A tracked
+        // query here would return those frozen-at-creation-time instances instead of each
+        // job's real current status, making page counts/status badges wrong for any batch
+        // already touched this session.
         var batches = await _dbContext.Batches
+            .AsNoTracking()
             .Include(b => b.Project)
             .Include(b => b.Captures)
             .OrderByDescending(b => b.StartTime)

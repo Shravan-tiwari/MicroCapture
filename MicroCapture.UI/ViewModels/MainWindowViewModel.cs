@@ -579,6 +579,13 @@ public partial class MainWindowViewModel : ViewModelBase
         var picked = await MicroCapture.UI.Views.RecentBatchesDialog.PickAsync(owner, _dbContext);
         if (picked == null) return;
 
+        // Clear the tracker before re-querying: this _dbContext has been tracking every
+        // CaptureJob/Batch it has ever touched this session (see CaptureQueueService.
+        // EnqueueCaptureAsync), so a plain Include query below would silently return those
+        // frozen-at-creation-time instances — e.g. every job still showing "Pending" even
+        // though the background worker (using its own separate context/connection) finished
+        // them long ago — instead of the batch's real current state.
+        _dbContext.ChangeTracker.Clear();
         var batch = await _dbContext.Batches
             .Include(b => b.Project)
             .Include(b => b.Captures)
@@ -634,6 +641,12 @@ public partial class MainWindowViewModel : ViewModelBase
             // Resume an existing active batch with the same code instead of always
             // creating a new one — otherwise a restart mid-batch (crash, power loss)
             // silently orphans every page captured before it and starts numbering over.
+            // ChangeTracker.Clear() first: if the operator switches Project/Batch Code back to
+            // a batch already touched this session (without restarting the app), a tracked
+            // query would return frozen-at-creation-time CaptureJob instances instead of the
+            // background worker's real current status for each — see OpenRecentBatchesAsync's
+            // identical fix for the full explanation.
+            _dbContext.ChangeTracker.Clear();
             var batch = await _dbContext.Batches
                 .Include(b => b.Captures)
                 .FirstOrDefaultAsync(b => b.ProjectId == project.Id && b.BatchCode == batchCode && b.Status == "Active");
@@ -1125,7 +1138,16 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        // AsNoTracking is required here, not optional: this same _dbContext instance has been
+        // tracking every CaptureJob since it was first enqueued (see CaptureQueueService.
+        // EnqueueCaptureAsync's _dbContext.CaptureJobs.Add), and the background worker updates
+        // job status through its own separate AppDbContext/connection. A tracked Include query
+        // returns the identity-mapped in-memory instances as-is — frozen at "Pending" from the
+        // moment each job was created — never picking up the worker's writes. Without
+        // AsNoTracking, this guard sees every job as permanently Pending and Finalize can never
+        // proceed, no matter how long the operator waits.
         var batch = await _dbContext.Batches
+            .AsNoTracking()
             .Include(b => b.Captures)
             .FirstOrDefaultAsync(b => b.Id == _currentBatchId);
         if (batch == null) return;

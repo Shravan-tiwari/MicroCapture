@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:conv="using:MicroCapture.UI.Converters"
+        xmlns:acv="using:Avalonia.Data.Converters"
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
         Background="{StaticResource CanvasBrush}">
@@ -32,6 +33,12 @@
                             Background="Transparent"
                             HorizontalAlignment="Stretch"
                             VerticalAlignment="Stretch"/>
+                    <TextBlock Text="{Binding LoadErrorMessage}"
+                               IsVisible="{Binding LoadErrorMessage, Converter={x:Static acv:StringConverters.IsNotNullOrEmpty}}"
+                               Foreground="{StaticResource InkMutedBrush}"
+                               TextWrapping="Wrap" TextAlignment="Center"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               MaxWidth="360" FontSize="14"/>
                 </Grid>
             </Border>
 
