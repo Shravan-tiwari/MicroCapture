@@ -2,7 +2,6 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         x:Class="MicroCapture.UI.Views.FinalizeBatchDialog"
-        x:DataType="vm:FinalizeBatchViewModel"
         Title="Finalize Batch"
         Width="760" Height="620"
         WindowStartupLocation="CenterOwner"
@@ -18,7 +17,7 @@
                 <ScrollViewer>
                     <ItemsControl ItemsSource="{Binding Pages}">
                         <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="vm:FinalizePageRow">
+                            <DataTemplate>
                                 <Border Background="{StaticResource Surface1Brush}" CornerRadius="6" Padding="8" Margin="0,0,0,6">
                                     <Grid ColumnDefinitions="Auto, *, Auto">
                                         <Border Grid.Column="0" Width="60" Height="60" CornerRadius="4" ClipToBounds="True"
@@ -29,15 +28,9 @@
                                                    Foreground="{StaticResource InkBrush}"
                                                    Text="{Binding PageNumber, StringFormat='Page {0}'}"/>
                                         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                            <Button Content="↑" Width="28"
-                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).MoveUpCommand}"
-                                                    CommandParameter="{Binding}" Classes="secondary"/>
-                                            <Button Content="↓" Width="28"
-                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).MoveDownCommand}"
-                                                    CommandParameter="{Binding}" Classes="secondary"/>
-                                            <Button Content="✕" Width="28"
-                                                    Command="{Binding $parent[ItemsControl].((vm:FinalizeBatchViewModel)DataContext).DeletePageCommand}"
-                                                    CommandParameter="{Binding}" Classes="iconDanger"/>
+                                            <Button Content="↑" Width="28" Click="OnMoveUpClick" Classes="secondary"/>
+                                            <Button Content="↓" Width="28" Click="OnMoveDownClick" Classes="secondary"/>
+                                            <Button Content="✕" Width="28" Click="OnDeletePageClick" Classes="iconDanger"/>
                                         </StackPanel>
                                     </Grid>
                                 </Border>

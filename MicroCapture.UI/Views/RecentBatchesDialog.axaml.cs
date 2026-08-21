@@ -1,5 +1,6 @@
 using System;
 using Avalonia.Controls;
+using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
@@ -16,6 +17,21 @@ public partial class RecentBatchesDialog : Window
     public RecentBatchesDialog()
     {
         InitializeComponent();
+    }
+
+    // Row buttons dispatch through this code-behind handler, not a compiled
+    // "$parent[ItemsControl].((vm:RecentBatchesViewModel)DataContext).SelectCommand" binding —
+    // that pattern threw "unable to resolve type vm:RecentBatchesViewModel from any of the
+    // following locations" at runtime on the actual target machine (confirmed reproducible
+    // after a clean rebuild), even though it built without error. MainWindow.axaml's own
+    // per-row buttons (thumbnail click/select/delete) all use this same sender.DataContext +
+    // this.DataContext code-behind idiom instead, and that's proven to work.
+    private void OnBatchRowClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button { DataContext: RecentBatchRow row } && DataContext is RecentBatchesViewModel vm)
+        {
+            vm.SelectCommand.Execute(row);
+        }
     }
 
     public static async System.Threading.Tasks.Task<Batch?> PickAsync(Window owner, AppDbContext dbContext)

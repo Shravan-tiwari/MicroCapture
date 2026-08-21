@@ -2,7 +2,6 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         x:Class="MicroCapture.UI.Views.RecentBatchesDialog"
-        x:DataType="vm:RecentBatchesViewModel"
         Title="Recent Batches"
         Width="560" Height="520"
         WindowStartupLocation="CenterOwner"
@@ -16,10 +15,9 @@
             <ScrollViewer Grid.Row="2">
                 <ItemsControl ItemsSource="{Binding Batches}">
                     <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:RecentBatchRow">
+                        <DataTemplate>
                             <Button Classes="secondary" HorizontalAlignment="Stretch" Margin="0,0,0,8" Padding="14,10"
-                                    Command="{Binding $parent[ItemsControl].((vm:RecentBatchesViewModel)DataContext).SelectCommand}"
-                                    CommandParameter="{Binding}">
+                                    Click="OnBatchRowClick">
                                 <Grid ColumnDefinitions="*, Auto">
                                     <StackPanel Grid.Column="0" Spacing="3">
                                         <StackPanel Orientation="Horizontal" Spacing="8">

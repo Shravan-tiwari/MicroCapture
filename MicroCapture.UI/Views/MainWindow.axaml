@@ -19,7 +19,14 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <Grid RowDefinitions="Auto, *, 112, Auto">
+    <!-- Filmstrip row (3rd) was 112px — barely enough for the thumbnail image row alone. With
+         the status dot+text row added below the page-number row, total content height (image +
+         two text rows + button/border padding) runs to ~140px, and since the inner ScrollViewer
+         only allows horizontal scrolling (see the filmstrip below), whatever didn't fit was
+         silently clipped from the bottom — the status Ellipse/TextBlock specifically, since they
+         sit last in each tile's StackPanel. Confirmed cause of "no status text/dot shown at all"
+         despite Status actually being set correctly. -->
+    <Grid RowDefinitions="Auto, *, 140, Auto">
 
         <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
         <Border Grid.Row="0" Background="{StaticResource Surface1Brush}" Padding="14,10"
