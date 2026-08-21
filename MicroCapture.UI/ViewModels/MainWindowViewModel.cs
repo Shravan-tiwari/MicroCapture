@@ -1001,6 +1001,38 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    [RelayCommand]
+    private async Task CaptureRawAsync()
+    {
+        if (!IsConnected) { StatusText = "Connect the camera before capturing."; return; }
+        try
+        {
+            StatusText = "Capturing unprocessed image...";
+            var timestamp = DateTime.Now.ToString("yyyyMMddHHmmssfff");
+            var filePath = await _cameraService.CaptureAsync(_outputDirectory, $"raw_{timestamp}");
+
+            if (!File.Exists(filePath))
+            {
+                StatusText = "Raw capture failed — file not found.";
+                return;
+            }
+
+            var (width, height) = await Task.Run(() => Processing.ImageProcessor.GetImagePixelDimensions(filePath));
+            if (width <= 0 || height <= 0)
+            {
+                StatusText = "Raw capture failed — could not read dimensions.";
+                return;
+            }
+
+            var filename = Path.GetFileName(filePath);
+            StatusText = $"✓ Raw captured: {filename} ({width}×{height}px) — Open in image editor to measure calibration target's pixel coordinates.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Raw capture failed: {ex.Message}";
+        }
+    }
+
     private bool CanRunOcrOrExport() => !IsOcrRunning && !IsExporting;
 
     [RelayCommand(CanExecute = nameof(CanRunOcrOrExport))]

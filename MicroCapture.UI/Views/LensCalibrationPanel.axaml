@@ -39,8 +39,6 @@
                                Text="Enter the known physical size of a calibration target, frame it to fill the full captured frame, then click Measure DPI."/>
                     <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
                         <StackPanel Spacing="10">
-                            <Button Content="Capture Raw (Unprocessed)" Command="{Binding CaptureRawCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
-                            <TextBlock Text="{Binding RawCaptureStatusText}" TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource InkTertiaryBrush}"/>
                             <Grid ColumnDefinitions="Auto, *, Auto, *" RowDefinitions="Auto" >
                                 <TextBlock Grid.Column="0" Text="Width (in)" VerticalAlignment="Center" FontSize="13"
                                            Foreground="{StaticResource InkTertiaryBrush}" Margin="0,0,8,0"/>
