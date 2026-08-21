@@ -53,6 +53,39 @@ public partial class LensCalibrationViewModel : ViewModelBase
     [ObservableProperty] private bool _resultLooksGood;
     [ObservableProperty] private int _imagesUsedInResult;
 
+    // --- Physical-size DPI calibration (separate from the lens intrinsics computed above) ---
+    // Operator-entered known physical size of the calibration target, in inches. Defaults to 0
+    // ("not entered yet") rather than guessing a size, since a wrong guess silently baked into
+    // MeasuredDpi would be worse than an obviously-unset 0.
+    [ObservableProperty] private double _targetWidthInches;
+    [ObservableProperty] private double _targetHeightInches;
+    [ObservableProperty] private double? _measuredPixelWidth;
+    [ObservableProperty] private double? _measuredPixelHeight;
+    [ObservableProperty] private string _dpiStatusText = "Enter the calibration target's physical width/height, then Measure DPI.";
+
+    /// <summary>Read-only preview of the DPI this calibration would compute, shown next to the
+    /// input fields — same averaging formula as ImageProcessor.MeasuredDpi, duplicated here
+    /// (rather than referencing MicroCapture.Processing from a property getter) only because
+    /// it's a trivial one-line computation over already-in-hand doubles; SaveAsync below is the
+    /// actual source of truth once persisted.</summary>
+    public double? ComputedDpi =>
+        MeasuredPixelWidth is { } pw && MeasuredPixelHeight is { } ph && TargetWidthInches > 0 && TargetHeightInches > 0
+            ? (pw / TargetWidthInches + ph / TargetHeightInches) / 2.0
+            : null;
+
+    partial void OnMeasuredPixelWidthChanged(double? value) => OnPropertyChanged(nameof(ComputedDpi));
+    partial void OnMeasuredPixelHeightChanged(double? value) => OnPropertyChanged(nameof(ComputedDpi));
+    partial void OnTargetWidthInchesChanged(double value)
+    {
+        OnPropertyChanged(nameof(ComputedDpi));
+        MeasureDpiCommand.NotifyCanExecuteChanged();
+    }
+    partial void OnTargetHeightInchesChanged(double value)
+    {
+        OnPropertyChanged(nameof(ComputedDpi));
+        MeasureDpiCommand.NotifyCanExecuteChanged();
+    }
+
     public ObservableCollection<string> Log { get; } = new();
 
     private LensCalibrationService.CalibrationOutcome? _outcome;
@@ -109,6 +142,60 @@ public partial class LensCalibrationViewModel : ViewModelBase
         {
             IsBusy = false;
             ComputeCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private bool CanMeasureDpi() => !IsBusy && TargetWidthInches > 0 && TargetHeightInches > 0;
+
+    /// <summary>Measures the rig's real physical DPI: takes one fresh full-frame capture (not
+    /// one of the ChArUco board shots collected above — the DPI target and the lens-calibration
+    /// board don't have to be the same physical object, and requiring a fresh shot lets the
+    /// operator frame the DPI target to fill the known-size area precisely, without depending on
+    /// however a board pose happened to be framed for marker detection) and reads its pixel
+    /// dimensions directly via Mat.Cols/Mat.Rows (ImageProcessor.GetImagePixelDimensions).
+    ///
+    /// This assumes the operator has framed the capture so the calibration target's known
+    /// physical extent fills the full frame edge-to-edge — the simplest correct approach given
+    /// time constraints. LensCalibrationService's own marker-grid inference
+    /// (BuildMarkerGrid/DetectMarkerCenters) was considered as a tighter alternative (measuring
+    /// only the board's own pixel span within a larger frame), but that grid is explicitly
+    /// documented as arbitrary-scale/uncalibrated (see LensCalibrationService's class remarks —
+    /// "arbitrary-scale and not aligned to any absolute real-world axis or origin"), so it has no
+    /// physical-inches reference to anchor a pixel-per-inch measurement to; only the operator's
+    /// own known target-size entry can provide that.</summary>
+    [RelayCommand(CanExecute = nameof(CanMeasureDpi))]
+    private async Task MeasureDpiAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            DpiStatusText = "Capturing DPI reference frame...";
+            var path = await _cameraService.CaptureAsync(_outputDirectory, $"dpicalib_{DateTime.Now:yyyyMMddHHmmssfff}");
+            var (width, height) = await Task.Run(() => ImageProcessor.GetImagePixelDimensions(path));
+
+            if (width <= 0 || height <= 0)
+            {
+                DpiStatusText = "Could not read the captured frame — retry.";
+                Log.Insert(0, "DPI measurement failed: captured frame could not be decoded.");
+                return;
+            }
+
+            MeasuredPixelWidth = width;
+            MeasuredPixelHeight = height;
+            Log.Insert(0, $"DPI reference frame captured: {width}x{height}px for a {TargetWidthInches:F2}\"x{TargetHeightInches:F2}\" target.");
+            DpiStatusText = ComputedDpi is { } dpi
+                ? $"Measured DPI: {dpi:F0} — Save to apply it to this calibration."
+                : "Measurement captured, but DPI could not be computed — check the target size fields.";
+        }
+        catch (Exception ex)
+        {
+            Log.Insert(0, $"DPI measurement failed: {ex.Message}");
+            DpiStatusText = "DPI measurement failed — see log below.";
+        }
+        finally
+        {
+            IsBusy = false;
         }
     }
 
@@ -176,6 +263,14 @@ public partial class LensCalibrationViewModel : ViewModelBase
                 DistCoeffs = formatted[1],
                 ReprojectionErrorPx = _outcome.Value.ReprojectionErrorPx,
                 IsActive = true,
+                // Physical-size DPI calibration (see this class's own fields above) — saved
+                // alongside the lens intrinsics whether or not Measure DPI was ever run; null
+                // fields here just mean this rig's DPI calibration wasn't done this session
+                // (ImageProcessor.MeasuredDpi degrades to BaselineDpi in that case).
+                TargetWidthInches = TargetWidthInches > 0 ? TargetWidthInches : null,
+                TargetHeightInches = TargetHeightInches > 0 ? TargetHeightInches : null,
+                MeasuredPixelWidth = MeasuredPixelWidth,
+                MeasuredPixelHeight = MeasuredPixelHeight,
             };
             _dbContext.CameraCalibrations.Add(row);
             await _dbContext.SaveChangesAsync();

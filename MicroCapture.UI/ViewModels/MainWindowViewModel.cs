@@ -80,6 +80,22 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private int _selectedDpi = 150;
     public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
 
+    // Output file format is sticky PER CAPTURE, not per batch like DPI/dewarp/binarize/
+    // bleedthrough above — read directly at capture-enqueue time (CaptureAsync/RecaptureAsync)
+    // and stamped onto that job's own CaptureFormat, so it can change capture-to-capture within
+    // the same batch without any Batch-row persistence or OnXChanged hook. Hydrated from the
+    // most recently captured job's own CaptureFormat on startup (see the constructor) so the
+    // dropdown remembers the last-used format across app restarts, the same "sticky" behavior
+    // DPI/format selections elsewhere in the app already have via their own Batch persistence.
+    [ObservableProperty] private string _selectedCaptureFormat = "TIFF";
+    partial void OnSelectedCaptureFormatChanged(string value)
+    {
+        // Capture format persists the current choice but does not retroactively change
+        // already-processed jobs in the batch (they keep their original format).
+        // This is just a "remember my last choice" convenience.
+    }
+    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG" };
+
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
     // in the background queue, off the capture path, so toggling this never affects shutter
     // responsiveness. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
@@ -95,6 +111,35 @@ public partial class MainWindowViewModel : ViewModelBase
     // only) — opt-in per batch. See ImageProcessor.TryRemoveBleedthrough.
     [ObservableProperty] private bool _bleedthroughEnabled = false;
 
+    /// <summary>Immediately persists one field of the active batch's settings row so a toggle
+    /// changed mid-batch (DPI/dewarp/binarize/bleedthrough/split) takes effect for every capture
+    /// still to come, without requiring an app restart or a re-opened batch. A no-op before any
+    /// batch is started, and suppressed while StartBatchAsync's resume branch is hydrating these
+    /// same observable properties FROM a loaded batch (see _suppressPersist) so that doesn't
+    /// read back as an operator-initiated change. Failures are reported via StatusText rather
+    /// than thrown — a setting that fails to persist should never crash the capture session;
+    /// the operator can see the message and retry the toggle.</summary>
+    private async void PersistBatchSettingAsync(Action<Batch> apply)
+    {
+        if (_currentBatchId == null || _suppressPersist) return;
+        try
+        {
+            var batch = await _dbContext.Batches.FindAsync(_currentBatchId);
+            if (batch == null) return;
+            apply(batch);
+            await _dbContext.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not save setting: {ex.Message}";
+        }
+    }
+
+    partial void OnSelectedDpiChanged(int value) => PersistBatchSettingAsync(b => b.Dpi = value);
+    partial void OnDewarpEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.DewarpEnabled = value);
+    partial void OnBinarizeEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BinarizeEnabled = value);
+    partial void OnBleedthroughEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BleedthroughEnabled = value);
+
     public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
     // Visible once the operator has expressed intent (checked the box for the next batch) OR
     // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
@@ -106,8 +151,21 @@ public partial class MainWindowViewModel : ViewModelBase
         if (value) SplitBookPages = false;
         OnPropertyChanged(nameof(ShowCalibrateButton));
         OnPropertyChanged(nameof(CalibrateButtonLabel));
+
+        // Turning fixed frames OFF can take effect immediately for future captures — there's
+        // nothing to (re)calibrate for "off." Turning it ON still requires going through the
+        // existing CalibrateFramesAsync flow exactly as today (StartBatchAsync's new-batch
+        // branch, or CalibrateFramesAsync itself, are what persist UseFixedFrames = true once a
+        // real calibration exists) — persisting true here, before any frames are calibrated,
+        // would let the background worker pick up UseFixedFrames=true with no FixedFrames data.
+        if (!value && IsFixedFrameBatch)
+            PersistBatchSettingAsync(b => b.UseFixedFrames = false);
     }
-    partial void OnSplitBookPagesChanged(bool value) { if (value) UseFixedFrames = false; }
+    partial void OnSplitBookPagesChanged(bool value)
+    {
+        if (value) UseFixedFrames = false;
+        PersistBatchSettingAsync(b => b.SplitBookPages = value);
+    }
     partial void OnIsFixedFrameBatchChanged(bool value)
     {
         OnPropertyChanged(nameof(IsAutoCaptureAvailable));
@@ -118,6 +176,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private string? _currentProjectId;
     private string? _currentBatchId;
+    // Set true only while StartBatchAsync's resume branch is hydrating the observable DPI/
+    // dewarp/binarize/bleedthrough properties FROM an already-saved Batch row — without this,
+    // those assignments would round-trip straight back into PersistBatchSettingAsync as if the
+    // operator had just changed them, which is at best a redundant write and at worst racy given
+    // _currentBatchId's own assignment timing during that same resume.
+    private bool _suppressPersist;
     // Snapshotted at StartBatchAsync, sanitized so operator-entered text can never
     // escape the intended output directory or produce an invalid filename.
     private string _activeProjectCode = string.Empty;
@@ -290,6 +354,33 @@ public partial class MainWindowViewModel : ViewModelBase
                 finally { Volatile.Write(ref _liveViewFramePending, 0); }
             });
         };
+
+        _ = HydrateLastUsedCaptureFormatAsync();
+    }
+
+    /// <summary>Sets SelectedCaptureFormat's initial value from whatever format the most
+    /// recently captured job (across every batch, not just the current one) actually used —
+    /// so the dropdown remembers the operator's last choice across app restarts, the same way
+    /// DPI/dewarp/etc. are sticky via their own Batch persistence. CaptureFormat is per-job, not
+    /// per-batch, so there's no Batch row to read this back from at Start Batch time the way
+    /// SelectedDpi etc. do — this is the one-time app-startup equivalent instead. Silently
+    /// leaves the "TIFF" default in place if the query fails or no jobs exist yet (a brand-new
+    /// install), consistent with how design-time/never-captured state should look.</summary>
+    private async Task HydrateLastUsedCaptureFormatAsync()
+    {
+        try
+        {
+            var lastFormat = await _dbContext.CaptureJobs
+                .OrderByDescending(j => j.Timestamp)
+                .Select(j => j.CaptureFormat)
+                .FirstOrDefaultAsync();
+            if (!string.IsNullOrWhiteSpace(lastFormat))
+                SelectedCaptureFormat = lastFormat;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Could not hydrate last-used capture format: {ex}");
+        }
     }
 
     private void UpdateCaptureReadiness()
@@ -488,13 +579,26 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 _currentBatchId = batch.Id;
                 PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
-                IsFixedFrameBatch = batch.UseFixedFrames;
-                RefreshFixedFrameCache(batch);
-                ExportFormat = batch.PreferredExportFormat;
-                SelectedDpi = batch.Dpi;
-                DewarpEnabled = batch.DewarpEnabled;
-                BinarizeEnabled = batch.BinarizeEnabled;
-                BleedthroughEnabled = batch.BleedthroughEnabled;
+                // These assignments hydrate the observable properties FROM the already-saved
+                // batch row — without suppression, each one's OnXChanged would immediately
+                // PersistBatchSettingAsync straight back to the very row it was just read from
+                // (redundant at best; racy at worst, since _currentBatchId above is already set
+                // by the time these run).
+                _suppressPersist = true;
+                try
+                {
+                    IsFixedFrameBatch = batch.UseFixedFrames;
+                    RefreshFixedFrameCache(batch);
+                    ExportFormat = batch.PreferredExportFormat;
+                    SelectedDpi = batch.Dpi;
+                    DewarpEnabled = batch.DewarpEnabled;
+                    BinarizeEnabled = batch.BinarizeEnabled;
+                    BleedthroughEnabled = batch.BleedthroughEnabled;
+                }
+                finally
+                {
+                    _suppressPersist = false;
+                }
                 await LoadRecentCapturesFromBatchAsync(batch);
                 StatusText = $"Resumed batch '{batchCode}' for project '{projectCode}' at page {PageCount}";
             }
@@ -769,7 +873,7 @@ public partial class MainWindowViewModel : ViewModelBase
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
 
             // Record in durable queue
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat);
 
             // Add thumbnail
             AddThumbnail(job.Id, filePath, PageCount);
@@ -808,7 +912,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             await _queueService.SupersedePageAsync(_currentBatchId, PageCount);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount);
+            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat);
 
             // Update thumbnail for the recaptured page
             var existing = RecentCaptures.Where(t => t.PageNumber == PageCount).ToList();
@@ -984,6 +1088,7 @@ public partial class MainWindowViewModel : ViewModelBase
             StatusText = $"Exporting batch {BatchCode} to {ExportFormat}...";
             var exportService = new MicroCapture.Processing.BatchExportService(_dbContext);
             var exportPath = await exportService.ExportBatchAsync(_currentBatchId, _outputDirectory, ExportFormat);
+
             StatusText = missingOcrText
                 ? $"Exported: {Path.GetFileName(exportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
                 : $"Exported successfully: {Path.GetFileName(exportPath)}";
@@ -1002,6 +1107,14 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Deletes every job's OriginalFilePath for a batch that just finished exporting
+    /// successfully — never called on a failed or cancelled export (see ExportBatchAsync, which
+    /// only reaches this after ExportBatchAsync's own export call returns without throwing).
+    /// Originals are retained up to this point specifically so Crop Review can re-crop from the
+    /// original at any time before final export; once export has produced its output, that
+    /// capability is no longer needed for this batch. Each deletion is independently try/caught
+    /// so one locked/missing file can't stop the rest from being cleaned up. Returns the number
+    /// of files that could not be deleted, for the caller's status message.</summary>
     // ---------- Helpers ----------
 
     [RelayCommand]
@@ -1188,16 +1301,20 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
-            var processedDir = Path.Combine(Path.GetDirectoryName(item.FilePath) ?? ".", "Processed");
-            var baseName = Path.GetFileNameWithoutExtension(item.FilePath);
-            if (Directory.Exists(processedDir))
+            // Processed derivatives now live in the main capture folder alongside the (still-
+            // retained) original, not a separate "Processed" subfolder — target that folder, but
+            // skip the original itself so this cleanup never removes the file the doc comment
+            // above promises to leave on disk. Use the boundary-aware derivative matcher, not a
+            // raw "{baseName}*" glob: a recapture's own original ("{baseName}_R_{timestamp}.jpg")
+            // is a literal prefix-match of the page it recaptures and must never be deleted here.
+            var processedDir = MicroCapture.Processing.ProcessedFilePaths.OutputDirectoryFor(item.FilePath);
+            foreach (var derivative in MicroCapture.Processing.ProcessedFilePaths.EnumerateDerivatives(processedDir, item.FilePath))
             {
-                foreach (var derivative in Directory.EnumerateFiles(processedDir, $"{baseName}*"))
-                {
-                    try { File.Delete(derivative); }
-                    catch (IOException) { /* best-effort cleanup; the DB status is what actually excludes it */ }
-                    catch (UnauthorizedAccessException) { /* best-effort cleanup */ }
-                }
+                if (string.Equals(Path.GetFullPath(derivative), Path.GetFullPath(item.FilePath), StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try { File.Delete(derivative); }
+                catch (IOException) { /* best-effort cleanup; the DB status is what actually excludes it */ }
+                catch (UnauthorizedAccessException) { /* best-effort cleanup */ }
             }
         }
         catch (Exception ex)

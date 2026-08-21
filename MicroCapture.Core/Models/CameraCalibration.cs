@@ -41,4 +41,17 @@ public class CameraCalibration
     public double ReprojectionErrorPx { get; set; }
 
     public bool IsActive { get; set; }
+
+    // Physical-size DPI calibration — entirely distinct from the lens intrinsics fields above
+    // (Fx/Fy/Cx/Cy/DistCoeffs correct optical distortion in an arbitrary/unscaled coordinate
+    // system; these four fields instead tie the rig's pixel grid to a real physical
+    // measurement). Operator enters the known physical size of a calibration target
+    // (TargetWidthInches/TargetHeightInches) and the app measures how many pixels that target
+    // spans in a captured frame (MeasuredPixelWidth/MeasuredPixelHeight) — together they give
+    // pixels-per-inch, the actual measured DPI of this rig at this camera distance/zoom. Null
+    // means "not yet calibrated" — see ImageProcessor.MeasuredDpi for the uncalibrated fallback.
+    public double? TargetWidthInches { get; set; }
+    public double? TargetHeightInches { get; set; }
+    public double? MeasuredPixelWidth { get; set; }
+    public double? MeasuredPixelHeight { get; set; }
 }

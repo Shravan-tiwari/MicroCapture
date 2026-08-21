@@ -80,6 +80,15 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "Sharpness", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "WhiteBalance", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "BleedthroughEnabled", "INTEGER NOT NULL DEFAULT 0");
+        // Physical-size DPI calibration (see CameraCalibration.cs's own comment on these four
+        // fields) — null means "not yet calibrated," so ImageProcessor.MeasuredDpi falls back to
+        // BaselineDpi for any rig whose calibration row predates this.
+        EnsureColumn("CameraCalibrations", "TargetWidthInches", "REAL NULL");
+        EnsureColumn("CameraCalibrations", "TargetHeightInches", "REAL NULL");
+        EnsureColumn("CameraCalibrations", "MeasuredPixelWidth", "REAL NULL");
+        EnsureColumn("CameraCalibrations", "MeasuredPixelHeight", "REAL NULL");
+        EnsureColumn("CaptureJobs", "ProcessedFilePath", "TEXT NULL");
+        EnsureColumn("CaptureJobs", "CaptureFormat", "TEXT NOT NULL DEFAULT 'TIFF'");
     }
 
     private void EnsureCameraCalibrationsTable()
@@ -142,7 +151,7 @@ public class CaptureQueueService
         }
     }
 
-    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber)
+    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF")
     {
         var job = new CaptureJob
         {
@@ -150,12 +159,13 @@ public class CaptureQueueService
             OriginalFilePath = originalFilePath,
             PageNumber = pageNumber,
             Timestamp = DateTime.UtcNow,
-            ProcessingStatus = "Pending"
+            ProcessingStatus = "Pending",
+            CaptureFormat = captureFormat
         };
 
         _dbContext.CaptureJobs.Add(job);
         await _dbContext.SaveChangesAsync();
-        
+
         return job;
     }
 
@@ -252,5 +262,19 @@ public class CaptureQueueService
             }
             await _dbContext.SaveChangesAsync();
         }
+    }
+
+    /// <summary>Records exactly where a job's processed derivative(s) ended up on disk — the
+    /// single ';'-joined path (matching FixedFrames/DewarpCurve's own multi-value convention)
+    /// downstream readers (BatchExportService.GetProcessedFilesForJob, and eventually export
+    /// cleanup) prefer over globbing a folder by filename prefix. Same superseded-guard as
+    /// <see cref="UpdateJobStatusAsync"/> — a recapture can supersede this job while the old
+    /// attempt is still mid-flight, and a stale write finishing afterward must not resurrect it.</summary>
+    public async Task SetProcessedFilePathAsync(string jobId, string processedFilePath)
+    {
+        var job = await _dbContext.CaptureJobs.FindAsync(jobId);
+        if (job == null || job.ProcessingStatus == "Superseded") return;
+        job.ProcessedFilePath = processedFilePath;
+        await _dbContext.SaveChangesAsync();
     }
 }

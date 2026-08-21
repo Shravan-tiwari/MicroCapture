@@ -182,26 +182,67 @@ public class BatchExportService
 
     /// <summary>Deterministically resolves a job's processed output file(s) on disk from its
     /// original capture path — shared with <see cref="BatchOcrService"/> so both locate exactly
-    /// the same files without duplicating the glob logic.</summary>
+    /// the same files without duplicating the glob logic.
+    ///
+    /// Four tiers, each falling through to the next only if it finds nothing:
+    /// 1. <see cref="CaptureJob.ProcessedFilePath"/> — the exact path(s) BackgroundProcessingWorker
+    ///    recorded on success (';'-joined for multi-output jobs). The authoritative answer for
+    ///    every job processed after this field was introduced; filtered to paths that still
+    ///    exist, since a job's derivative can be deleted outside this flow (e.g. Crop Review
+    ///    reprocessing cleanup) without the DB field being cleared.
+    /// 2. A glob of the main capture folder (the current layout — processed derivatives now live
+    ///    alongside the retained original, not a separate subfolder) by filename prefix, for rows
+    ///    with no ProcessedFilePath yet (older schema, or a job that failed to persist it).
+    /// 3. A glob of the OLD "Processed" subfolder by the same prefix — backward compatibility for
+    ///    batches processed before this change, whose derivatives still live there and were never
+    ///    moved.
+    /// 4. <see cref="CaptureJob.OriginalFilePath"/> itself, if nothing else was found.</summary>
     internal static List<string> GetProcessedFilesForJob(CaptureJob job)
     {
-        var dir = Path.GetDirectoryName(job.OriginalFilePath) ?? ".";
-        var processedDir = Path.Combine(dir, "Processed");
-        var fileName = Path.GetFileNameWithoutExtension(job.OriginalFilePath);
-
-        var list = new List<string>();
-        if (Directory.Exists(processedDir))
+        // Tier 1: the exact recorded path(s), if this job has them and they still exist.
+        if (!string.IsNullOrWhiteSpace(job.ProcessedFilePath))
         {
-            // The ImageProcessor creates files like {fileName}_processed.tif or {fileName}_1_left.tif
-            var files = Directory.GetFiles(processedDir, $"{fileName}*.*")
-                .Where(IsExportableImage)
-                .OrderBy(f => f) // alphabetical order ensures _1_left before _2_right
+            var recorded = job.ProcessedFilePath
+                .Split(';', StringSplitOptions.RemoveEmptyEntries)
+                .Where(File.Exists)
                 .ToList();
-            if (files.Count > 0)
-                list.AddRange(files);
+            if (recorded.Count > 0)
+                return recorded;
         }
 
-        if (list.Count == 0 && File.Exists(job.OriginalFilePath))
+        var dir = ProcessedFilePaths.OutputDirectoryFor(job.OriginalFilePath);
+
+        // Tier 2: main folder glob (current layout) — e.g. {fileName}.tif, {fileName}_1_left.tif.
+        // Uses the boundary-aware derivative matcher, not a raw "{fileName}*" glob: with
+        // originals now retained alongside their derivatives, a raw prefix glob would also match
+        // an unrelated job's recapture original ("{fileName}_R_{timestamp}.jpg") whose name
+        // happens to start with this job's file name.
+        var mainFolderFiles = ProcessedFilePaths.EnumerateDerivatives(dir, job.OriginalFilePath)
+            .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(job.OriginalFilePath), StringComparison.OrdinalIgnoreCase))
+            .Where(IsExportableImage)
+            .OrderBy(f => f) // alphabetical order ensures _1_left before _2_right
+            .ToList();
+        if (mainFolderFiles.Count > 0)
+            return mainFolderFiles;
+
+        // Tier 3: old "Processed" subfolder glob — backward compatibility for batches processed
+        // before derivatives moved into the main capture folder. Originals were never written
+        // into this legacy subfolder, so a plain prefix glob here doesn't share Tier 2's
+        // recapture-collision risk, but use the same matcher for consistency.
+        var legacyProcessedDir = Path.Combine(dir, "Processed");
+        if (Directory.Exists(legacyProcessedDir))
+        {
+            var legacyFiles = ProcessedFilePaths.EnumerateDerivatives(legacyProcessedDir, job.OriginalFilePath)
+                .Where(IsExportableImage)
+                .OrderBy(f => f)
+                .ToList();
+            if (legacyFiles.Count > 0)
+                return legacyFiles;
+        }
+
+        // Tier 4: last resort, the original capture itself.
+        var list = new List<string>();
+        if (File.Exists(job.OriginalFilePath))
         {
             list.Add(job.OriginalFilePath);
         }

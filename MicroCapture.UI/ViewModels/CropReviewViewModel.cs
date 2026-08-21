@@ -889,17 +889,21 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             job.OcrStatus = "Pending";
             job.ExportStatus = "Pending";
 
-            // A reprocess must not leave stale derivatives eligible for export.
-            var processedDirectory = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
-            var baseName = Path.GetFileNameWithoutExtension(job.OriginalFilePath);
-            if (Directory.Exists(processedDirectory))
+            // A reprocess must not leave stale derivatives eligible for export. Processed
+            // derivatives now live in the same folder as the (retained-until-export) original,
+            // not a separate "Processed" subfolder — target that main folder, but skip the
+            // original itself, which must survive a reprocess exactly like it survives every
+            // other step before export. Use the boundary-aware derivative matcher, not a raw
+            // "{baseName}*" glob: another job's recapture original can share this job's base
+            // name as a literal string prefix and must never be swept up here.
+            var processedDirectory = ProcessedFilePaths.OutputDirectoryFor(job.OriginalFilePath);
+            foreach (var derivative in ProcessedFilePaths.EnumerateDerivatives(processedDirectory, job.OriginalFilePath))
             {
-                foreach (var derivative in Directory.EnumerateFiles(processedDirectory, $"{baseName}*"))
-                {
-                    try { File.Delete(derivative); }
-                    catch (IOException) { /* The worker will overwrite its own output on retry. */ }
-                    catch (UnauthorizedAccessException) { /* Preserve the source job; report remains available. */ }
-                }
+                if (string.Equals(Path.GetFullPath(derivative), Path.GetFullPath(job.OriginalFilePath), StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try { File.Delete(derivative); }
+                catch (IOException) { /* The worker will overwrite its own output on retry. */ }
+                catch (UnauthorizedAccessException) { /* Preserve the source job; report remains available. */ }
             }
 
             await _dbContext.SaveChangesAsync();

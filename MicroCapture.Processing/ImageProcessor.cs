@@ -2,6 +2,7 @@ using System;
 using System.Globalization;
 using System.IO;
 using BitMiracle.LibTiff.Classic;
+using MicroCapture.Core.Models;
 using OpenCvSharp;
 
 namespace MicroCapture.Processing;
@@ -86,6 +87,46 @@ public partial class ImageProcessor
     // and nothing ever downsamples away real captured detail just because of this setting. See
     // ResizeForDpi.
     public const int BaselineDpi = 150;
+
+    /// <summary>Real, physically-measured pixels-per-inch for the rig a job's batch was
+    /// captured under, derived from <see cref="CameraCalibration.TargetWidthInches"/>/
+    /// <see cref="CameraCalibration.TargetHeightInches"/> (the operator-entered known physical
+    /// size of a calibration target) and <see cref="CameraCalibration.MeasuredPixelWidth"/>/
+    /// <see cref="CameraCalibration.MeasuredPixelHeight"/> (how many pixels that target spanned
+    /// in a captured frame) — averaged across width and height for a single scalar DPI. This
+    /// replaces the old assumption that BaselineDpi (150) was itself a real captured resolution;
+    /// it never was (no sensor size/capture distance/lens geometry was ever measured), which is
+    /// the confirmed root cause of processed pages coming out roughly 2x (or worse) their real
+    /// physical size versus what the DPI tag claimed.
+    ///
+    /// Falls back to <see cref="BaselineDpi"/> when <paramref name="calib"/> is null or any of
+    /// the four calibration fields is missing/non-positive — i.e. this rig has never been
+    /// physically DPI-calibrated. That fallback keeps the pipeline running (never throws/blocks
+    /// a capture), but the resulting DPI is only ever a label in that case, not a measured
+    /// physical fact — exactly the pre-existing (uncalibrated) behavior, preserved as a documented
+    /// degrade path rather than a silent one.</summary>
+    // Sanity bounds on a MeasuredDpi result: below MinPlausibleDpi/above MaxPlausibleDpi almost
+    // certainly means a fat-fingered calibration entry (e.g. inches typed where the field meant
+    // something else, or an accidental decimal-point slip) rather than a real physical
+    // measurement — no real copy-stand rig measures under 20 or over 4x the highest selectable
+    // AvailableDpiOptions value. Falling back to BaselineDpi in that case keeps the pipeline from
+    // computing an extreme resample scale off a value nobody actually intended.
+    private const double MinPlausibleDpi = 20.0;
+    private const double MaxPlausibleDpi = 4800.0;
+
+    public static double MeasuredDpi(CameraCalibration? calib)
+    {
+        if (calib is { TargetWidthInches: > 0, TargetHeightInches: > 0, MeasuredPixelWidth: { } pw, MeasuredPixelHeight: { } ph })
+        {
+            var dpiX = pw / calib.TargetWidthInches.Value;
+            var dpiY = ph / calib.TargetHeightInches.Value;
+            var measured = (dpiX + dpiY) / 2.0;
+            if (measured is >= MinPlausibleDpi and <= MaxPlausibleDpi)
+                return measured;
+        }
+        return BaselineDpi;
+    }
+
     public double CropConfidenceThreshold { get; set; } = 0.5;
     // Below this, detection is unreliable enough that Crop Review shouldn't pre-fill a
     // suggestion at all — full-frame/manual is the safer default. Between this and
@@ -402,7 +443,7 @@ public partial class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, double measuredDpi = BaselineDpi, string captureFormat = "TIFF")
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -480,14 +521,12 @@ public partial class ImageProcessor
                     result.WasCropped = leftFlat.Cols != src.Cols / 2 || leftFlat.Rows != src.Rows
                         || rightFlat.Cols != src.Cols / 2 || rightFlat.Rows != src.Rows;
 
-                    using var leftFinished = FinishPageProcessing(leftFlat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
-                    var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                    WriteTiff(outLeft, leftFinished, meta, result.WasBinarized);
+                    using var leftFinished = FinishPageProcessing(leftFlat, result, binarizeEnabled, meta.Dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                    var outLeft = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left", leftFinished, meta, result.WasBinarized, captureFormat);
                     result.OutputFilePaths.Add(outLeft);
 
-                    using var rightFinished = FinishPageProcessing(rightFlat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
-                    var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                    WriteTiff(outRight, rightFinished, meta, result.WasBinarized);
+                    using var rightFinished = FinishPageProcessing(rightFlat, result, binarizeEnabled, meta.Dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                    var outRight = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right", rightFinished, meta, result.WasBinarized, captureFormat);
                     result.OutputFilePaths.Add(outRight);
 
                     if (!splitPages) result.Warnings.Add("Two-page spread auto-detected (spine shadow) — split into left/right pages automatically.");
@@ -503,11 +542,9 @@ public partial class ImageProcessor
                     // found and applied a real geometric correction versus degrading to an
                     // effective pass-through on a featureless/low-signal capture.
                     result.WasCropped = flat.Cols != src.Cols || flat.Rows != src.Rows;
-                    using var finished = FinishPageProcessing(flat, result, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                    using var finished = FinishPageProcessing(flat, result, binarizeEnabled, meta.Dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
 
-                    var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
-                    var outPath = Path.Combine(outputDirectory, outName);
-                    WriteTiff(outPath, finished, meta, result.WasBinarized);
+                    var outPath = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath), finished, meta, result.WasBinarized, captureFormat, singlePageInputPath: inputPath);
                     result.OutputFilePaths.Add(outPath);
                     result.Success = true;
                     return result;
@@ -551,17 +588,15 @@ public partial class ImageProcessor
 
                 // Process left — its own spine edge is this half's right edge (leftMat.Cols).
                 using var leftMat = WarpQuad(src, leftCorners);
-                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
-                var outLeft = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left.tif");
-                WriteTiff(outLeft, leftResult, meta, result.WasBinarized);
+                var leftResult = ProcessSinglePage(leftMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: leftMat.Cols, binarizeEnabled, meta.Dpi, measuredDpi: measuredDpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
+                var outLeft = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_1_left", leftResult, meta, result.WasBinarized, captureFormat);
                 result.OutputFilePaths.Add(outLeft);
                 leftResult.Dispose();
 
                 // Process right — its own spine edge is this half's left edge (x = 0).
                 using var rightMat = WarpQuad(src, rightCorners);
-                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
-                var outRight = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right.tif");
-                WriteTiff(outRight, rightResult, meta, result.WasBinarized);
+                var rightResult = ProcessSinglePage(rightMat, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint: 0, binarizeEnabled, meta.Dpi, measuredDpi: measuredDpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
+                var outRight = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath) + "_2_right", rightResult, meta, result.WasBinarized, captureFormat);
                 result.OutputFilePaths.Add(outRight);
                 rightResult.Dispose();
 
@@ -577,12 +612,10 @@ public partial class ImageProcessor
                 if (manualOverride && !string.IsNullOrEmpty(leftCrop))
                     manualCrop = WarpQuad(src, ParseCropCorners(leftCrop, src.Width, src.Height));
 
-                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
+                var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, measuredDpi: measuredDpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
                 manualCrop?.Dispose();
 
-                var outName = Path.GetFileNameWithoutExtension(inputPath) + "_processed.tif";
-                var outPath = Path.Combine(outputDirectory, outName);
-                WriteTiff(outPath, processed, meta, result.WasBinarized);
+                var outPath = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath), processed, meta, result.WasBinarized, captureFormat, singlePageInputPath: inputPath);
                 result.OutputFilePaths.Add(outPath);
                 result.Success = true;
                 processed.Dispose();
@@ -644,7 +677,7 @@ public partial class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, bool passthroughFixedFrames = true)
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, bool passthroughFixedFrames = true, double measuredDpi = BaselineDpi, string captureFormat = "TIFF")
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -686,8 +719,7 @@ public partial class ImageProcessor
                     (int)Math.Round(frames[i].X), (int)Math.Round(frames[i].Y),
                     (int)Math.Round(frames[i].Width), (int)Math.Round(frames[i].Height)), src.Cols, src.Rows);
 
-                var outName = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}.tif";
-                var outPath = Path.Combine(outputDirectory, outName);
+                var frameFileNameNoExt = $"{Path.GetFileNameWithoutExtension(inputPath)}_frame{(i + 1).ToString("D" + padWidth, CultureInfo.InvariantCulture)}";
 
                 if (passthroughFixedFrames)
                 {
@@ -696,12 +728,13 @@ public partial class ImageProcessor
                     // rectangle," not run boundary detection/crop/dewarp/enhancement on top of
                     // it. No Method 4, no FinishPageProcessing tail (finger removal,
                     // bleedthrough, CLAHE, sharpen, binarize) — just crop to the calibrated rect
-                    // and resample to the target DPI so the TIFF's pixel dimensions match its
-                    // resolution tag (see ResizeForDpi/WriteTiff's own doc comments).
+                    // and resample to the target DPI so the output's pixel dimensions match its
+                    // resolution tag (see ResizeForDpi/WriteTiff's own doc comments). Never
+                    // binarized on this path, so captureFormat's TIFF/JPG choice always applies.
                     using var cropped = new Mat(src, rect).Clone();
-                    using var resized = ResizeForDpi(cropped, meta.Dpi);
-                    WriteTiff(outPath, resized, meta, binarized: false);
-                    result.OutputFilePaths.Add(outPath);
+                    using var resized = ResizeForDpi(cropped, meta.Dpi, measuredDpi);
+                    var framePath = WritePageOutput(outputDirectory, frameFileNameNoExt, resized, meta, binarized: false, captureFormat);
+                    result.OutputFilePaths.Add(framePath);
                     continue;
                 }
 
@@ -740,12 +773,13 @@ public partial class ImageProcessor
                     sub.Dispose();
                     flat = new Mat(src, rect).Clone();
                 }
+                string detectedFramePath;
                 using (flat)
-                using (var finished = FinishPageProcessing(flat, frameResult, binarizeEnabled, meta.Dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance))
+                using (var finished = FinishPageProcessing(flat, frameResult, binarizeEnabled, meta.Dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance))
                 {
-                    WriteTiff(outPath, finished, meta, frameResult.WasBinarized);
+                    detectedFramePath = WritePageOutput(outputDirectory, frameFileNameNoExt, finished, meta, frameResult.WasBinarized, captureFormat);
                 }
-                result.OutputFilePaths.Add(outPath);
+                result.OutputFilePaths.Add(detectedFramePath);
 
                 result.Warnings.AddRange(frameResult.Warnings.Select(w => $"Frame {i + 1}: {w}"));
                 result.QcVerdict = CombineVerdict(result.QcVerdict, frameResult.QcVerdict);
@@ -763,6 +797,28 @@ public partial class ImageProcessor
         }
 
         return result;
+    }
+
+    /// <summary>Single-page (non-split, non-fixed-frame) output filename — now the bare capture
+    /// basename (e.g. "{basename}.tif") instead of the old "{basename}_processed.tif", now that
+    /// the derivative is written into the same folder as the (retained-until-export) original
+    /// rather than a separate "Processed" subfolder: the suffix existed to disambiguate the two
+    /// files sharing one folder, but the extension alone already does that in the common case
+    /// (a camera-native .jpg/.cr2/.cr3 original vs. a .tif or .jpg processed output).
+    ///
+    /// Falls back to the old "_processed" suffix ONLY when the bare name would exactly collide
+    /// with <paramref name="inputPath"/> itself — same basename AND same extension, e.g. a
+    /// JPG-format capture with JPG-format processed output both landing on "{basename}.jpg" —
+    /// since the original is deliberately left on disk until batch export and must never be
+    /// silently overwritten by its own derivative. Split-page (_1_left/_2_right) and fixed-frame
+    /// (_frameNN) naming is unaffected by this — those inherently produce multiple files per
+    /// original and can't collapse to a bare basename regardless.</summary>
+    private static string SinglePageOutputFileName(string inputPath, string targetExtension)
+    {
+        var baseName = Path.GetFileNameWithoutExtension(inputPath);
+        var bareName = baseName + targetExtension;
+        var wouldCollide = string.Equals(bareName, Path.GetFileName(inputPath), StringComparison.OrdinalIgnoreCase);
+        return wouldCollide ? baseName + "_processed" + targetExtension : bareName;
     }
 
     /// <summary>Writes a processed page as TIFF, tagging it with the batch's chosen DPI and
@@ -848,6 +904,83 @@ public partial class ImageProcessor
             }
             tiff.WriteScanline(rowBuf, y);
         }
+    }
+
+    /// <summary>Writes a processed page as JPEG — the per-capture-sticky alternative to
+    /// <see cref="WriteTiff"/> (see <see cref="WritePageOutput"/>, which decides between the
+    /// two). Quality 95 matches the existing SkiaSharp emergency-fallback path elsewhere in this
+    /// class (the OpenCV-unavailable degrade path), kept consistent rather than picking a new
+    /// number. Uses <see cref="Cv2.ImEncode"/> directly (the same OpenCV encode-to-bytes-then-
+    /// write-file pattern this class's PNG debug dumps already use) since <paramref name="mat"/>
+    /// is already an OpenCV Mat here — no need to bridge through SkiaSharp the way the raw-bytes
+    /// emergency fallback does. JPEG has no equivalent of TIFF's Author/DateTime tags in the
+    /// simple form <see cref="WriteTiff"/> sets them, so those are necessarily lost for JPG
+    /// output — an accepted tradeoff of choosing JPG over TIFF, not an oversight. DPI is NOT
+    /// similarly dropped, though: see <see cref="StampJfifDensity"/>, called below, which patches
+    /// the standard JFIF density field OpenCV's encoder otherwise leaves unset.</summary>
+    private static void WriteJpeg(string path, Mat mat, TiffMetadata metadata)
+    {
+        var jpegParams = new int[] { (int)ImwriteFlags.JpegQuality, 95 };
+        if (!Cv2.ImEncode(".jpg", mat, out var bytes, jpegParams))
+            throw new IOException($"Could not encode JPEG: {path}");
+        StampJfifDensity(bytes, metadata.Dpi);
+        File.WriteAllBytes(path, bytes);
+    }
+
+    /// <summary>OpenCV's JPEG encoder has no DPI/density parameter (unlike its TIFF encoder,
+    /// see WriteTiff's XRESOLUTION/YRESOLUTION tags) — without this, every JPG-format capture
+    /// would silently lose its DPI, and any tool reading physical page size from the file would
+    /// default to 72/96 DPI, reintroducing the exact wrong-physical-size problem the DPI
+    /// calibration feature exists to fix. libjpeg (which both OpenCV and SkiaSharp use here)
+    /// always writes a standard JFIF APP0 segment as the first thing after the SOI marker for a
+    /// baseline JPEG, at a fixed offset, so patching its units/density fields in place — rather
+    /// than re-encoding — is safe as long as the expected marker bytes are verified first.
+    /// Layout: FFD8 (SOI) FFE0 (APP0) LenHi LenLo "JFIF\0" VerMajor VerMinor Units(1) XDensity(2,
+    /// big-endian) YDensity(2, big-endian) ... units=1 means "dots per inch".</summary>
+    private static void StampJfifDensity(byte[] jpegBytes, int dpi)
+    {
+        const int unitsOffset = 13; // FFD8 FFE0 LenHi LenLo 'J''F''I''F'\0 VerMajor VerMinor
+        if (jpegBytes.Length < unitsOffset + 5) return;
+        if (jpegBytes[0] != 0xFF || jpegBytes[1] != 0xD8 || jpegBytes[2] != 0xFF || jpegBytes[3] != 0xE0) return;
+        if (jpegBytes[6] != (byte)'J' || jpegBytes[7] != (byte)'F' || jpegBytes[8] != (byte)'I' ||
+            jpegBytes[9] != (byte)'F' || jpegBytes[10] != 0x00) return;
+
+        var clampedDpi = (ushort)Math.Clamp(dpi, 1, ushort.MaxValue);
+        jpegBytes[unitsOffset] = 1; // units = dots per inch
+        jpegBytes[unitsOffset + 1] = (byte)(clampedDpi >> 8);
+        jpegBytes[unitsOffset + 2] = (byte)(clampedDpi & 0xFF);
+        jpegBytes[unitsOffset + 3] = (byte)(clampedDpi >> 8);
+        jpegBytes[unitsOffset + 4] = (byte)(clampedDpi & 0xFF);
+    }
+
+    /// <summary>Decides between <see cref="WriteTiff"/> and <see cref="WriteJpeg"/> for one
+    /// processed page and returns the exact path written (including the extension that decision
+    /// implies), so every caller in <see cref="Process"/>/<see cref="ProcessFixedFrames"/> gets
+    /// the right output format without duplicating this rule at each call site. Binarized (pure
+    /// black-and-white) output is always written as TIFF regardless of <paramref name="captureFormat"/>
+    /// — a 1-bit CCITT-G4 bitonal image has no meaningful JPEG equivalent (JPEG is a lossy
+    /// photographic codec; forcing bilevel content through it would reintroduce exactly the
+    /// compression artifacts binarizing was meant to eliminate, and lose the genuine file-size
+    /// win of true 1-bit packing).
+    ///
+    /// <paramref name="singlePageInputPath"/>, when non-null, applies the single-page collision-
+    /// avoidance naming rule (<see cref="SinglePageOutputFileName"/>) against the resolved
+    /// extension instead of using <paramref name="fileNameNoExt"/> verbatim — pass null for
+    /// split-page (_1_left/_2_right) and fixed-frame (_frameNN) outputs, whose suffixed names
+    /// already can't collide with the original regardless of extension.</summary>
+    private static string WritePageOutput(string outputDirectory, string fileNameNoExt, Mat mat, TiffMetadata metadata, bool binarized, string captureFormat, string? singlePageInputPath = null)
+    {
+        var useJpeg = !binarized && string.Equals(captureFormat, "JPG", StringComparison.OrdinalIgnoreCase);
+        var extension = useJpeg ? ".jpg" : ".tif";
+        var finalFileName = singlePageInputPath != null
+            ? SinglePageOutputFileName(singlePageInputPath, extension)
+            : fileNameNoExt + extension;
+        var path = Path.Combine(outputDirectory, finalFileName);
+        if (useJpeg)
+            WriteJpeg(path, mat, metadata);
+        else
+            WriteTiff(path, mat, metadata, binarized);
+        return path;
     }
 
     /// <summary>Writes <paramref name="mat"/> (expected 8-bit single-channel, values only 0 or
@@ -965,6 +1098,18 @@ public partial class ImageProcessor
         var intrinsics = string.Join(",", new[] { calibration.Fx, calibration.Fy, calibration.Cx, calibration.Cy }.Select(v => v.ToString("G17", CultureInfo.InvariantCulture)));
         var distCoeffs = string.Join(",", calibration.DistCoeffs.Select(v => v.ToString("G17", CultureInfo.InvariantCulture)));
         return $"{intrinsics};{distCoeffs};{calibration.CalibratedWidth},{calibration.CalibratedHeight}";
+    }
+
+    /// <summary>Reads just a captured frame's pixel dimensions — used by the lens-calibration
+    /// UI's DPI-measurement step (MicroCapture.UI.ViewModels.LensCalibrationViewModel) so it can
+    /// measure a calibration target's pixel span without the UI project needing its own
+    /// OpenCvSharp dependency, mirroring how every other OpenCV-touching operation this project
+    /// exposes to the UI goes through a static ImageProcessor/LensCalibrationService entry point
+    /// instead. Returns (0, 0) if the file can't be decoded.</summary>
+    public static (int Width, int Height) GetImagePixelDimensions(string path)
+    {
+        using var mat = Cv2.ImRead(path, ImreadModes.Grayscale);
+        return mat.Empty() ? (0, 0) : (mat.Cols, mat.Rows);
     }
 
     /// <summary>Undistorts a raw frame using a one-time lens calibration (see
@@ -1115,7 +1260,7 @@ public partial class ImageProcessor
     /// (non-manual-override) capture path no longer calls this — see
     /// <see cref="ProcessAutoDetected"/>, which runs the Method 4 single-pass flatten instead of
     /// TryAutoCrop/TryDeskew/TryApplyDewarp/TryApplyLineMesh.</summary>
-    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, Rect? searchRegion = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
+    private Mat ProcessSinglePage(Mat input, ProcessingResult result, bool skipAutoCrop, bool dewarpEnabled = false, DewarpModel? savedDewarp = null, bool dewarpManualOverride = false, double? spineXHint = null, bool binarizeEnabled = false, int dpi = 300, double measuredDpi = BaselineDpi, Rect? searchRegion = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0)
     {
         var working = input.Clone();
 
@@ -1134,7 +1279,7 @@ public partial class ImageProcessor
         // curvature at all. See TryApplyLineMesh's own doc comment.
         working = TryApplyLineMesh(working, result) ?? working;
 
-        return FinishPageProcessing(working, result, binarizeEnabled, dpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+        return FinishPageProcessing(working, result, binarizeEnabled, dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
     }
 
     /// <summary>Shared tail of every page-processing path (Method 4 auto-detect AND the manual-
@@ -1145,7 +1290,7 @@ public partial class ImageProcessor
     /// <paramref name="working"/> (disposes intermediate Mats as it reassigns the local, exactly
     /// as the old inline tail in <see cref="ProcessSinglePage"/> did) and returns the final Mat
     /// for the caller to write out.</summary>
-    private Mat FinishPageProcessing(Mat working, ProcessingResult result, bool binarizeEnabled, int dpi, bool bleedthroughEnabled, bool hasManualAdjustments, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
+    private Mat FinishPageProcessing(Mat working, ProcessingResult result, bool binarizeEnabled, int dpi, double measuredDpi, bool bleedthroughEnabled, bool hasManualAdjustments, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
     {
         working = TryRemoveFingers(working, result) ?? working;
         // Before enhancement/sharpen so a sharpen pass doesn't crisp up leftover ghosting, and
@@ -1174,8 +1319,8 @@ public partial class ImageProcessor
         // not the pre-resize one. Everything before this point (crop/deskew/dewarp/mesh/QC)
         // deliberately runs at native capture resolution, where all of this class's other
         // pixel-footprint tunables (Sharpen's sigma, CLAHE tile size, etc.) were tuned.
-        working = ResizeForDpi(working, dpi);
-        working = TryApplyBinarization(working, result, binarizeEnabled, dpi);
+        working = ResizeForDpi(working, dpi, measuredDpi);
+        working = TryApplyBinarization(working, result, binarizeEnabled, dpi, measuredDpi);
 
         return working;
     }
@@ -4184,21 +4329,31 @@ public partial class ImageProcessor
 
     // ───────────── DPI RESAMPLE ─────────────
 
-    /// <summary>Resamples pixel dimensions so a higher DPI selection actually produces a larger
-    /// output file, not just a different resolution tag. The camera has no true native optical
-    /// DPI to resample from/to — see <see cref="BaselineDpi"/>'s own doc comment — so this
-    /// scales relative to that chosen reference point instead: <paramref name="dpi"/> at or
-    /// below <see cref="BaselineDpi"/> leaves pixels untouched (this setting never discards real
-    /// captured detail by downsampling), anything above it upsamples proportionally
-    /// (dpi/BaselineDpi in each dimension). Runs after every geometric/enhancement step, right
-    /// before binarization, so all of this class's other pixel-footprint-tuned steps
-    /// (Sharpen's sigma, CLAHE tile size, edge-detection bands, etc.) keep operating at the
-    /// resolution they were actually tuned against.</summary>
-    private static Mat ResizeForDpi(Mat src, int dpi)
-    {
-        if (dpi <= BaselineDpi) return src;
+    /// <summary>Resamples pixel dimensions so the output actually measures <paramref name="targetDpi"/>
+    /// against the rig's real, physically-measured resolution (<paramref name="measuredDpi"/> —
+    /// see <see cref="MeasuredDpi"/>), instead of the old behavior of scaling against the
+    /// arbitrary <see cref="BaselineDpi"/> label. scale = targetDpi / measuredDpi, applied with
+    /// NO floor — deliberately allowed (and expected) to downsample when the target DPI is below
+    /// the rig's measured resolution, matching traditional scanner-style behavior, per confirmed
+    /// product decision. (The old "never downsample" guard was built around BaselineDpi being a
+    /// safe stand-in floor for "native resolution," which stops being true once DPI is a real
+    /// physical measurement — downsampling below a genuinely-measured native resolution is a
+    /// legitimate, requested capability, not lost detail by accident.) Runs after every
+    /// geometric/enhancement step, right before binarization, so all of this class's other
+    /// pixel-footprint-tuned steps (Sharpen's sigma, CLAHE tile size, edge-detection bands, etc.)
+    /// keep operating at the resolution they were actually tuned against.</summary>
+    // Hard backstop independent of MeasuredDpi's own sanity check (see MinPlausibleDpi/
+    // MaxPlausibleDpi above) — even a targetDpi/measuredDpi ratio that slips through for some
+    // other reason should never be allowed to demand a >8x linear resample in either direction.
+    // Cubic-interpolating an already multi-megapixel Mat at, say, 80x per axis (a real value seen
+    // from a single fat-fingered calibration entry) can exhaust memory or hang the background
+    // worker; no legitimate AvailableDpiOptions-vs-real-rig-resolution combination needs more
+    // than this.
+    private const double MaxResampleScale = 8.0;
 
-        var scale = dpi / (double)BaselineDpi;
+    private static Mat ResizeForDpi(Mat src, int targetDpi, double measuredDpi)
+    {
+        var scale = Math.Clamp(targetDpi / measuredDpi, 1.0 / MaxResampleScale, MaxResampleScale);
         var newWidth = Math.Max(1, (int)Math.Round(src.Cols * scale));
         var newHeight = Math.Max(1, (int)Math.Round(src.Rows * scale));
 
@@ -4215,12 +4370,12 @@ public partial class ImageProcessor
     /// <see cref="TryApplyDewarp"/>. Runs last in the pipeline (after QC, see
     /// <see cref="ProcessSinglePage"/>) since blur/exposure scores are meaningless once
     /// thresholded to pure black-and-white.</summary>
-    private Mat TryApplyBinarization(Mat src, ProcessingResult result, bool binarizeEnabled, int dpi)
+    private Mat TryApplyBinarization(Mat src, ProcessingResult result, bool binarizeEnabled, int dpi, double measuredDpi)
     {
         if (!binarizeEnabled) return src;
         try
         {
-            var binarized = ApplySauvolaBinarization(src, dpi);
+            var binarized = ApplySauvolaBinarization(src, dpi, measuredDpi);
             result.WasBinarized = true;
             result.Warnings.Add("Binarized to black-and-white (Sauvola local threshold).");
             return binarized;
@@ -4255,7 +4410,7 @@ public partial class ImageProcessor
     ///    flat bright one.
     /// 3. A final connected-component despeckle pass removes isolated foreground specks too
     ///    small to be real strokes.</summary>
-    private static Mat ApplySauvolaBinarization(Mat src, int dpi)
+    private static Mat ApplySauvolaBinarization(Mat src, int dpi, double measuredDpi)
     {
         using var gray = new Mat();
         if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
@@ -4324,7 +4479,7 @@ public partial class ImageProcessor
 
         using var beforeDespeckle = new Mat(rows, cols, MatType.CV_8UC1);
         beforeDespeckle.SetArray(output);
-        return DespeckleBinary(beforeDespeckle, dpi);
+        return DespeckleBinary(beforeDespeckle, dpi, measuredDpi);
     }
 
     /// <summary>Removes isolated foreground specks from a bilevel (0/255) image via connected-
@@ -4333,10 +4488,12 @@ public partial class ImageProcessor
     /// noise pixels, since it filters by connected blob size rather than a fixed spatial
     /// footprint. The area floor scales with DPI (~4px² at 300 DPI) since "how many pixels make
     /// up a real stroke fragment" is a resolution-relative question, not an absolute one.
-    /// Scaled against BaselineDpi (the DPI that leaves pixel dimensions unresampled — see
-    /// ResizeForDpi) rather than a hardcoded 300, so the floor tracks the actual pixel density
-    /// of the bilevel image being despeckled, not just the nominal tag value.</summary>
-    private static Mat DespeckleBinary(Mat bilevel, int dpi)
+    /// Scaled against <paramref name="measuredDpi"/> (the rig's real physically-measured
+    /// resolution — see <see cref="MeasuredDpi"/>) rather than a hardcoded 300 or the old
+    /// BaselineDpi stand-in, since <paramref name="dpi"/>/<paramref name="measuredDpi"/> is
+    /// exactly the resample factor ResizeForDpi already applied to reach this point — that ratio,
+    /// not the raw tag value, is what tracks the bilevel image's actual pixel density.</summary>
+    private static Mat DespeckleBinary(Mat bilevel, int dpi, double measuredDpi)
     {
         using var inverted = new Mat();
         Cv2.BitwiseNot(bilevel, inverted); // Our convention: ink=0/white=255 — ConnectedComponents treats non-zero as foreground.
@@ -4346,7 +4503,7 @@ public partial class ImageProcessor
         using var centroids = new Mat();
         var labelCount = Cv2.ConnectedComponentsWithStats(inverted, labels, stats, centroids, PixelConnectivity.Connectivity8);
 
-        var scale = dpi / (double)BaselineDpi;
+        var scale = dpi / measuredDpi;
         var minBlobPixels = Math.Max(2, (int)Math.Round(4.0 * scale * scale));
 
         var keep = new bool[labelCount];

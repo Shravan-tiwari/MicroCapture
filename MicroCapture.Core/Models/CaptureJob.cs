@@ -42,5 +42,24 @@ public class CaptureJob
     public double Sharpness { get; set; } = 0.0; // 0.0..+1.0, unsharp-mask strength
     public double WhiteBalance { get; set; } = 0.0; // -1.0 (cool/blue) .. +1.0 (warm/amber)
 
+    // Exact on-disk path(s) of this job's processed derivative(s), written by
+    // BackgroundProcessingWorker after a successful Process/ProcessFixedFrames run — lets
+    // downstream readers (BatchExportService.GetProcessedFilesForJob, export/cleanup code) find
+    // the real output file(s) directly instead of globbing a folder by filename prefix. Multiple
+    // outputs (split left/right pages, or one per fixed frame) are joined by ';', the same
+    // convention Batch.FixedFrames/CaptureJob.DewarpCurve already use for multi-value string
+    // fields. Null for older rows written before this field existed, and for any job still
+    // Pending/InProgress/Failed — callers must fall back to a folder glob (or OriginalFilePath)
+    // in that case; see GetProcessedFilesForJob's own three-tier fallback.
+    public string? ProcessedFilePath { get; set; }
+
+    // Sticky per-capture output file format, read directly at capture-enqueue time (see
+    // MainWindowViewModel.SelectedCaptureFormat) rather than stored on Batch — the operator can
+    // change it capture-to-capture within the same batch, unlike DPI/dewarp/binarize which are
+    // fixed per batch. "TIFF" default matches all historical behavior (every capture before this
+    // field existed was effectively TIFF). Binarized output is always written as TIFF regardless
+    // of this value — see ImageProcessor's WriteTiff/WriteJpeg selection logic.
+    public string CaptureFormat { get; set; } = "TIFF";
+
     public Batch? Batch { get; set; }
 }

@@ -74,10 +74,12 @@ public class BackgroundProcessingWorker
                     // Mark as InProgress
                     await queueService.UpdateJobStatusAsync(job.Id, "processing", "InProgress");
 
-                    // Determine output directory
-                    var outputDir = Path.Combine(
-                        Path.GetDirectoryName(job.OriginalFilePath) ?? ".",
-                        "Processed");
+                    // Processed derivatives now live in the same folder as the original capture
+                    // (not a separate "Processed" subfolder) — originals are retained on disk
+                    // until batch export, so there's no reason to segregate the derivative
+                    // anymore, and Crop Review's re-crop-from-original still works unchanged
+                    // since the original stays right where the derivative is written.
+                    var outputDir = ProcessedFilePaths.OutputDirectoryFor(job.OriginalFilePath);
 
                     bool splitPages = job.Batch?.SplitBookPages ?? false;
                     bool useFixedFrames = job.Batch?.UseFixedFrames == true && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames);
@@ -93,15 +95,43 @@ public class BackgroundProcessingWorker
                     LensCalibration? lensCalibration = calibrationEntity != null
                         ? ImageProcessor.ParseLensCalibration($"{calibrationEntity.CameraMatrix};{calibrationEntity.DistCoeffs};{calibrationEntity.ImageWidth},{calibrationEntity.ImageHeight}")
                         : null;
+                    // The rig's real physically-measured DPI (see ImageProcessor.MeasuredDpi).
+                    // If calibration exists and gives a real measurement, use it.
+                    // Otherwise, use the operator's selected DPI as the baseline — this ensures
+                    // no upsampling happens when there's no real measurement, only the tag.
+                    double measuredDpi;
+                    if (calibrationEntity?.TargetWidthInches > 0 && calibrationEntity?.TargetHeightInches > 0
+                        && calibrationEntity?.MeasuredPixelWidth.HasValue == true && calibrationEntity?.MeasuredPixelHeight.HasValue == true)
+                    {
+                        measuredDpi = ImageProcessor.MeasuredDpi(calibrationEntity);
+                    }
+                    else
+                    {
+                        measuredDpi = job.Batch?.Dpi ?? 150;
+                    }
                     bool bleedthroughEnabled = job.Batch?.BleedthroughEnabled ?? false;
                     var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance);
+                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat)
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat);
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {
                         await queueService.UpdateJobStatusAsync(job.Id, "processing", "Completed");
                         await queueService.UpdateJobStatusAsync(job.Id, "qc", result.QcVerdict);
+                        // Exact reference to the new main-folder output(s), so downstream
+                        // readers (BatchExportService.GetProcessedFilesForJob) don't need to
+                        // glob a "Processed" subfolder that no longer exists.
+                        await queueService.SetProcessedFilePathAsync(job.Id, string.Join(";", result.OutputFilePaths));
+                        // Delete the original capture file after successful processing
+                        try
+                        {
+                            if (File.Exists(job.OriginalFilePath))
+                                File.Delete(job.OriginalFilePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"Could not delete original '{job.OriginalFilePath}' after processing: {ex.Message}");
+                        }
                         // OCR no longer runs automatically here — it's expensive (a subprocess
                         // per file, up to ~30s each) and often wasted work on pages that get
                         // recaptured or deleted before the batch is finalized. It now runs
