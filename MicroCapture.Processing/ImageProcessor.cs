@@ -682,7 +682,13 @@ public partial class ImageProcessor
     /// detection. This is what lets a calibration/copy-stand rig — whose rectangle can only
     /// ever be axis-aligned — still get real trapezoid/curve correction per capture, instead of
     /// baking in whatever keystone or page bow happens to be present that day.</summary>
-    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, bool passthroughFixedFrames = true, double measuredDpi = BaselineDpi, string captureFormat = "TIFF")
+    /// <param name="frameReferenceWidth">Width of the image <paramref name="fixedFramesSpec"/>'s
+    /// coordinates were authored against (<c>Batch.FixedFrameImageWidth</c>) — the live-view feed
+    /// for frames drawn directly on the live view, or a full-res calibration shot for batches
+    /// calibrated before live-view editing existed. 0 means "unknown", which falls back to
+    /// treating frame coordinates as direct capture pixels (the historical behavior).</param>
+    /// <param name="frameReferenceHeight">Height counterpart of <paramref name="frameReferenceWidth"/>.</param>
+    public ProcessingResult ProcessFixedFrames(string inputPath, string outputDirectory, string fixedFramesSpec, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, bool passthroughFixedFrames = true, int frameReferenceWidth = 0, int frameReferenceHeight = 0, double measuredDpi = BaselineDpi, string captureFormat = "TIFF")
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -715,6 +721,35 @@ public partial class ImageProcessor
                 result.Success = false;
                 result.Errors.Add("Batch has no calibrated fixed frames.");
                 return result;
+            }
+
+            // Frames are stored in the pixel space of whatever image they were authored against
+            // (Batch.FixedFrameImageWidth/Height), which is NOT necessarily this capture's own
+            // resolution — frames drawn on the live view are authored at live-feed size (~960px)
+            // while the capture is full-res (~6000px), and even a calibration-shot batch can
+            // differ if the batch shoots a different JPEG size than the calibration shot forced.
+            // Project them onto THIS capture's real resolution before cropping.
+            //
+            // Scaling the array once, here, means both the passthrough crop below and the
+            // Method 4 padded-search branch inherit correct geometry: FixedFrameSearchPadFraction
+            // is a fraction OF THE FRAME, so the padding stays proportional automatically. This
+            // is why the scale belongs at the array and not at ClampRectToBounds, which then
+            // becomes a genuine rounding-slop safety net rather than the load-bearing step.
+            //
+            // src (not rawSrc) is the denominator: SafeUndistort is a remap that preserves
+            // dimensions, so either way this is the resolution the crop rects land in. A zero
+            // reference (batches saved before reference dims were recorded) degrades to the
+            // historical behavior of treating frame coordinates as direct capture pixels.
+            var frameScaleX = frameReferenceWidth > 0 ? (double)src.Cols / frameReferenceWidth : 1.0;
+            var frameScaleY = frameReferenceHeight > 0 ? (double)src.Rows / frameReferenceHeight : 1.0;
+            if (frameScaleX != 1.0 || frameScaleY != 1.0)
+            {
+                for (var i = 0; i < frames.Length; i++)
+                {
+                    frames[i] = new FixedFrameRect(
+                        frames[i].X * frameScaleX, frames[i].Y * frameScaleY,
+                        frames[i].Width * frameScaleX, frames[i].Height * frameScaleY);
+                }
             }
 
             var padWidth = Math.Max(2, frames.Length.ToString(CultureInfo.InvariantCulture).Length);

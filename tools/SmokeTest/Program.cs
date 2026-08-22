@@ -64,6 +64,8 @@ TestMediumConfidenceCropIsStillApplied();
 TestFixedFramesRoundTrip();
 TestProcessFixedFramesProducesNOutputs();
 TestFixedFramesFallsBackToCalibratedRectOnFeaturelessImage();
+TestFixedFramesScaleFromReferenceResolution();
+TestFixedFramesZeroReferenceIsBackCompatible();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
 TestDewarpControlPointsStayWithinPageBounds();
@@ -1268,9 +1270,11 @@ async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
     var originalPath = WriteSolidImage(Path.Combine(workDir, "capture.png"), calibW, calibH);
     var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, 1);
 
-    // Mirrors BackgroundProcessingWorker.ProcessLoop's branch for a batch with UseFixedFrames set.
+    // Mirrors BackgroundProcessingWorker.ProcessLoop's branch for a batch with UseFixedFrames set,
+    // including the reference dims it passes so frames get projected onto the capture's own size.
     var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
-    var processResult = new ImageProcessor().ProcessFixedFrames(job.OriginalFilePath, outputDir, batch.FixedFrames!);
+    var processResult = new ImageProcessor().ProcessFixedFrames(job.OriginalFilePath, outputDir, batch.FixedFrames!,
+        frameReferenceWidth: batch.FixedFrameImageWidth, frameReferenceHeight: batch.FixedFrameImageHeight);
     Check("Worker-equivalent fixed-frame processing succeeds", processResult.Success);
     Check("Worker-equivalent processing writes exactly one file per frame", processResult.OutputFilePaths.Count == frames.Length);
     await queue.UpdateJobStatusAsync(job.Id, "processing", processResult.Success ? "Completed" : "Failed");
@@ -1283,6 +1287,81 @@ async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
 
     Check("Export produces one page per calibrated frame for the one capture — no BatchExportService changes needed",
         exportedFiles.Length == frames.Length);
+}
+
+void TestFixedFramesScaleFromReferenceResolution()
+{
+    Console.WriteLine("\n-- Fixed frames authored at live-view size crop correctly from a full-res capture --");
+    var workDir = TempWorkDir();
+
+    // Frames drawn on a 960x640 live view, but the real capture is 6x/4.5x larger. Before
+    // reference dims were honored, these rects were applied as raw capture pixels and every
+    // crop came out as a postage stamp in the top-left corner.
+    const int liveW = 960, liveH = 640;
+    const int captureW = 5760, captureH = 2880;
+    var frames = new[]
+    {
+        new FixedFrameRect(100, 80, 300, 400),
+        new FixedFrameRect(500, 80, 300, 400)
+    };
+    var spec = ImageProcessor.FormatFixedFrames(frames);
+
+    var capturePath = WriteSolidImage(Path.Combine(workDir, "capture.png"), captureW, captureH);
+    var outputDir = Path.Combine(workDir, "Processed");
+    // Target DPI == measuredDpi so ResizeForDpi is a no-op — this test is about crop geometry,
+    // and DPI resampling would otherwise rewrite the output dimensions on top of it.
+    var neutralDpi = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
+    var result = new ImageProcessor().ProcessFixedFrames(capturePath, outputDir, spec, neutralDpi,
+        frameReferenceWidth: liveW, frameReferenceHeight: liveH);
+
+    Check("Live-view-authored fixed frames process successfully against a full-res capture", result.Success);
+    Check("One output file per frame", result.OutputFilePaths.Count == frames.Length);
+
+    if (result.Success && result.OutputFilePaths.Count == frames.Length)
+    {
+        var sx = (double)captureW / liveW;
+        var sy = (double)captureH / liveH;
+        var allScaled = true;
+        for (var i = 0; i < frames.Length; i++)
+        {
+            using var output = Cv2.ImRead(result.OutputFilePaths[i], ImreadModes.Unchanged);
+            var expectedW = frames[i].Width * sx;
+            var expectedH = frames[i].Height * sy;
+            // Tolerance covers rounding in ClampRectToBounds plus DPI resampling rounding.
+            if (Math.Abs(output.Width - expectedW) > 2 || Math.Abs(output.Height - expectedH) > 2)
+            {
+                allScaled = false;
+                Console.WriteLine($"   frame {i + 1}: got {output.Width}x{output.Height}, expected ~{expectedW:F0}x{expectedH:F0}");
+            }
+        }
+        Check("Each crop is scaled from live-view space onto the capture's real resolution", allScaled);
+    }
+}
+
+void TestFixedFramesZeroReferenceIsBackCompatible()
+{
+    Console.WriteLine("\n-- Fixed frames with no reference dims keep the historical direct-pixel behavior --");
+    var workDir = TempWorkDir();
+
+    // Batches calibrated before reference dims were recorded pass 0, which must reproduce the
+    // pre-change behavior exactly: frame coordinates treated as direct capture pixels.
+    const int captureW = 800, captureH = 600;
+    var frames = new[] { new FixedFrameRect(50, 40, 300, 200) };
+    var spec = ImageProcessor.FormatFixedFrames(frames);
+
+    var capturePath = WriteSolidImage(Path.Combine(workDir, "capture.png"), captureW, captureH);
+    var outputDir = Path.Combine(workDir, "Processed");
+    var neutralDpi = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
+    var result = new ImageProcessor().ProcessFixedFrames(capturePath, outputDir, spec, neutralDpi,
+        frameReferenceWidth: 0, frameReferenceHeight: 0);
+
+    Check("Zero-reference fixed-frame processing succeeds", result.Success);
+    if (result.Success && result.OutputFilePaths.Count > 0)
+    {
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check("Zero reference dims crop at the frame's literal pixel size (unscaled)",
+            Math.Abs(output.Width - 300) <= 2 && Math.Abs(output.Height - 200) <= 2);
+    }
 }
 
 void TestTiffDisplayDecodeRoundTrip()
