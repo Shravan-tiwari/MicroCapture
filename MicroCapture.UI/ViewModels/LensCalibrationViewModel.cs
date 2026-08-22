@@ -16,10 +16,10 @@ namespace MicroCapture.UI.ViewModels;
 
 /// <summary>Drives the one-time camera lens intrinsics/distortion calibration flow: repeatedly
 /// capture a physical ChArUco board at varied tilts/positions, then compute and save the
-/// calibration via <see cref="LensCalibrationService"/>. Unlike <see cref="FrameCalibrationViewModel"/>
-/// (which edits a single already-captured still image), this owns the repeated-capture loop
-/// itself — there's no single "the calibration image" here, so the natural analogue of that
-/// class's constructor-takes-an-image-path shape doesn't fit; this takes the camera service
+/// calibration via <see cref="LensCalibrationService"/>. Unlike fixed frames (which are drawn
+/// directly on the live view, needing no capture at all), this owns the repeated-capture loop
+/// itself — there's no single "the calibration image" here, so a
+/// constructor-takes-an-image-path shape doesn't fit; this takes the camera service
 /// instead and calls it directly per "Capture" click.</summary>
 public partial class LensCalibrationViewModel : ViewModelBase
 {

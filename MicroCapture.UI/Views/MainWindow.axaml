@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:MicroCapture.UI.ViewModels"
         xmlns:views="using:MicroCapture.UI.Views"
+        xmlns:controls="using:MicroCapture.UI.Controls"
         xmlns:conv="using:MicroCapture.UI.Converters"
         xmlns:acv="using:Avalonia.Data.Converters"
         xmlns:core="using:MicroCapture.Core.Interfaces"
@@ -54,9 +55,6 @@
                             ToolTip.Tip="Reopen a previous batch — including ones already finalized — instead of retyping its Project/Batch Code"/>
                     <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages"
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding UseFixedFrames}" Content="Use Fixed Frames"
-                              ToolTip.Tip="Crop every capture in this batch to operator-calibrated fixed rectangles instead of per-shot auto-detection"
-                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
                     <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book Curve Correction"
                               ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight. Runs in the background queue, so it never affects capture speed."
                               Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
@@ -78,9 +76,6 @@
                               Width="90" ToolTip.Tip="Output file format for each capture (TIFF, JPG, or PNG). Sticky per capture — carries over to the next shot and remembers your last choice across app restarts, not tied to the batch's other settings. Binarized (black-and-white) output is always written as TIFF regardless of this setting."/>
                     <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
                             Margin="6,0,0,0"/>
-                    <Button Classes="secondary" Command="{Binding CalibrateFramesCommand}"
-                            Content="{Binding CalibrateButtonLabel}"
-                            IsVisible="{Binding ShowCalibrateButton}"/>
                     <Button Classes="secondary" Command="{Binding CalibrateLensCommand}"
                             Content="Calibrate Lens"
                             ToolTip.Tip="One-time camera lens distortion calibration against a printed ChArUco board — corrects barrel/pincushion distortion before any other geometric correction runs"
@@ -103,9 +98,8 @@
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
                     <Button Classes="toggle" Classes.active="{Binding IsAutoCapture}"
                             Command="{Binding ToggleAutoCaptureCommand}"
-                            IsVisible="{Binding IsAutoCaptureAvailable}"
                             Content="AUTO" FontWeight="SemiBold"
-                            ToolTip.Tip="Automatically capture once a page is stable, in focus, and different from the last capture"/>
+                            ToolTip.Tip="Automatically capture once the page is stable, in focus, and different from the last capture. In frame mode this watches the contents of your drawn frames rather than looking for a page boundary."/>
                     <TextBlock Text="{Binding CameraModel}" Foreground="{StaticResource InkSubtleBrush}"
                                VerticalAlignment="Center" FontSize="12" />
                 </StackPanel>
@@ -121,9 +115,16 @@
                     IsVisible="{Binding IsShowingLiveView}">
                 <Grid Name="LiveViewContainer">
                     <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
-                    <!-- Overlay: active fixed-frame outlines, drawn read-only while shooting so
-                         the operator can position paper before pressing capture. -->
-                    <Canvas Name="FixedFrameOverlayCanvas" Background="Transparent" IsHitTestVisible="False"/>
+                    <!-- Overlay: interactive fixed frames drawn straight onto the live view.
+                         Drag empty space to create one, drag a frame to move it, its handles to
+                         resize, and the × badge (or DEL) to remove it — no modal, no calibration
+                         shot, editable at any time. -->
+                    <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
+                            Frames="{Binding Frames}"
+                            SourceImageSize="{Binding FrameReferenceSize}"
+                            CaptureImageSize="{Binding CaptureImageSize}"
+                            SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
+                            IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
                     <!-- Overlay: readiness badge -->
                     <Border Background="#cc0f1011" HorizontalAlignment="Left" VerticalAlignment="Top"
                             Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"
@@ -135,14 +136,9 @@
                 </Grid>
             </Border>
 
-            <!-- Inline calibration panels — replace live view during calibration. Both share
-                 the same IsCalibrating gate (blocks Capture/Recapture), but each panel only
-                 shows for its own calibration type, distinguished by which ViewModel is set. -->
-            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
-                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
-                    IsVisible="{Binding CalibrationViewModel, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
-                <views:FrameCalibrationPanel DataContext="{Binding CalibrationViewModel}"/>
-            </Border>
+            <!-- Inline lens calibration panel — replaces the live view while it runs. Fixed
+                 frames no longer have a panel of their own: they are edited directly on the
+                 live view above. -->
             <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
                     BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding LensCalibrationViewModel, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
@@ -178,6 +174,60 @@
                                     <TextBlock Text="{Binding DocumentStatus}" FontSize="13" FontWeight="Medium"
                                                Foreground="{Binding DocumentStatus, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                                 </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Fixed frames. Frame order is page order — it decides which region
+                             becomes _frame01, _frame02, ... — so the list shows the mapping
+                             explicitly and is reordered by hand, never auto-sorted. -->
+                        <TextBlock Text="FRAMES" Classes="sectionLabel" Margin="0,4,0,0"/>
+                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                            <StackPanel Spacing="10">
+                                <TextBlock Text="{Binding FrameSummary}" FontSize="13" TextWrapping="Wrap"
+                                           Foreground="{StaticResource InkMutedBrush}"/>
+
+                                <TextBlock Text="Drag on the live view to draw a frame. Drag inside one to move it, its handles to resize, and × or DEL to remove."
+                                           FontSize="11" TextWrapping="Wrap"
+                                           Foreground="{StaticResource InkTertiaryBrush}"
+                                           IsVisible="{Binding !IsFrameMode}"/>
+
+                                <ItemsControl ItemsSource="{Binding FrameList}" IsVisible="{Binding IsFrameMode}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:FrameListItem">
+                                            <Border CornerRadius="6" Padding="8,5" Margin="0,2"
+                                                    Background="{Binding IsSelected, Converter={x:Static conv:BoolToSelectBrushConverter.Instance}}">
+                                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                                    <Border Width="10" Height="10" CornerRadius="2" VerticalAlignment="Center"
+                                                            Background="{Binding Color}"/>
+                                                    <TextBlock Text="{Binding Label}" FontSize="12" VerticalAlignment="Center"
+                                                               Foreground="{StaticResource InkMutedBrush}"/>
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <TextBlock Text="Frame editing is locked while pages are still processing."
+                                           FontSize="11" TextWrapping="Wrap"
+                                           Foreground="{StaticResource WarningBrush}"
+                                           IsVisible="{Binding !AreFrameEditsAllowed}"/>
+
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button Content="Add" Classes="secondary" Margin="0,0,6,6"
+                                            Command="{Binding AddFrameCommand}"
+                                            ToolTip.Tip="Add a frame at a default size — or just drag on the live view to draw one where you want it"/>
+                                    <Button Content="Remove" Classes="secondary" Margin="0,0,6,6"
+                                            Command="{Binding RemoveSelectedFrameCommand}"/>
+                                    <Button Content="↑" Classes="secondary" Margin="0,0,6,6"
+                                            Command="{Binding MoveFrameUpCommand}"
+                                            ToolTip.Tip="Move the selected frame earlier in page order"/>
+                                    <Button Content="↓" Classes="secondary" Margin="0,0,6,6"
+                                            Command="{Binding MoveFrameDownCommand}"
+                                            ToolTip.Tip="Move the selected frame later in page order"/>
+                                    <Button Content="Clear" Classes="secondary" Margin="0,0,6,6"
+                                            Command="{Binding ClearAllFramesCommand}"
+                                            ToolTip.Tip="Remove every frame and go back to automatic boundary detection"/>
+                                </WrapPanel>
                             </StackPanel>
                         </Border>
 
@@ -251,6 +301,10 @@
                                 <StackPanel Orientation="Horizontal" Spacing="8">
                                     <TextBlock Text="Browse pages" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="← →" Classes="caption"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Remove frame" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="DEL" Classes="caption"/>
                                 </StackPanel>
                             </StackPanel>
                         </Border>

@@ -3,7 +3,7 @@ using Avalonia.Media;
 namespace MicroCapture.UI;
 
 /// <summary>Shared color-by-index palette for fixed-frame rectangles, used both when drawing
-/// frames in <see cref="Views.FrameCalibrationWindow"/> and when coloring each frame's output
+/// frames in <see cref="Controls.FixedFrameOverlayEditor"/> and when coloring each frame's output
 /// thumbnail border in the main capture strip — so a frame's color means the same thing in both
 /// places. Color is derived from index, not persisted anywhere.</summary>
 public static class FixedFrameColorPalette

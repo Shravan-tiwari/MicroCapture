@@ -28,4 +28,23 @@ public static class ImageDecodeHelper
         Cv2.ImEncode(".png", mat, out var pngBytes);
         return pngBytes;
     }
+
+    /// <summary>Exact pixel dimensions of a captured file, for callers that need the rig's true
+    /// capture resolution rather than the image itself — a frame-size readout, or checking that
+    /// the live feed and the capture really do share an aspect ratio. Decodes through OpenCV so
+    /// it works for the TIFFs Skia can't read; callers should treat it as a background-thread
+    /// operation. Returns null if the file can't be read.</summary>
+    public static (int Width, int Height)? GetPixelSize(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            using var mat = Cv2.ImRead(path, ImreadModes.Color);
+            return mat.Empty() ? null : (mat.Cols, mat.Rows);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }

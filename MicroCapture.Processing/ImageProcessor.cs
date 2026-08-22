@@ -33,10 +33,14 @@ public readonly record struct CropPoint(double X, double Y);
 /// project.</summary>
 public readonly record struct LensCalibration(double Fx, double Fy, double Cx, double Cy, double[] DistCoeffs, int CalibratedWidth, int CalibratedHeight);
 
-/// <summary>One operator-calibrated fixed-frame rectangle, in the pixel space of the image it
-/// was calibrated against (see Batch.FixedFrameImageWidth/Height). Unlike <see cref="CropPoint"/>
-/// quads, fixed frames are always axis-aligned — no perspective correction, since they exist
-/// for a stationary, straight-down copy-stand shot.</summary>
+/// <summary>One operator-drawn fixed-frame rectangle, in the pixel space of the image it was
+/// authored against (see Batch.FixedFrameImageWidth/Height) — the live-view feed for frames
+/// drawn directly on the live view, or a full-resolution calibration shot for batches set up
+/// before live-view editing existed. Either way that reference resolution is what
+/// <see cref="ImageProcessor.ProcessFixedFrames"/> projects from when it crops a capture, so the
+/// two need never match. Unlike <see cref="CropPoint"/> quads, fixed frames are always
+/// axis-aligned — no perspective correction, since they exist for a stationary, straight-down
+/// copy-stand shot.</summary>
 public readonly record struct FixedFrameRect(double X, double Y, double Width, double Height);
 
 /// <summary>Book-curvature correction model: 5 control points along a page's top content edge
@@ -1279,8 +1283,8 @@ public partial class ImageProcessor
         return frames.ToArray();
     }
 
-    /// <summary>Inverse of <see cref="ParseFixedFrames"/> — the format <see cref="FrameCalibrationViewModel"/>
-    /// (MicroCapture.UI) saves onto Batch.FixedFrames.</summary>
+    /// <summary>Inverse of <see cref="ParseFixedFrames"/> — the format the UI's live-view frame
+    /// editor saves onto Batch.FixedFrames.</summary>
     public static string FormatFixedFrames(IEnumerable<FixedFrameRect> frames) =>
         string.Join(";", frames.Select(f => string.Join(",",
             f.X.ToString("F1", CultureInfo.InvariantCulture), f.Y.ToString("F1", CultureInfo.InvariantCulture),

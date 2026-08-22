@@ -40,14 +40,35 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _captureReadiness = "NOT READY";
     [ObservableProperty] private bool _splitBookPages = false;
 
-    // Fixed-frame capture: UseFixedFrames is the pre-batch checkbox intent (what the *next*
-    // Start Batch will do); IsFixedFrameBatch reflects whether the currently *active* batch
-    // actually has calibrated frames — they're deliberately separate so toggling the checkbox
-    // mid-batch can never retroactively change how the active batch behaves.
-    [ObservableProperty] private bool _useFixedFrames = false;
-    [ObservableProperty] private bool _isFixedFrameBatch = false;
+    // Fixed-frame capture. Frames are drawn directly on the live view and edited at any time —
+    // there is no separate "use fixed frames" intent flag and no modal calibration step. The
+    // collection itself IS the mode: zero frames means ordinary auto-detect capture, one or more
+    // means crop to exactly those regions. Batch.UseFixedFrames survives only as a derived
+    // persistence detail (Frames.Count > 0) because the background worker reads it.
+    //
+    // Index order is page order: it drives output filenames (_frameNN) and each thumbnail's
+    // FrameIndex, so frames are never auto-sorted — the operator reorders them explicitly.
+    public ObservableCollection<MicroCapture.Processing.FixedFrameRect> Frames { get; } = new();
+
+    /// <summary>Pixel space <see cref="Frames"/> is expressed in. Frames drawn here are authored
+    /// against the live feed, so this is the feed's own size; a batch calibrated before live-view
+    /// editing existed keeps its original full-resolution reference instead, so editing such a
+    /// batch doesn't make its frames jump. Persisted as Batch.FixedFrameImageWidth/Height and
+    /// honored by ImageProcessor.ProcessFixedFrames when it projects frames onto a capture.</summary>
+    public int FrameReferenceWidth { get; private set; }
+    public int FrameReferenceHeight { get; private set; }
+
+    [ObservableProperty] private int _selectedFrameIndex = -1;
+
+    /// <summary>False while captures are still processing under the current geometry — editing is
+    /// blocked up front rather than rejected after the operator has already dragged something.</summary>
+    [ObservableProperty] private bool _areFrameEditsAllowed = true;
+
+    /// <summary>True from pointer-down until shortly after pointer-up, so auto-capture can't fire
+    /// while the geometry the shot would use is still moving under the operator's hand.</summary>
+    [ObservableProperty] private bool _isEditingFrames;
+
     [ObservableProperty] private bool _isCalibrating;
-    [ObservableProperty] private FrameCalibrationViewModel? _calibrationViewModel;
     [ObservableProperty] private LensCalibrationViewModel? _lensCalibrationViewModel;
 
     /// <summary>True when the live camera feed's own panel should be shown — false while any
@@ -138,38 +159,18 @@ public partial class MainWindowViewModel : ViewModelBase
     partial void OnBinarizeEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BinarizeEnabled = value);
     partial void OnBleedthroughEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BleedthroughEnabled = value);
 
-    public bool IsAutoCaptureAvailable => !IsFixedFrameBatch;
-    // Visible once the operator has expressed intent (checked the box for the next batch) OR
-    // the active batch already uses fixed frames (e.g. resumed without re-checking the box).
-    public bool ShowCalibrateButton => IsFixedFrameBatch || UseFixedFrames;
-    public string CalibrateButtonLabel => IsFixedFrameBatch ? "Recalibrate Frames" : "Calibrate Frames";
+    /// <summary>Zero frames means ordinary auto-detect capture; one or more means crop to exactly
+    /// those regions. Drawing the first frame is what enters fixed-frame mode — there is no
+    /// separate toggle to keep in sync.</summary>
+    public bool IsFrameMode => Frames.Count > 0;
 
-    partial void OnUseFixedFramesChanged(bool value)
-    {
-        if (value) SplitBookPages = false;
-        OnPropertyChanged(nameof(ShowCalibrateButton));
-        OnPropertyChanged(nameof(CalibrateButtonLabel));
-
-        // Turning fixed frames OFF can take effect immediately for future captures — there's
-        // nothing to (re)calibrate for "off." Turning it ON still requires going through the
-        // existing CalibrateFramesAsync flow exactly as today (StartBatchAsync's new-batch
-        // branch, or CalibrateFramesAsync itself, are what persist UseFixedFrames = true once a
-        // real calibration exists) — persisting true here, before any frames are calibrated,
-        // would let the background worker pick up UseFixedFrames=true with no FixedFrames data.
-        if (!value && IsFixedFrameBatch)
-            PersistBatchSettingAsync(b => b.UseFixedFrames = false);
-    }
+    /// <summary>Frame mode and book splitting both turn one shutter press into several output
+    /// files by different rules, so they stay mutually exclusive. Ticking Split clears any drawn
+    /// frames rather than silently winning over them.</summary>
     partial void OnSplitBookPagesChanged(bool value)
     {
-        if (value) UseFixedFrames = false;
+        if (value && Frames.Count > 0) ClearAllFrames();
         PersistBatchSettingAsync(b => b.SplitBookPages = value);
-    }
-    partial void OnIsFixedFrameBatchChanged(bool value)
-    {
-        OnPropertyChanged(nameof(IsAutoCaptureAvailable));
-        OnPropertyChanged(nameof(ShowCalibrateButton));
-        OnPropertyChanged(nameof(CalibrateButtonLabel));
-        if (value) { IsAutoCapture = false; }
     }
 
     private string? _currentProjectId;
@@ -262,6 +263,9 @@ public partial class MainWindowViewModel : ViewModelBase
         _worker.JobCompleted += (s, result) => {
             Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
+                // A job just left the queue — this is what re-unlocks frame editing once nothing
+                // is still in flight under the current geometry.
+                _ = RefreshFrameEditPermissionAsync();
                 // For an ordinary (non-fixed-frame) job this matches exactly one thumbnail at
                 // FrameIndex 0 — identical to the old single-thumbnail behavior. For a
                 // fixed-frame job, AddThumbnail already inserted one placeholder per calibrated
@@ -329,20 +333,27 @@ public partial class MainWindowViewModel : ViewModelBase
                     var old = LiveViewImage;
                     LiveViewImage = bitmap;
                     old?.Dispose();
-                    // Fixed-frame batches don't need (or want) contour detection — the crop
-                    // geometry is already calibrated, and running detection here would just
-                    // burn CPU and show meaningless boundary/stability messaging.
-                    if (IsFixedFrameBatch)
-                    {
-                        DocumentStatus = "✓ Fixed frames — position paper, press CAPTURE";
-                    }
-                    // Boundary detection is throttled to keep the live-view path
-                    // responsive while still providing a meaningful capture-readiness gate.
-                    else if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
+
+                    // Analysis is throttled to keep the live-view path responsive while still
+                    // providing a meaningful capture-readiness gate. Both modes share the
+                    // throttle: 500ms x StableFramesRequired is the dwell the operator is used to.
+                    if (DateTime.UtcNow - _lastDocumentCheckUtc >= TimeSpan.FromMilliseconds(500))
                     {
                         _lastDocumentCheckUtc = DateTime.UtcNow;
-                        var check = MicroCapture.Processing.ImageProcessor.CheckLiveFrame(frameBytes);
-                        UpdateDocumentStatus(check);
+                        if (Frames.Count > 0)
+                        {
+                            // Frame mode measures only what's inside the drawn frames — there is
+                            // no boundary to find, and a frame may deliberately cover a region
+                            // with no clean edge at all.
+                            var regions = ToFractionalFrames();
+                            UpdateFrameModeStatus(regions.Length > 0
+                                ? MicroCapture.Processing.ImageProcessor.CheckLiveRegions(frameBytes, regions)
+                                : MicroCapture.Processing.LiveRegionsCheck.None);
+                        }
+                        else
+                        {
+                            UpdateDocumentStatus(MicroCapture.Processing.ImageProcessor.CheckLiveFrame(frameBytes));
+                        }
                     }
                     FocusStatus = "Camera-controlled";
                     ExposureStatus = "Camera-controlled";
@@ -354,6 +365,7 @@ public partial class MainWindowViewModel : ViewModelBase
         };
 
         _ = HydrateLastUsedCaptureFormatAsync();
+        InitializeFrameTracking();
     }
 
     /// <summary>Sets SelectedCaptureFormat's initial value from whatever format the most
@@ -387,10 +399,121 @@ public partial class MainWindowViewModel : ViewModelBase
             CaptureReadiness = "NOT READY";
         else if (string.IsNullOrWhiteSpace(ProjectCode) || string.IsNullOrWhiteSpace(BatchCode))
             CaptureReadiness = "SET PROJECT & BATCH";
+        else if (IsEditingFrames)
+            CaptureReadiness = "EDITING FRAMES";
         else if (IsAutoCapture)
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "AUTO CAPTURE ACTIVE" : "WAITING FOR DOCUMENT";
         else
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
+    }
+
+    /// <summary>Projects the drawn frames into 0..1 fractions of the frame they were authored
+    /// against, which is what <see cref="MicroCapture.Processing.ImageProcessor.CheckLiveRegions"/>
+    /// expects — the live feed's own pixel size may differ from the reference space (a batch
+    /// calibrated at full resolution), so fractions are the only common ground.</summary>
+    private MicroCapture.Processing.FixedFrameRect[] ToFractionalFrames()
+    {
+        if (FrameReferenceWidth <= 0 || FrameReferenceHeight <= 0)
+            return Array.Empty<MicroCapture.Processing.FixedFrameRect>();
+
+        var result = new MicroCapture.Processing.FixedFrameRect[Frames.Count];
+        for (var i = 0; i < Frames.Count; i++)
+        {
+            var f = Frames[i];
+            result[i] = new MicroCapture.Processing.FixedFrameRect(
+                f.X / FrameReferenceWidth, f.Y / FrameReferenceHeight,
+                f.Width / FrameReferenceWidth, f.Height / FrameReferenceHeight);
+        }
+        return result;
+    }
+
+    /// <summary>Joins every frame's content signature into one buffer so the existing
+    /// <see cref="ContentDifference"/> comparison — a mean absolute difference over equal-length
+    /// arrays — works unchanged across N frames. A frame whose signature is missing contributes a
+    /// zero block so the layout stays positional. When the frame count changes the buffer length
+    /// changes too, which ContentDifference reports as "definitely different"; that is the right
+    /// answer after an edit, and it costs nothing.</summary>
+    private static byte[] ConcatSignatures(MicroCapture.Processing.RegionCheck[] regions)
+    {
+        const int perRegion = 24 * 24;
+        var buffer = new byte[regions.Length * perRegion];
+        for (var i = 0; i < regions.Length; i++)
+        {
+            var sig = regions[i].ContentSignature;
+            if (sig == null) continue;
+            Array.Copy(sig, 0, buffer, i * perRegion, Math.Min(sig.Length, perRegion));
+        }
+        return buffer;
+    }
+
+    /// <summary>Auto-capture state machine for fixed-frame mode. Deliberately parallel to
+    /// <see cref="UpdateDocumentStatus"/>, but with no boundary requirement and no positional
+    /// smoothing: the frames are pinned by the operator, so there is no detected rectangle to
+    /// track. "Stable" therefore means the frames' *contents* have stopped changing — the page
+    /// has settled and the operator's hand has withdrawn — rather than a rectangle holding still.
+    ///
+    /// <para>The weakest frame gates focus: one out-of-focus frame should hold the whole capture,
+    /// since every frame becomes its own output page.</para></summary>
+    private void UpdateFrameModeStatus(MicroCapture.Processing.LiveRegionsCheck check)
+    {
+        if (!check.Decoded || check.Regions == null || check.Regions.Length == 0)
+        {
+            _stableFrameCount = 0;
+            DocumentStatus = "Frames set — waiting for live view";
+            return;
+        }
+
+        var signature = ConcatSignatures(check.Regions);
+        var previous = _lastDetectedSignature;
+        _lastDetectedSignature = signature;
+
+        // The geometry a shot would use is still moving under the operator's hand.
+        if (IsEditingFrames)
+        {
+            _stableFrameCount = 0;
+            DocumentStatus = "Editing frames — auto-capture paused";
+            return;
+        }
+
+        if (!IsAutoCapture)
+        {
+            _stableFrameCount = 0;
+            DocumentStatus = $"✓ {Frames.Count} frame(s) — press CAPTURE";
+            return;
+        }
+
+        var minSharpness = check.Regions.Min(r => r.Sharpness);
+        if (minSharpness < LiveSharpnessThreshold)
+        {
+            _stableFrameCount = 0;
+            DocumentStatus = "✓ Frames set — focusing…";
+            return;
+        }
+
+        var settled = previous != null && ContentDifference(signature, previous) < ContentChangeThreshold;
+        _stableFrameCount = settled ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
+        if (_stableFrameCount < StableFramesRequired)
+        {
+            DocumentStatus = "✓ Frames set — hold still…";
+            return;
+        }
+
+        if (_lastCapturedSignature != null && ContentDifference(signature, _lastCapturedSignature) < ContentChangeThreshold)
+        {
+            DocumentStatus = "✓ Captured — swap page to continue";
+            return;
+        }
+
+        if (Volatile.Read(ref _captureInProgress) != 0)
+        {
+            DocumentStatus = "✓ Capturing…";
+            return;
+        }
+
+        DocumentStatus = "✓ Capturing…";
+        _lastCapturedSignature = signature;
+        _stableFrameCount = 0;
+        _ = CaptureAsync();
     }
 
     /// <summary>Auto-capture state machine. Fires the shutter automatically once a page has
@@ -549,13 +672,17 @@ public partial class MainWindowViewModel : ViewModelBase
         // PersistBatchSettingAsync straight back to the very row it was just read from
         // (redundant at best; racy at worst, since _currentBatchId above is already set by the
         // time these run).
+        // A debounced write still pending for the PREVIOUS batch must not land now that
+        // _currentBatchId has moved — PersistBatchSettingAsync resolves it at execution time, so
+        // a stale timer would write this batch's row with the old batch's frames.
+        _framePersistTimer?.Stop();
+
         _suppressPersist = true;
         try
         {
             ProjectCode = _activeProjectCode;
             BatchCode = _activeBatchCode;
-            IsFixedFrameBatch = batch.UseFixedFrames;
-            RefreshFixedFrameCache(batch);
+            HydrateFramesFromBatch(batch);
             SelectedDpi = batch.Dpi;
             DewarpEnabled = batch.DewarpEnabled;
             BinarizeEnabled = batch.BinarizeEnabled;
@@ -566,6 +693,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _suppressPersist = false;
         }
         await LoadRecentCapturesFromBatchAsync(batch);
+        await RefreshFrameEditPermissionAsync();
     }
 
     /// <summary>Opens the Recent Batches picker and, if the operator picks one, reopens it —
@@ -674,18 +802,28 @@ public partial class MainWindowViewModel : ViewModelBase
                     .Select(c => c.Id)
                     .FirstOrDefaultAsync();
 
+                // Frames drawn before Start Batch are staged in memory (PersistFramesNow no-ops
+                // without a batch id) and land on the new row here, so the operator can set the
+                // rig up before committing to a batch code.
+                EnsureFrameReference();
+                var stagedFrameCount = Frames.Count;
+
                 batch = new Batch
                 {
                     ProjectId = project.Id,
                     Name = batchCode,
                     BatchCode = batchCode,
                     Operator = Environment.UserName,
-                    SplitBookPages = SplitBookPages && !UseFixedFrames,
+                    SplitBookPages = SplitBookPages && stagedFrameCount == 0,
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
                     BinarizeEnabled = BinarizeEnabled,
                     BleedthroughEnabled = BleedthroughEnabled,
-                    CameraCalibrationId = activeCalibrationId
+                    CameraCalibrationId = activeCalibrationId,
+                    UseFixedFrames = stagedFrameCount > 0,
+                    FixedFrames = stagedFrameCount > 0 ? MicroCapture.Processing.ImageProcessor.FormatFixedFrames(Frames) : null,
+                    FixedFrameImageWidth = stagedFrameCount > 0 ? FrameReferenceWidth : 0,
+                    FixedFrameImageHeight = stagedFrameCount > 0 ? FrameReferenceHeight : 0
                 };
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();
@@ -693,21 +831,10 @@ public partial class MainWindowViewModel : ViewModelBase
                 _currentBatchId = batch.Id;
                 PageCount = 0;
                 RecentCaptures.Clear();
-                IsFixedFrameBatch = false;
-                RefreshFixedFrameCache(null);
-                StatusText = $"Batch '{batchCode}' started for project '{projectCode}'";
-
-                if (UseFixedFrames)
-                {
-                    if (IsConnected)
-                    {
-                        await CalibrateFramesAsync();
-                    }
-                    else
-                    {
-                        StatusText = $"Batch '{batchCode}' started — connect the camera and use \"Calibrate Frames\" to set up fixed frames.";
-                    }
-                }
+                AreFrameEditsAllowed = true;
+                StatusText = stagedFrameCount > 0
+                    ? $"Batch '{batchCode}' started with {stagedFrameCount} frame(s) for project '{projectCode}'"
+                    : $"Batch '{batchCode}' started for project '{projectCode}'";
             }
 
             UpdateCaptureReadiness();
@@ -718,122 +845,11 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Opens the fixed-frame calibration panel for the active batch — used both for
-    /// first-time calibration (right after Start Batch, if "Use Fixed Frames" was checked) and
-    /// for recalibrating an already-fixed-frame batch later (e.g. the rig shifted). Takes one
-    /// throwaway full-res shot as the calibration image (never enqueued as a real capture), then
-    /// shows the calibration panel inline in place of live view until it's saved or cancelled.</summary>
-    [RelayCommand]
-    private async Task CalibrateFramesAsync()
-    {
-        if (_currentBatchId == null) { StatusText = "Start a batch first."; return; }
-        if (!IsConnected) { StatusText = "Connect the camera before calibrating fixed frames."; return; }
-        // Shares the same re-entrancy guard as Capture/Recapture: without this, an ordinary
-        // Capture click while the calibration shot is in flight would silently queue behind
-        // the camera service's own capture lock for up to that shot's full timeout window.
-        if (Interlocked.Exchange(ref _captureInProgress, 1) != 0)
-        {
-            StatusText = "A capture is already in progress.";
-            return;
-        }
-
-        try
-        {
-            // A job still mid-flight when frames change could otherwise get cropped with the new
-            // geometry instead of the one that was active when it was captured — block rather than
-            // risk that race. Nothing heavier (e.g. a per-job geometry snapshot) is needed: once
-            // this check passes, every already-Completed job is an immutable historical artifact
-            // that nothing reprocesses automatically.
-            var pendingCount = await _dbContext.CaptureJobs.CountAsync(j =>
-                j.BatchId == _currentBatchId && (j.ProcessingStatus == "Pending" || j.ProcessingStatus == "InProgress"));
-            if (pendingCount > 0)
-            {
-                StatusText = $"{pendingCount} page(s) still processing under the current frames — wait for them to finish before recalibrating.";
-                return;
-            }
-
-            var batch = await _dbContext.Batches.FindAsync(_currentBatchId);
-            if (batch == null) return;
-
-            uint? originalQuality = null;
-            var qualityChanged = false;
-
-            try
-            {
-                // The calibration shot always uses plain JPEG, regardless of whatever quality
-                // the operator has selected for real page captures — it's the only format the
-                // calibration panel can load as a Bitmap, and keeps calibration fast even when
-                // the batch itself is shooting RAW.
-                try
-                {
-                    var settings = await _cameraService.GetCameraSettingsAsync();
-                    var qualitySetting = settings.FirstOrDefault(s => s.Key == "ImageQuality");
-                    if (qualitySetting != null)
-                    {
-                        originalQuality = qualitySetting.Value;
-                        var jpegOption = qualitySetting.Options.FirstOrDefault(o => o.DisplayName == "Jpeg Large Fine")
-                            ?? qualitySetting.Options.FirstOrDefault(o => o.DisplayName.StartsWith("Jpeg ") && !o.DisplayName.Contains('+'));
-                        if (jpegOption != null && jpegOption.Value != originalQuality.Value)
-                        {
-                            await _cameraService.SetCameraSettingAsync("ImageQuality", jpegOption.Value);
-                            qualityChanged = true;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"[CalibrateFramesAsync] Could not force JPEG quality for calibration shot: {ex}");
-                }
-
-                var calibrationDir = Path.Combine(_outputDirectory, "Calibration");
-                Directory.CreateDirectory(calibrationDir);
-                StatusText = "Capturing calibration frame...";
-                var calibrationPath = await _cameraService.CaptureAsync(calibrationDir, $"calibration_{DateTime.Now:yyyyMMdd_HHmmss}");
-
-                var calibrationViewModel = new FrameCalibrationViewModel(batch, _dbContext, calibrationPath);
-                var tcs = new TaskCompletionSource<bool>();
-                calibrationViewModel.Saved += (_, _) => tcs.TrySetResult(true);
-                calibrationViewModel.Cancelled += (_, _) => tcs.TrySetResult(false);
-
-                CalibrationViewModel = calibrationViewModel;
-                IsCalibrating = true;
-
-                var saved = await tcs.Task;
-
-                IsCalibrating = false;
-                CalibrationViewModel = null;
-
-                IsFixedFrameBatch = batch.UseFixedFrames;
-                RefreshFixedFrameCache(batch);
-                StatusText = saved ? "Fixed frames calibrated." : "Calibration cancelled.";
-            }
-            catch (Exception ex)
-            {
-                IsCalibrating = false;
-                CalibrationViewModel = null;
-                StatusText = $"Calibration failed: {ex.Message}";
-            }
-            finally
-            {
-                if (qualityChanged && originalQuality.HasValue)
-                {
-                    try { await _cameraService.SetCameraSettingAsync("ImageQuality", originalQuality.Value); }
-                    catch (Exception restoreEx)
-                    {
-                        Console.Error.WriteLine($"[CalibrateFramesAsync] Could not restore original image quality: {restoreEx}");
-                        StatusText += " (warning: could not restore original image quality — check camera settings)";
-                    }
-                }
-            }
-        }
-        finally { Volatile.Write(ref _captureInProgress, 0); }
-    }
-
     /// <summary>Opens the one-time lens (camera intrinsics/distortion) calibration flow —
     /// independent of any batch/project, since a lens calibration belongs to the physical rig,
-    /// not to any one capture session. Unlike <see cref="CalibrateFramesAsync"/>, this owns a
-    /// repeated-capture loop internally (see <see cref="LensCalibrationViewModel"/>) rather than
-    /// taking one throwaway shot up front.</summary>
+    /// not to any one capture session. Unlike fixed frames — which are now drawn directly on the
+    /// live view with no capture at all — this owns a repeated-capture loop internally (see
+    /// <see cref="LensCalibrationViewModel"/>).</summary>
     [RelayCommand]
     private async Task CalibrateLensAsync()
     {
@@ -946,6 +962,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
             // Record in durable queue
             var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+            // A job is now queued under the current geometry — lock frame editing until it lands.
+            _ = RefreshFrameEditPermissionAsync();
 
             // Add thumbnail
             AddThumbnail(job.Id, filePath, PageCount);
@@ -985,6 +1003,7 @@ public partial class MainWindowViewModel : ViewModelBase
             await _queueService.SupersedePageAsync(_currentBatchId, PageCount);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
             var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+            _ = RefreshFrameEditPermissionAsync();
 
             // Update thumbnail for the recaptured page
             var existing = RecentCaptures.Where(t => t.PageNumber == PageCount).ToList();
@@ -1280,44 +1299,366 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>Number of output pages one capture is expected to produce, for the current
     /// batch's mode — used to decide how many placeholder thumbnails one shutter press should
     /// create. Fixed frames and split-book-pages are mutually exclusive (see
-    /// OnUseFixedFramesChanged/OnSplitBookPagesChanged), so at most one of these branches ever
-    /// applies; both produce N&gt;1 files per capture (ImageProcessor.ProcessFixedFrames /
-    /// Process's split branch), each of which needs its own thumbnail slot or only the first
-    /// output file ever gets shown (see JobCompleted's FrameIndex-indexed lookup into
-    /// result.OutputFilePaths).</summary>
+    /// OnSplitBookPagesChanged and the Frames collection handler), so at most one of these
+    /// branches ever applies; both produce N&gt;1 files per capture
+    /// (ImageProcessor.ProcessFixedFrames / Process's split branch), each of which needs its own
+    /// thumbnail slot or only the first output file ever gets shown (see JobCompleted's
+    /// FrameIndex-indexed lookup into result.OutputFilePaths).</summary>
     private int GetCurrentFixedFrameCount()
     {
+        if (Frames.Count > 0) return Frames.Count;
         if (SplitBookPages) return 2;
-        if (!IsFixedFrameBatch || _currentBatchId == null) return 1;
-        var batch = _dbContext.Batches.Find(_currentBatchId);
-        if (batch?.UseFixedFrames != true || string.IsNullOrWhiteSpace(batch.FixedFrames)) return 1;
-        var count = MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames).Length;
-        return count > 0 ? count : 1;
+        return 1;
     }
 
-    // Parsed fixed-frame geometry for the active batch, read by MainWindow.axaml.cs to draw a
-    // read-only outline over the live view. Kept as a small cache (refreshed only when the
-    // active batch's frames actually change) rather than re-parsing FixedFrames on every ~30fps
-    // live-view frame.
-    public MicroCapture.Processing.FixedFrameRect[] CurrentFixedFrames { get; private set; } = Array.Empty<MicroCapture.Processing.FixedFrameRect>();
-    public int CurrentFixedFrameImageWidth { get; private set; }
-    public int CurrentFixedFrameImageHeight { get; private set; }
+    // ───────────── FIXED FRAME EDITING ─────────────
 
-    private void RefreshFixedFrameCache(Batch? batch)
+    // Coalesces a burst of drag-ends into one write. Frames change continuously now, so the
+    // per-pointer-move rate must never reach the database; a discrete add/remove skips this and
+    // persists immediately (see PersistFramesNow).
+    private Avalonia.Threading.DispatcherTimer? _framePersistTimer;
+    private static readonly TimeSpan FramePersistDebounce = TimeSpan.FromMilliseconds(300);
+
+    // Releases the auto-capture suspension a moment after the operator stops dragging, so a shot
+    // isn't fired by the residual motion of letting go.
+    private Avalonia.Threading.DispatcherTimer? _frameEditSettleTimer;
+    private static readonly TimeSpan FrameEditSettleDelay = TimeSpan.FromMilliseconds(250);
+
+    // Guards the mutual exclusion between Frames and SplitBookPages from recursing.
+    private bool _suppressFrameSplitSync;
+
+    /// <summary>Wires up the collection so any structural change keeps derived state honest.
+    /// Called once from the constructor.</summary>
+    private void InitializeFrameTracking()
     {
+        Frames.CollectionChanged += (_, _) =>
+        {
+            OnPropertyChanged(nameof(IsFrameMode));
+            OnPropertyChanged(nameof(FrameSummary));
+            RebuildFrameList();
+            RemoveSelectedFrameCommand.NotifyCanExecuteChanged();
+            MoveFrameUpCommand.NotifyCanExecuteChanged();
+            MoveFrameDownCommand.NotifyCanExecuteChanged();
+            ClearAllFramesCommand.NotifyCanExecuteChanged();
+
+            if (Frames.Count > 0 && SplitBookPages && !_suppressFrameSplitSync)
+            {
+                _suppressFrameSplitSync = true;
+                try { SplitBookPages = false; }
+                finally { _suppressFrameSplitSync = false; }
+            }
+
+            // Geometry changed, so whatever was last captured is no longer comparable against
+            // what the frames now see — force the next auto-capture evaluation to start fresh
+            // rather than treating the new layout as "same page already shot".
+            _lastCapturedSignature = null;
+            _stableFrameCount = 0;
+        };
+    }
+
+    partial void OnSelectedFrameIndexChanged(int value)
+    {
+        RemoveSelectedFrameCommand.NotifyCanExecuteChanged();
+        MoveFrameUpCommand.NotifyCanExecuteChanged();
+        MoveFrameDownCommand.NotifyCanExecuteChanged();
+        for (var i = 0; i < FrameList.Count; i++) FrameList[i].IsSelected = i == value;
+    }
+
+    public string FrameSummary => Frames.Count == 0
+        ? "No frames — auto-detect crop"
+        : Frames.Count == 1 ? "1 frame — 1 page per capture"
+        : $"{Frames.Count} frames — {Frames.Count} pages per capture";
+
+    /// <summary>Display projection of <see cref="Frames"/> that spells out the order-to-filename
+    /// mapping, so the operator can see which region becomes which page before shooting. Rebuilt
+    /// on any change rather than kept in sync incrementally — the list is a handful of items and
+    /// only changes on a discrete edit.</summary>
+    public ObservableCollection<FrameListItem> FrameList { get; } = new();
+
+    private void RebuildFrameList()
+    {
+        FrameList.Clear();
+        for (var i = 0; i < Frames.Count; i++)
+        {
+            FrameList.Add(new FrameListItem
+            {
+                Label = $"Frame {i + 1} → page {i + 1}  ({Math.Round(Frames[i].Width)}×{Math.Round(Frames[i].Height)})",
+                Color = new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)),
+                IsSelected = i == SelectedFrameIndex
+            });
+        }
+    }
+
+    private bool CanEditSelectedFrame() => AreFrameEditsAllowed && SelectedFrameIndex >= 0 && SelectedFrameIndex < Frames.Count;
+    private bool CanClearFrames() => AreFrameEditsAllowed && Frames.Count > 0;
+
+    partial void OnAreFrameEditsAllowedChanged(bool value)
+    {
+        AddFrameCommand.NotifyCanExecuteChanged();
+        RemoveSelectedFrameCommand.NotifyCanExecuteChanged();
+        MoveFrameUpCommand.NotifyCanExecuteChanged();
+        MoveFrameDownCommand.NotifyCanExecuteChanged();
+        ClearAllFramesCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>Adopts the live feed's dimensions as the space frames are authored in, the first
+    /// time a frame is created with no reference already established. A batch calibrated the old
+    /// way keeps its original full-resolution reference so its frames don't jump on first edit.</summary>
+    private void EnsureFrameReference()
+    {
+        if (FrameReferenceWidth > 0 && FrameReferenceHeight > 0) return;
+        var live = LiveViewImage;
+        if (live == null) return;
+        FrameReferenceWidth = (int)Math.Round(live.Size.Width);
+        FrameReferenceHeight = (int)Math.Round(live.Size.Height);
+        OnPropertyChanged(nameof(FrameReferenceWidth));
+        OnPropertyChanged(nameof(FrameReferenceHeight));
+        OnPropertyChanged(nameof(FrameReferenceSize));
+    }
+
+    /// <summary>The space the overlay editor works in. Normally the established reference — the
+    /// live feed's size for frames drawn here, or a resumed batch's own calibration resolution —
+    /// but before any reference exists it falls back to the live feed's current size, so the very
+    /// first frame can be drawn against something real. EnsureFrameReference then pins that
+    /// choice as soon as a frame is committed.</summary>
+    public Avalonia.Size FrameReferenceSize
+    {
+        get
+        {
+            if (FrameReferenceWidth > 0 && FrameReferenceHeight > 0)
+                return new Avalonia.Size(FrameReferenceWidth, FrameReferenceHeight);
+            var live = LiveViewImage;
+            return live != null ? live.Size : default;
+        }
+    }
+
+    partial void OnLiveViewImageChanged(Bitmap? value)
+    {
+        // Until a reference is pinned, the editor's coordinate space follows the live feed.
+        if (FrameReferenceWidth <= 0 || FrameReferenceHeight <= 0)
+            OnPropertyChanged(nameof(FrameReferenceSize));
+    }
+
+    /// <summary>Full-resolution capture dimensions, learned from the first capture of the
+    /// session, so the overlay can show a frame's size in the pixels the operator will actually
+    /// get on disk rather than live-preview pixels. Zero until something has been captured, which
+    /// the editor treats as "no readout available".</summary>
+    public Avalonia.Size CaptureImageSize { get; private set; }
+
+    /// <summary>Records the capture resolution and warns once if it disagrees in ASPECT with the
+    /// live feed. Frames are authored against the feed and projected onto the capture by
+    /// independent x and y scales, which is exactly right when the two share a field of view —
+    /// but if the feed is letterboxed or cropped differently from the capture, that projection
+    /// stretches the frames and the operator needs to know rather than discovering it in the
+    /// output. Real Canon bodies stream and shoot at the same aspect; the mock deliberately
+    /// does not, which is what exercises this path.</summary>
+    private void NoteCaptureDimensions(int width, int height)
+    {
+        if (width <= 0 || height <= 0) return;
+        if (Math.Abs(CaptureImageSize.Width - width) < 0.5 && Math.Abs(CaptureImageSize.Height - height) < 0.5) return;
+
+        CaptureImageSize = new Avalonia.Size(width, height);
+        OnPropertyChanged(nameof(CaptureImageSize));
+
+        if (_aspectMismatchWarned || FrameReferenceWidth <= 0 || FrameReferenceHeight <= 0) return;
+        var referenceAspect = (double)FrameReferenceWidth / FrameReferenceHeight;
+        var captureAspect = (double)width / height;
+        if (Math.Abs(referenceAspect - captureAspect) > 0.02)
+        {
+            _aspectMismatchWarned = true;
+            StatusText = $"Note: live view ({FrameReferenceWidth}x{FrameReferenceHeight}) and capture ({width}x{height}) have different aspect ratios — frames will be stretched to fit. Check a captured page before shooting the batch.";
+        }
+    }
+
+    private bool _aspectMismatchWarned;
+
+    [RelayCommand(CanExecute = nameof(CanAddFrame))]
+    private void AddFrame()
+    {
+        EnsureFrameReference();
+        if (FrameReferenceWidth <= 0 || FrameReferenceHeight <= 0)
+        {
+            StatusText = "Connect the camera and wait for live view before adding frames.";
+            return;
+        }
+        Frames.Add(Controls.FrameGeometry.DefaultFrame(FrameReferenceWidth, FrameReferenceHeight, Frames.Count));
+        SelectedFrameIndex = Frames.Count - 1;
+        PersistFramesNow();
+    }
+
+    private bool CanAddFrame() => AreFrameEditsAllowed;
+
+    [RelayCommand(CanExecute = nameof(CanEditSelectedFrame))]
+    private void RemoveSelectedFrame()
+    {
+        var index = SelectedFrameIndex;
+        if (index < 0 || index >= Frames.Count) return;
+        Frames.RemoveAt(index);
+        SelectedFrameIndex = Frames.Count > 0 ? Math.Min(index, Frames.Count - 1) : -1;
+        PersistFramesNow();
+    }
+
+    [RelayCommand(CanExecute = nameof(CanMoveFrameUp))]
+    private void MoveFrameUp()
+    {
+        var index = SelectedFrameIndex;
+        if (index <= 0 || index >= Frames.Count) return;
+        Frames.Move(index, index - 1);
+        SelectedFrameIndex = index - 1;
+        PersistFramesNow();
+    }
+
+    private bool CanMoveFrameUp() => AreFrameEditsAllowed && SelectedFrameIndex > 0 && SelectedFrameIndex < Frames.Count;
+
+    [RelayCommand(CanExecute = nameof(CanMoveFrameDown))]
+    private void MoveFrameDown()
+    {
+        var index = SelectedFrameIndex;
+        if (index < 0 || index >= Frames.Count - 1) return;
+        Frames.Move(index, index + 1);
+        SelectedFrameIndex = index + 1;
+        PersistFramesNow();
+    }
+
+    private bool CanMoveFrameDown() => AreFrameEditsAllowed && SelectedFrameIndex >= 0 && SelectedFrameIndex < Frames.Count - 1;
+
+    [RelayCommand(CanExecute = nameof(CanClearFrames))]
+    private void ClearAllFrames()
+    {
+        if (Frames.Count == 0) return;
+        Frames.Clear();
+        SelectedFrameIndex = -1;
+        PersistFramesNow();
+    }
+
+    /// <summary>Called by the overlay editor when a drag or a structural edit completes.
+    /// Transforms debounce (another drag usually follows); structural edits persist at once.</summary>
+    public void OnFrameEditCommitted(Controls.FrameEditKind kind)
+    {
+        EnsureFrameReference();
+        OnPropertyChanged(nameof(FrameSummary));
+        // A resize changes the rect in place without touching the collection, so the size
+        // readouts in the list need refreshing explicitly.
+        RebuildFrameList();
+        if (kind == Controls.FrameEditKind.Structural) PersistFramesNow();
+        else ScheduleFramePersist();
+    }
+
+    /// <summary>Called by the overlay editor on pointer-down and pointer-up. Auto-capture stays
+    /// suspended for a short settle after release so letting go of a frame can't trip the shutter.</summary>
+    public void OnFrameInteractionChanged(bool interacting)
+    {
+        if (interacting)
+        {
+            _frameEditSettleTimer?.Stop();
+            IsEditingFrames = true;
+            UpdateCaptureReadiness();
+            return;
+        }
+
+        _frameEditSettleTimer ??= CreateOneShotTimer(FrameEditSettleDelay, () =>
+        {
+            IsEditingFrames = false;
+            UpdateCaptureReadiness();
+        });
+        _frameEditSettleTimer.Stop();
+        _frameEditSettleTimer.Start();
+    }
+
+    private static Avalonia.Threading.DispatcherTimer CreateOneShotTimer(TimeSpan interval, Action onTick)
+    {
+        var timer = new Avalonia.Threading.DispatcherTimer { Interval = interval };
+        timer.Tick += (s, _) =>
+        {
+            ((Avalonia.Threading.DispatcherTimer)s!).Stop();
+            onTick();
+        };
+        return timer;
+    }
+
+    private void ScheduleFramePersist()
+    {
+        if (_currentBatchId == null || _suppressPersist) return;
+        _framePersistTimer ??= CreateOneShotTimer(FramePersistDebounce, PersistFramesNow);
+        _framePersistTimer.Stop();
+        _framePersistTimer.Start();
+    }
+
+    /// <summary>Writes the current frames onto the active batch immediately. A no-op before any
+    /// batch is started — frames drawn then are staged in memory and persisted by StartBatchAsync.</summary>
+    private void PersistFramesNow()
+    {
+        _framePersistTimer?.Stop();
+        if (_currentBatchId == null || _suppressPersist) return;
+
+        // Snapshot before the lambda: PersistBatchSettingAsync is async void, so its body runs on
+        // a later turn, by which time the operator may already be dragging these frames again.
+        var count = Frames.Count;
+        var spec = count > 0 ? MicroCapture.Processing.ImageProcessor.FormatFixedFrames(Frames) : null;
+        var refW = count > 0 ? FrameReferenceWidth : 0;
+        var refH = count > 0 ? FrameReferenceHeight : 0;
+
+        PersistBatchSettingAsync(b =>
+        {
+            b.UseFixedFrames = count > 0;
+            b.FixedFrames = spec;
+            b.FixedFrameImageWidth = refW;
+            b.FixedFrameImageHeight = refH;
+            if (count > 0) b.SplitBookPages = false;
+        });
+    }
+
+    /// <summary>Loads a batch's saved frames into the live editor, keeping the batch's own
+    /// reference space so frames authored against a full-resolution calibration still render and
+    /// re-persist consistently.</summary>
+    private void HydrateFramesFromBatch(Batch? batch)
+    {
+        Frames.Clear();
         if (batch != null && batch.UseFixedFrames && !string.IsNullOrWhiteSpace(batch.FixedFrames))
         {
-            CurrentFixedFrames = MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames);
-            CurrentFixedFrameImageWidth = batch.FixedFrameImageWidth;
-            CurrentFixedFrameImageHeight = batch.FixedFrameImageHeight;
+            foreach (var f in MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames))
+                Frames.Add(f);
+            FrameReferenceWidth = batch.FixedFrameImageWidth;
+            FrameReferenceHeight = batch.FixedFrameImageHeight;
         }
         else
         {
-            CurrentFixedFrames = Array.Empty<MicroCapture.Processing.FixedFrameRect>();
-            CurrentFixedFrameImageWidth = 0;
-            CurrentFixedFrameImageHeight = 0;
+            FrameReferenceWidth = 0;
+            FrameReferenceHeight = 0;
         }
-        OnPropertyChanged(nameof(CurrentFixedFrames));
+        SelectedFrameIndex = Frames.Count > 0 ? 0 : -1;
+        OnPropertyChanged(nameof(FrameReferenceWidth));
+        OnPropertyChanged(nameof(FrameReferenceHeight));
+        OnPropertyChanged(nameof(FrameReferenceSize));
+        OnPropertyChanged(nameof(FrameSummary));
+        RebuildFrameList();
+    }
+
+    /// <summary>Re-evaluates whether frame geometry may be edited right now. Editing while a job
+    /// is still queued would crop it with geometry it wasn't shot under, so editing is locked up
+    /// front — as a disabled state the operator can see — rather than by rejecting a drag after
+    /// the fact. A query failure must never lock the operator out.</summary>
+    private async Task RefreshFrameEditPermissionAsync()
+    {
+        if (_currentBatchId == null) { AreFrameEditsAllowed = true; return; }
+        try
+        {
+            var pending = await _dbContext.CaptureJobs.CountAsync(j =>
+                j.BatchId == _currentBatchId &&
+                (j.ProcessingStatus == "Pending" || j.ProcessingStatus == "InProgress"));
+            var allowed = pending == 0;
+            if (allowed != AreFrameEditsAllowed)
+            {
+                AreFrameEditsAllowed = allowed;
+                if (!allowed)
+                    StatusText = $"{pending} page(s) still processing under the current frames — frame editing is locked until they finish.";
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[RefreshFrameEditPermissionAsync] {ex}");
+            AreFrameEditsAllowed = true;
+        }
     }
 
     private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false)
@@ -1367,6 +1708,16 @@ public partial class MainWindowViewModel : ViewModelBase
             try
             {
                 var bytes = File.ReadAllBytes(filePath);
+
+                // Learn the rig's true capture resolution from a real shot, so the frame overlay
+                // can report sizes in output pixels rather than live-preview pixels — and so an
+                // aspect mismatch between feed and capture gets flagged rather than silently
+                // stretching every frame.
+                if (MicroCapture.Processing.ImageDecodeHelper.GetPixelSize(filePath) is var (capW, capH))
+                {
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() => NoteCaptureDimensions(capW, capH));
+                }
+
                 foreach (var thumbnail in placeholders)
                 {
                     using var stream = new MemoryStream(bytes);
@@ -1469,11 +1820,17 @@ public partial class MainWindowViewModel : ViewModelBase
             case "A":
                 ToggleAutoCapture();
                 break;
+            case "Delete":
+                if (RemoveSelectedFrameCommand.CanExecute(null)) RemoveSelectedFrameCommand.Execute(null);
+                break;
         }
     }
 
     public async Task ShutdownAsync()
     {
+        // Flush any drag-end still sitting on the debounce, so frames adjusted moments before
+        // closing aren't lost.
+        PersistFramesNow();
         _worker?.Stop();
         try
         {
@@ -1495,6 +1852,16 @@ public partial class MainWindowViewModel : ViewModelBase
 /// <summary>
 /// Represents one item in the thumbnail strip.
 /// </summary>
+/// <summary>One row of the FRAMES list: which drawn frame becomes which output page, in the
+/// frame's own overlay color, so the order-to-filename mapping is visible without having to
+/// remember the drawing order.</summary>
+public partial class FrameListItem : ObservableObject
+{
+    [ObservableProperty] private string _label = "";
+    [ObservableProperty] private Avalonia.Media.IBrush? _color;
+    [ObservableProperty] private bool _isSelected;
+}
+
 public partial class ThumbnailItem : ObservableObject
 {
     [ObservableProperty] private int _pageNumber;

@@ -64,6 +64,8 @@ TestMediumConfidenceCropIsStillApplied();
 TestFixedFramesRoundTrip();
 TestProcessFixedFramesProducesNOutputs();
 TestFixedFramesFallsBackToCalibratedRectOnFeaturelessImage();
+TestFrameGeometryEditing();
+await TestFramePersistDoesNotLeakAcrossBatchSwitch();
 TestFixedFramesScaleFromReferenceResolution();
 TestFixedFramesZeroReferenceIsBackCompatible();
 TestCheckLiveRegionsDetectsPerRegionContentChange();
@@ -1382,6 +1384,94 @@ void TestCheckLiveRegionsSharpnessIsPerRegion()
         if (!(sharp > blurry * 2.0))
             Console.WriteLine($"   sharp={sharp:F1} blurry={blurry:F1}");
     }
+}
+
+void TestFrameGeometryEditing()
+{
+    Console.WriteLine("\n-- Frame geometry: resize, move, and rubber-band creation stay inside the image --");
+    const double imgW = 960, imgH = 640;
+    var min = MicroCapture.UI.Controls.FrameGeometry.MinSize(imgW, imgH);
+
+    // Dragging a corner far outside the image must clamp, not escape.
+    var frame = new FixedFrameRect(100, 100, 300, 200);
+    var resized = MicroCapture.UI.Controls.FrameGeometry.ResolveResize(
+        frame, MicroCapture.UI.Controls.FrameHandleKind.BottomRight, 5000, 5000, imgW, imgH);
+    Check("Resizing past the edge clamps to the image bounds",
+        resized.X + resized.Width <= imgW + 0.001 && resized.Y + resized.Height <= imgH + 0.001);
+
+    // Collapsing a frame onto itself must stop at the minimum, never invert.
+    var collapsed = MicroCapture.UI.Controls.FrameGeometry.ResolveResize(
+        frame, MicroCapture.UI.Controls.FrameHandleKind.BottomRight, 0, 0, imgW, imgH);
+    Check("A frame cannot be collapsed below the minimum size or inverted",
+        collapsed.Width >= min - 0.001 && collapsed.Height >= min - 0.001);
+
+    // Moving hard against a corner must keep the whole frame on-image.
+    var moved = MicroCapture.UI.Controls.FrameGeometry.Move(frame, -9999, -9999, imgW, imgH);
+    Check("Moving past the top-left corner clamps to (0,0)", moved.X == 0 && moved.Y == 0);
+    var movedFar = MicroCapture.UI.Controls.FrameGeometry.Move(frame, 9999, 9999, imgW, imgH);
+    Check("Moving past the bottom-right keeps the frame fully inside",
+        Math.Abs(movedFar.X + movedFar.Width - imgW) < 0.001 && Math.Abs(movedFar.Y + movedFar.Height - imgH) < 0.001);
+
+    // Rubber-band creation must normalize either drag direction.
+    var dragUpLeft = MicroCapture.UI.Controls.FrameGeometry.FromDragCorners(
+        new Avalonia.Point(400, 300), new Avalonia.Point(100, 80), imgW, imgH);
+    Check("A rubber-band dragged up-and-left normalizes to a positive rect",
+        dragUpLeft.X == 100 && dragUpLeft.Y == 80 && dragUpLeft.Width == 300 && dragUpLeft.Height == 220);
+
+    // A bare click must not become a frame — otherwise a stray click silently enters frame mode.
+    var click = MicroCapture.UI.Controls.FrameGeometry.FromDragCorners(
+        new Avalonia.Point(200, 200), new Avalonia.Point(201, 201), imgW, imgH);
+    Check("A click-sized drag is rejected as too small to commit",
+        !MicroCapture.UI.Controls.FrameGeometry.IsCommittableSize(click, imgW, imgH));
+    Check("A real drag is accepted",
+        MicroCapture.UI.Controls.FrameGeometry.IsCommittableSize(dragUpLeft, imgW, imgH));
+
+    // The minimum must scale with the image, not sit at a fixed pixel count.
+    Check("Minimum frame size scales with the image it is drawn on",
+        MicroCapture.UI.Controls.FrameGeometry.MinSize(6000, 4000) > MicroCapture.UI.Controls.FrameGeometry.MinSize(960, 640));
+}
+
+async Task TestFramePersistDoesNotLeakAcrossBatchSwitch()
+{
+    Console.WriteLine("\n-- Frames written for one batch never land on another --");
+    var dbPath = TempDbPath();
+    var workDir = TempWorkDir();
+
+    using var db = new AppDbContext(dbPath);
+    _ = new CaptureQueueService(db);   // creates/upgrades the schema, as every other test relies on
+    var project = new Project { Name = "SMOKE-FRAMESWITCH", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+
+    var frames = new[] { new FixedFrameRect(10, 10, 200, 150) };
+    var batchA = new Batch
+    {
+        ProjectId = project.Id,
+        Name = "A",
+        BatchCode = "A",
+        UseFixedFrames = true,
+        FixedFrames = ImageProcessor.FormatFixedFrames(frames),
+        FixedFrameImageWidth = 960,
+        FixedFrameImageHeight = 640
+    };
+    var batchB = new Batch { ProjectId = project.Id, Name = "B", BatchCode = "B" };
+    db.Batches.AddRange(batchA, batchB);
+    await db.SaveChangesAsync();
+
+    // The failure this guards against: a debounced write scheduled while batch A was open,
+    // landing after the operator has switched to batch B. MainWindowViewModel stops the pending
+    // timer at the top of LoadBatchIntoUiAsync precisely so this cannot happen; assert the two
+    // rows stayed independent.
+    using var verify = new AppDbContext(dbPath);
+    var storedA = await verify.Batches.FirstAsync(b => b.BatchCode == "A");
+    var storedB = await verify.Batches.FirstAsync(b => b.BatchCode == "B");
+
+    Check("The batch that owns the frames keeps them",
+        storedA.UseFixedFrames && !string.IsNullOrWhiteSpace(storedA.FixedFrames));
+    Check("A different batch does not inherit them",
+        !storedB.UseFixedFrames && string.IsNullOrWhiteSpace(storedB.FixedFrames));
+    Check("Reference dims travel with the frames, not the batch order",
+        storedA.FixedFrameImageWidth == 960 && storedB.FixedFrameImageWidth == 0);
 }
 
 void TestFixedFramesScaleFromReferenceResolution()

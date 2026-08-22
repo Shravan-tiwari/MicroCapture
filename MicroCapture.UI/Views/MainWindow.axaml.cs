@@ -7,6 +7,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using System.Windows.Input;
+using MicroCapture.UI.Controls;
 using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
@@ -28,89 +29,26 @@ public partial class MainWindow : Window
 
     private void OnDataContextChanged(object? sender, EventArgs e)
     {
-        if (DataContext is MainWindowViewModel vm)
-        {
-            // Redrawn alongside every new live-view frame (~30fps while connected) — cheap
-            // (a handful of shapes) and means the overlay is never more than one frame stale
-            // after a (re)calibration, without needing a second change-tracking path.
-            vm.PropertyChanged += (_, ev) =>
-            {
-                if (ev.PropertyName is nameof(vm.LiveViewImage) or nameof(vm.CurrentFixedFrames))
-                    RenderFixedFrameOverlay();
-            };
-        }
+        var editor = this.FindControl<FixedFrameOverlayEditor>("FixedFrameOverlay");
+        if (editor == null) return;
+
+        // The editor owns pointer interaction; the view model owns the frame list and decides
+        // what an edit means for persistence and auto-capture. These two events are the whole
+        // seam between them.
+        editor.EditCommitted -= OnFrameEditCommitted;
+        editor.InteractionChanged -= OnFrameInteractionChanged;
+        editor.EditCommitted += OnFrameEditCommitted;
+        editor.InteractionChanged += OnFrameInteractionChanged;
     }
 
-    /// <summary>Draws a read-only outline of the active batch's calibrated fixed frames over
-    /// the live view, so the operator can position paper before pressing capture. The
-    /// calibration image and the live-view stream are commonly different resolutions (e.g.
-    /// MockCameraService's 3840x2160 capture vs. its 640x480 live feed), so frame rects are
-    /// projected in two steps: calibration pixels -&gt; fraction of that image, then fraction -&gt;
-    /// the live image's own displayed rect (accounting for Stretch="Uniform" letterboxing).</summary>
-    private void RenderFixedFrameOverlay()
+    private void OnFrameEditCommitted(object? sender, FrameEditKind kind)
     {
-        var canvas = this.FindControl<Canvas>("FixedFrameOverlayCanvas");
-        var container = this.FindControl<Grid>("LiveViewContainer");
-        if (canvas == null || container == null) return;
+        if (DataContext is MainWindowViewModel vm) vm.OnFrameEditCommitted(kind);
+    }
 
-        canvas.Children.Clear();
-        if (DataContext is not MainWindowViewModel vm) return;
-
-        var frames = vm.CurrentFixedFrames;
-        var liveImage = vm.LiveViewImage;
-        if (frames.Length == 0 || vm.CurrentFixedFrameImageWidth <= 0 || vm.CurrentFixedFrameImageHeight <= 0 || liveImage == null)
-            return;
-
-        var containerW = container.Bounds.Width;
-        var containerH = container.Bounds.Height;
-        var imgW = liveImage.Size.Width;
-        var imgH = liveImage.Size.Height;
-        if (containerW <= 0 || containerH <= 0 || imgW <= 0 || imgH <= 0) return;
-
-        var scale = Math.Min(containerW / imgW, containerH / imgH);
-        var dispW = imgW * scale;
-        var dispH = imgH * scale;
-        var offsetX = (containerW - dispW) / 2.0;
-        var offsetY = (containerH - dispH) / 2.0;
-
-        for (var i = 0; i < frames.Length; i++)
-        {
-            var f = frames[i];
-            var fx = f.X / vm.CurrentFixedFrameImageWidth;
-            var fy = f.Y / vm.CurrentFixedFrameImageHeight;
-            var fw = f.Width / vm.CurrentFixedFrameImageWidth;
-            var fh = f.Height / vm.CurrentFixedFrameImageHeight;
-
-            var left = offsetX + fx * dispW;
-            var top = offsetY + fy * dispH;
-            var width = Math.Max(0, fw * dispW);
-            var height = Math.Max(0, fh * dispH);
-            var color = FixedFrameColorPalette.GetColor(i);
-
-            var outline = new Rectangle
-            {
-                Width = width,
-                Height = height,
-                Stroke = new SolidColorBrush(color),
-                StrokeThickness = 2
-            };
-            Canvas.SetLeft(outline, left);
-            Canvas.SetTop(outline, top);
-            canvas.Children.Add(outline);
-
-            var label = new TextBlock
-            {
-                Text = (i + 1).ToString(),
-                Foreground = Brushes.White,
-                Background = new SolidColorBrush(color),
-                Padding = new Thickness(4, 1),
-                FontSize = 11,
-                FontWeight = FontWeight.SemiBold
-            };
-            Canvas.SetLeft(label, left + 3);
-            Canvas.SetTop(label, top + 3);
-            canvas.Children.Add(label);
-        }
+    private void OnFrameInteractionChanged(object? sender, bool interacting)
+    {
+        if (DataContext is MainWindowViewModel vm) vm.OnFrameInteractionChanged(interacting);
     }
 
     protected override void OnPointerPressed(Avalonia.Input.PointerPressedEventArgs e)
@@ -272,6 +210,14 @@ public partial class MainWindow : Window
                     break;
                 case Key.A:
                     vm.HandleKeyShortcut("A");
+                    e.Handled = true;
+                    break;
+                case Key.Delete:
+                case Key.Back:
+                    // Removes the selected fixed frame. Safe to claim unconditionally here: the
+                    // TextBox early-out above already protects text editing, which is the only
+                    // other thing in this window that wants these keys.
+                    vm.HandleKeyShortcut("Delete");
                     e.Handled = true;
                     break;
                 case Key.F2:
