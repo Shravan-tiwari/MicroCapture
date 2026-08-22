@@ -66,6 +66,8 @@ TestProcessFixedFramesProducesNOutputs();
 TestFixedFramesFallsBackToCalibratedRectOnFeaturelessImage();
 TestFixedFramesScaleFromReferenceResolution();
 TestFixedFramesZeroReferenceIsBackCompatible();
+TestCheckLiveRegionsDetectsPerRegionContentChange();
+TestCheckLiveRegionsSharpnessIsPerRegion();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
 TestDewarpControlPointsStayWithinPageBounds();
@@ -1287,6 +1289,99 @@ async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
 
     Check("Export produces one page per calibrated frame for the one capture — no BatchExportService changes needed",
         exportedFiles.Length == frames.Length);
+}
+
+/// <summary>Encodes a two-halves live-view-like frame: the left half filled with sharp black
+/// bars, the right half either sharp bars, blurred bars, or plain white — enough to drive the
+/// per-region focus and content-change assertions without needing a real camera.</summary>
+byte[] EncodeTwoRegionFrame(int width, int height, bool rightHasBars, bool rightBlurred, int rightBarOffset)
+{
+    using var bitmap = new SKBitmap(width, height);
+    using (var canvas = new SKCanvas(bitmap))
+    {
+        canvas.Clear(SKColors.White);
+        using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
+        // Left region: fixed sharp bars, identical in every generated frame.
+        for (var i = 0; i < 5; i++)
+            canvas.DrawRect(new SKRect(20, 20 + i * 24, width / 2 - 20, 32 + i * 24), paint);
+
+        if (rightHasBars)
+        {
+            using var rightPaint = new SKPaint
+            {
+                Color = SKColors.Black,
+                Style = SKPaintStyle.Fill,
+                IsAntialias = false,
+                // A large blur turns hard bar edges into gradients, collapsing the Laplacian
+                // variance the sharpness score is built on.
+                MaskFilter = rightBlurred ? SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 8f) : null
+            };
+            for (var i = 0; i < 5; i++)
+                canvas.DrawRect(new SKRect(width / 2 + 20, 20 + i * 24 + rightBarOffset, width - 20, 32 + i * 24 + rightBarOffset), rightPaint);
+        }
+    }
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    return data.ToArray();
+}
+
+void TestCheckLiveRegionsDetectsPerRegionContentChange()
+{
+    Console.WriteLine("\n-- CheckLiveRegions sees a content change confined to one region --");
+    const int w = 640, h = 480;
+    // Left half and right half, as fractions — the same shape the VM passes for its frames.
+    var regions = new[]
+    {
+        new FixedFrameRect(0.0, 0.0, 0.5, 1.0),
+        new FixedFrameRect(0.5, 0.0, 0.5, 1.0)
+    };
+
+    var baseline = ImageProcessor.CheckLiveRegions(EncodeTwoRegionFrame(w, h, true, false, 0), regions);
+    var unchanged = ImageProcessor.CheckLiveRegions(EncodeTwoRegionFrame(w, h, true, false, 0), regions);
+    // Only the RIGHT region's content moves; the left half is pixel-identical.
+    var rightChanged = ImageProcessor.CheckLiveRegions(EncodeTwoRegionFrame(w, h, true, false, 40), regions);
+
+    Check("CheckLiveRegions decodes and returns one result per region",
+        baseline.Decoded && baseline.Regions.Length == regions.Length);
+
+    if (baseline.Decoded && unchanged.Decoded && rightChanged.Decoded)
+    {
+        Check("An identical frame produces an identical signature per region",
+            baseline.Regions[0].ContentSignature!.SequenceEqual(unchanged.Regions[0].ContentSignature!) &&
+            baseline.Regions[1].ContentSignature!.SequenceEqual(unchanged.Regions[1].ContentSignature!));
+
+        Check("The untouched region's signature is unchanged when only the other region moves",
+            baseline.Regions[0].ContentSignature!.SequenceEqual(rightChanged.Regions[0].ContentSignature!));
+
+        Check("The changed region's signature differs — a page turn in one frame is detectable",
+            !baseline.Regions[1].ContentSignature!.SequenceEqual(rightChanged.Regions[1].ContentSignature!));
+    }
+}
+
+void TestCheckLiveRegionsSharpnessIsPerRegion()
+{
+    Console.WriteLine("\n-- CheckLiveRegions scores focus per region, not over the whole frame --");
+    const int w = 640, h = 480;
+    var regions = new[]
+    {
+        new FixedFrameRect(0.0, 0.0, 0.5, 1.0),
+        new FixedFrameRect(0.5, 0.0, 0.5, 1.0)
+    };
+
+    // Sharp bars on the left, heavily blurred bars on the right, in ONE frame. A whole-image
+    // Laplacian would score both regions the same and let the blurred frame pass the focus gate.
+    var mixed = ImageProcessor.CheckLiveRegions(EncodeTwoRegionFrame(w, h, true, true, 0), regions);
+
+    Check("Mixed-focus frame decodes into two region results", mixed.Decoded && mixed.Regions.Length == 2);
+    if (mixed.Decoded && mixed.Regions.Length == 2)
+    {
+        var sharp = mixed.Regions[0].Sharpness;
+        var blurry = mixed.Regions[1].Sharpness;
+        Check("The sharp region scores substantially higher than the blurred one in the same frame",
+            sharp > blurry * 2.0 && blurry >= 0);
+        if (!(sharp > blurry * 2.0))
+            Console.WriteLine($"   sharp={sharp:F1} blurry={blurry:F1}");
+    }
 }
 
 void TestFixedFramesScaleFromReferenceResolution()

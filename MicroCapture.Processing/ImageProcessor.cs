@@ -73,6 +73,20 @@ public readonly record struct LiveFrameCheck(bool Detected, int X, int Y, int Wi
     public static readonly LiveFrameCheck None = default;
 }
 
+/// <summary>One fixed frame's live-view measurement: how in-focus that region is, and a 24x24
+/// grayscale content signature of it (same convention as <see cref="LiveFrameCheck"/>, so the
+/// caller's content-difference comparison carries over unchanged). A zeroed value means the
+/// region was degenerate or off-image and should be treated as "no information".</summary>
+public readonly record struct RegionCheck(double Sharpness, byte[]? ContentSignature);
+
+/// <summary>Result of measuring every fixed frame against one live-view frame — see
+/// <see cref="ImageProcessor.CheckLiveRegions"/>. <see cref="Regions"/> is index-aligned with
+/// the regions passed in, so a caller can map results straight back onto its frame list.</summary>
+public readonly record struct LiveRegionsCheck(bool Decoded, int ImageWidth, int ImageHeight, RegionCheck[] Regions)
+{
+    public static readonly LiveRegionsCheck None = default;
+}
+
 /// <summary>
 /// Core image processing pipeline: auto-crop, deskew, perspective correction,
 /// enhancement, and QC scoring. All operations preserve the original file.
@@ -441,6 +455,85 @@ public partial class ImageProcessor
             // Live-view analysis is advisory. A decoding/native failure must never
             // interrupt the stream or turn an operator capture into a crash.
             return LiveFrameCheck.None;
+        }
+    }
+
+    /// <summary>Per-region live-view check driving auto-capture in fixed-frame mode. Unlike
+    /// <see cref="CheckLiveFrame"/> there is deliberately NO boundary/contour requirement: the
+    /// operator's drawn frames already ARE the region of interest, and a frame may legitimately
+    /// cover a sub-region with no clean detectable edge at all. So this only measures, per
+    /// region, how sharp it is and what its content looks like.
+    ///
+    /// <para>Sharpness is computed over each region's own sub-image rather than the whole frame
+    /// (which is what <see cref="CheckLiveFrame"/> does) — otherwise one out-of-focus frame
+    /// sitting beside a sharp one would pass the focus gate on the sharp one's score.</para>
+    ///
+    /// <para>Regions are given as FRACTIONS of the frame (0..1), not pixels, so the caller never
+    /// has to know the live stream's pixel dimensions — which differ from the space its frames
+    /// are stored in whenever a batch was calibrated at full resolution — and so a stream that
+    /// changes resolution mid-session degrades gracefully instead of silently misaligning.</para>
+    ///
+    /// <para>Signatures use the same 24x24 grayscale convention as <see cref="CheckLiveFrame"/>,
+    /// so the caller's existing content-difference comparison and its threshold carry over
+    /// unchanged.</para></summary>
+    public static LiveRegionsCheck CheckLiveRegions(byte[] encodedImage, FixedFrameRect[] regionFractions)
+    {
+        try
+        {
+            if (regionFractions.Length == 0) return LiveRegionsCheck.None;
+
+            using var image = Cv2.ImDecode(encodedImage, ImreadModes.Grayscale);
+            if (image.Empty()) return LiveRegionsCheck.None;
+
+            var regions = new RegionCheck[regionFractions.Length];
+            for (var i = 0; i < regionFractions.Length; i++)
+            {
+                regions[i] = MeasureRegion(image, regionFractions[i]);
+            }
+
+            return new LiveRegionsCheck(true, image.Width, image.Height, regions);
+        }
+        catch
+        {
+            // Same advisory contract as CheckLiveFrame — never interrupt the live stream.
+            return LiveRegionsCheck.None;
+        }
+    }
+
+    /// <summary>Measures one fractional sub-region's focus and content signature. A degenerate
+    /// or off-image region yields a zeroed <see cref="RegionCheck"/> rather than throwing, so
+    /// one bad frame can't blind the caller to the others.</summary>
+    private static RegionCheck MeasureRegion(Mat image, FixedFrameRect fraction)
+    {
+        try
+        {
+            var x = (int)Math.Round(fraction.X * image.Width);
+            var y = (int)Math.Round(fraction.Y * image.Height);
+            var w = (int)Math.Round(fraction.Width * image.Width);
+            var h = (int)Math.Round(fraction.Height * image.Height);
+
+            var safeX = Math.Clamp(x, 0, Math.Max(0, image.Width - 1));
+            var safeY = Math.Clamp(y, 0, Math.Max(0, image.Height - 1));
+            var safeW = Math.Clamp(w, 1, image.Width - safeX);
+            var safeH = Math.Clamp(h, 1, image.Height - safeY);
+            if (safeW < 2 || safeH < 2) return default;
+
+            using var region = new Mat(image, new Rect(safeX, safeY, safeW, safeH));
+
+            using var laplacian = new Mat();
+            Cv2.Laplacian(region, laplacian, MatType.CV_64F);
+            Cv2.MeanStdDev(laplacian, out _, out var stddev);
+            var sharpness = stddev.Val0 * stddev.Val0;
+
+            using var thumb = new Mat();
+            Cv2.Resize(region, thumb, new Size(24, 24), 0, 0, InterpolationFlags.Area);
+            thumb.GetArray(out byte[] pixels);
+
+            return new RegionCheck(sharpness, pixels);
+        }
+        catch
+        {
+            return default;
         }
     }
 
