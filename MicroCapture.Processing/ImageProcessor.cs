@@ -545,7 +545,7 @@ public partial class ImageProcessor
     /// Run the full processing pipeline on a captured image.
     /// Original file is never modified. A processed derivative is created.
     /// </summary>
-    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, double measuredDpi = BaselineDpi, string captureFormat = "TIFF")
+    public ProcessingResult Process(string inputPath, string outputDirectory, bool splitPages = false, bool manualOverride = false, string? leftCrop = null, string? rightCrop = null, TiffMetadata? metadata = null, bool dewarpEnabled = false, string? dewarpCurve = null, bool dewarpManualOverride = false, bool binarizeEnabled = false, LensCalibration? lensCalibration = null, bool bleedthroughEnabled = false, bool hasManualAdjustments = false, int rotationDegrees = 0, bool flipHorizontal = false, bool flipVertical = false, double brightness = 0, double contrast = 0, double saturation = 0, double sharpness = 0, double whiteBalance = 0, double measuredDpi = BaselineDpi, string captureFormat = "TIFF", string? outputFileNameOverride = null)
     {
         var result = new ProcessingResult { OriginalFilePath = inputPath };
         var meta = metadata ?? TiffMetadata.Default;
@@ -717,7 +717,20 @@ public partial class ImageProcessor
                 var processed = ProcessSinglePage(manualCrop ?? src, result, manualOverride, dewarpEnabled, savedDewarp, dewarpManualOverride, binarizeEnabled: binarizeEnabled, dpi: meta.Dpi, measuredDpi: measuredDpi, bleedthroughEnabled: bleedthroughEnabled, hasManualAdjustments: hasManualAdjustments, rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal, flipVertical: flipVertical, brightness: brightness, contrast: contrast, saturation: saturation, sharpness: sharpness, whiteBalance: whiteBalance);
                 manualCrop?.Dispose();
 
-                var outPath = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath), processed, meta, result.WasBinarized, captureFormat, singlePageInputPath: inputPath);
+                // outputFileNameOverride lets a caller force a distinct output basename when
+                // several jobs share the same inputPath (one fixed-frame source image processed
+                // as N independent per-frame jobs — see MainWindowViewModel.CaptureAsync).
+                // WritePageOutput's singlePageInputPath collision-avoidance naming derives its
+                // name purely from inputPath, so without this override every sibling frame job
+                // computes the exact same output filename and overwrites the previous frame's
+                // output — leaving only the last-processed frame's image behind under every page
+                // number (confirmed operator-visible bug: N distinct frames captured, exported
+                // PDF repeats one image N times). Passing the override skips that inputPath-based
+                // naming entirely in favor of the override name, which the caller has already
+                // made unique per frame.
+                var outPath = outputFileNameOverride != null
+                    ? WritePageOutput(outputDirectory, outputFileNameOverride, processed, meta, result.WasBinarized, captureFormat)
+                    : WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath), processed, meta, result.WasBinarized, captureFormat, singlePageInputPath: inputPath);
                 result.OutputFilePaths.Add(outPath);
                 result.Success = true;
                 processed.Dispose();

@@ -132,9 +132,20 @@ public class BackgroundProcessingWorker
                         measuredDpi = ImageProcessor.BaselineDpi;
                     }
                     bool bleedthroughEnabled = job.Batch?.BleedthroughEnabled ?? false;
+                    // Several sibling per-frame jobs can share the same OriginalFilePath (see
+                    // ManualOverrideApplied's own doc comment) — Process()'s default single-page
+                    // output naming derives its filename purely from OriginalFilePath, so those
+                    // siblings would otherwise all write the same output filename and overwrite
+                    // each other, leaving only the last-processed frame's image behind under
+                    // every page number. A page-number-based override keeps each job's output
+                    // distinct; harmless for an ordinary hand-cropped page too, since its
+                    // OriginalFilePath is already unique on its own.
+                    var outputNameOverride = job.ManualOverrideApplied && !splitPages
+                        ? $"{Path.GetFileNameWithoutExtension(job.OriginalFilePath)}_p{job.PageNumber:D6}"
+                        : null;
                     var result = useFixedFrames
                         ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, frameReferenceWidth: job.Batch!.FixedFrameImageWidth, frameReferenceHeight: job.Batch!.FixedFrameImageHeight, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat);
+                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat, outputFileNameOverride: outputNameOverride);
                     // Stamped so JobCompleted's UI handler can match the one thumbnail this
                     // result is for — several sibling jobs (one per fixed frame) can share the
                     // same OriginalFilePath, so that alone is no longer a unique key.
