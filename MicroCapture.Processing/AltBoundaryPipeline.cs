@@ -949,6 +949,47 @@ public partial class ImageProcessor
         return new SignChangeProfile(signChanges, valid);
     }
 
+    /// <summary>Per-column median grayscale brightness within the page's already-known vertical
+    /// extent (same trimmed top/bottom band as <see cref="ComputeSignChangeProfile"/>) — real
+    /// page columns are bright paper, black background scores much lower. Port of Cell 6A's
+    /// `page_brightness`/`page_height` computation (the notebook's DIAGNOSTIC/BASELINE side-edge
+    /// detector, not Method 4 — see that cell's own doc comment). Confirmed as the more reliable
+    /// signal on a real capture where Method 4's Gx sign-change count was thrown off by a
+    /// high-contrast full-bleed photo on the page (lots of internal edges reading as "text-like"
+    /// alternation across most of the frame, collapsing the sign-change mask to ~everything
+    /// being "page" and the span detection to the full image width) — brightness stays a
+    /// reliable page-vs-background signal regardless of how busy the page content is.</summary>
+    public static SignChangeProfile ComputeBrightnessProfile(Mat gray, double[] topY, double[] botY)
+    {
+        var w = gray.Cols;
+        var h = gray.Rows;
+        gray.GetArray(out byte[] grayFlat);
+
+        var brightness = new float[w];
+        var valid = new bool[w];
+
+        for (var x = 0; x < w; x++)
+        {
+            var top = Math.Clamp((int)topY[x], 0, h - 1);
+            var bot = Math.Clamp((int)botY[x], 0, h);
+            if (bot <= top + 10) continue;
+            var hgt = bot - top;
+            var trim = Math.Max(3, (int)(hgt * 0.10));
+            var y1 = top + trim;
+            var y2 = bot - trim;
+            if (y2 <= y1) continue;
+
+            var slice = new byte[y2 - y1];
+            for (var y = y1; y < y2; y++) slice[y - y1] = grayFlat[y * w + x];
+            Array.Sort(slice);
+            var mid = slice.Length / 2;
+            brightness[x] = slice.Length % 2 == 0 ? (slice[mid - 1] + slice[mid]) / 2f : slice[mid];
+            valid[x] = hgt > 20;
+        }
+
+        return new SignChangeProfile(brightness, valid);
+    }
+
     /// <summary>Otsu threshold on the valid portion of an arbitrary scalar per-column profile —
     /// works on any profile, not just brightness (Method 4 applies this to the sign-change
     /// count). Port of the notebook's `otsu_split`: scales the valid values into 0-255,
@@ -1178,6 +1219,19 @@ public partial class ImageProcessor
         var ransacRowHi = rowTop + (int)((rowBot - rowTop) * 0.85);
         var colLo = Math.Max(0, bookX - margin);
         var colHi = Math.Min(w, bookX + margin);
+        // Guard against a degenerate/inverted window: bookX sitting exactly at (or a shrunk
+        // retry margin collapsing near) the image edge can make colLo >= colHi, which crashes
+        // every downstream Math.Clamp(x, colLo, colHi-1) call. Confirmed on a real fixture
+        // (IMG_0021, book-curve): DetectBrightnessSpan legitimately returned bookXHi == w (the
+        // page's bright content runs flush to the frame's right edge), and the widen-retry loop
+        // then set rightMargin = Math.Min(w - bookXHi, ...) = 0, producing colLo == colHi == w.
+        // Force at least a 1px window rather than crash — pull colLo back if colHi is pinned at
+        // the image edge with no room to grow forward.
+        if (colHi <= colLo)
+        {
+            colHi = Math.Min(w, colLo + 1);
+            colLo = Math.Max(0, colHi - 1);
+        }
 
         var diagramMask = DetectDiagramLineMask(gray, rowTop, rowBot, colLo, colHi);
         // diagramMask is indexed relative to rowTop (length rowBot-rowTop); the RANSAC sampling
@@ -1191,7 +1245,12 @@ public partial class ImageProcessor
         {
             var seedRow = (rowTop + rowBot) / 2;
             seedX = (int)Math.Round(gm * seedRow + gb);
-            seedX = Math.Clamp(seedX, bookX - margin, bookX + margin - 1);
+            // Clamp against the same (possibly edge-corrected) colLo/colHi computed above, not
+            // the raw bookX +/- margin window — that raw window has the identical degenerate
+            // case this method's own guard above just fixed (bookX at the image edge with a
+            // near-zero margin), and using it here instead would just move the same crash down
+            // two lines.
+            seedX = Math.Clamp(seedX, colLo, colHi - 1);
         }
 
         var raw = TraceSideEdgeGx(gx, rowTop, rowBot, seedX, colLo, colHi, guide.Slope, guide.Intercept);
@@ -1419,27 +1478,75 @@ public partial class ImageProcessor
         return result;
     }
 
+    /// <summary>Cell 6A's book-span detector: per-column median brightness, Otsu-split into a
+    /// page mask, widest-merged-run wins (no gutter anchoring — Cell 6A never had a gutter
+    /// parameter; this is the notebook's own selection rule for this detector, not an adaptation
+    /// of Method 4's gutter-anchored walk). Port of Cell 6A's steps 4-10 (search
+    /// "page_brightness"/"Otsu page-brightness threshold" in the notebook).
+    ///
+    /// Promoted from diagnostic-only to a real fallback after Method 4's sign-change signal was
+    /// confirmed to fail on a real capture (a high-contrast full-bleed photo on the page produced
+    /// enough Gx sign alternation to read as "text-like" across nearly the whole frame, collapsing
+    /// Method 4's span to the full image width — reproduced identically in the notebook itself on
+    /// the same photo, ruling out a platform-specific C#/OpenCV divergence). Brightness remains a
+    /// reliable page-vs-background signal on that same photo since busy content doesn't change how
+    /// bright the paper itself is — this is the OPPOSITE of Cell 6A's own previously-documented
+    /// failure mode (a dark on-page photo reading as background to brightness alone), so neither
+    /// detector is strictly better; each covers the other's weak spot.</summary>
+    public static (int Lo, int Hi)? DetectBrightnessSpan(Mat gray, double[] topY, double[] botY, int w)
+    {
+        var profile = ComputeBrightnessProfile(gray, topY, botY);
+        double threshold;
+        try { threshold = OtsuSplit(profile.SignChanges, profile.Valid); }
+        catch (InvalidOperationException ex)
+        {
+            if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+                Console.WriteLine($"DEBUG DetectBrightnessSpan: OtsuSplit threw: {ex.Message}");
+            return null;
+        }
+
+        var mask = new bool[w];
+        for (var x = 0; x < w; x++) mask[x] = profile.Valid[x] && profile.SignChanges[x] >= threshold;
+        mask = CleanMask1D(mask, w);
+
+        var result = FindBookSpan(mask, w, gutterX: null);
+
+        if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+        {
+            var maskCount = 0;
+            for (var x = 0; x < w; x++) if (mask[x]) maskCount++;
+            Console.WriteLine($"DEBUG DetectBrightnessSpan: w={w} otsuThreshold={threshold:F3} maskCountAfterClean={maskCount} result={(result is { } r ? $"({r.Lo},{r.Hi})" : "null")}");
+        }
+
+        return result;
+    }
+
     /// <summary>Full Method 4 side-boundary detection for a spread OR a genuine single page:
-    /// span detection + RANSAC-guided walk + bridging + widen-retry for both sides, returning
-    /// the same <see cref="AltSideEdgeTrace"/> shape <see cref="AltTraceSideEdge"/> (Cell 6A)
-    /// produces so it drops directly into <see cref="AltDetectSpreadBoundary"/>/
+    /// span detection (Cell 6A's brightness-Otsu, via <see cref="DetectBrightnessSpan"/> — see
+    /// that method's doc comment for why span detection uses brightness rather than Method 4's
+    /// own Gx sign-change signal) + RANSAC-guided walk + bridging + widen-retry for both sides,
+    /// returning the same <see cref="AltSideEdgeTrace"/> shape <see cref="AltTraceSideEdge"/>
+    /// (Cell 6A) produces so it drops directly into <see cref="AltDetectSpreadBoundary"/>/
     /// <see cref="AltFlattenSinglePage"/> in its place.
-    /// <paramref name="gutterSeedColumn"/> is always used for the symmetry check's own
-    /// gutter-distance reference (a left/right-vs-center comparison is a reasonable symmetry
-    /// gate for either a real spread or a single page — the notebook uses the same
-    /// `gutter_x_global - left_cut` for both). <paramref name="hasRealGutter"/> controls ONLY
-    /// whether <see cref="DetectMethod4Span"/>'s span search itself is anchored there (true — a
-    /// real spread, where a text-block gap/shadow really does separate the two pages at that
-    /// column) or falls back to widest-run (false — a genuine single page, where anchoring a fake
-    /// center "gutter" risks locking onto an interior text blob instead of the true page
-    /// extent — see <see cref="DetectMethod4Span"/>'s own doc comment for the confirmed failure
-    /// this avoids).</summary>
+    /// <paramref name="gutterSeedColumn"/> is used for the symmetry check's own gutter-distance
+    /// reference (a left/right-vs-center comparison is a reasonable symmetry gate for either a
+    /// real spread or a single page — the notebook uses the same `gutter_x_global - left_cut`
+    /// for both). Unlike Method 4's own span detector, <see cref="DetectBrightnessSpan"/> never
+    /// anchors on the gutter (Cell 6A has no gutter concept at all — plain widest-run), so there
+    /// is no separate has-a-real-gutter distinction to make for the span step here.</summary>
     public readonly record struct Method4Result(AltSideEdgeTrace Left, AltSideEdgeTrace Right, int BookXLo, int BookXHi, bool SpanFound);
 
-    public Method4Result AltTraceSideEdgeMethod4Pair(Mat img, Mat gray, Mat gx, double[] topY, double[] botY, int gutterSeedColumn, bool hasRealGutter = true)
+    public Method4Result AltTraceSideEdgeMethod4Pair(Mat img, Mat gray, Mat gx, double[] topY, double[] botY, int gutterSeedColumn)
     {
         var w = img.Cols;
-        var span = DetectMethod4Span(gx, topY, botY, hasRealGutter ? gutterSeedColumn : null, w);
+        // Span detection now uses Cell 6A's brightness-Otsu signal (DetectBrightnessSpan), not
+        // Method 4's own Gx sign-change signal (DetectMethod4Span, kept below for reference but
+        // no longer called here) — confirmed on a real capture, reproduced identically in the
+        // notebook itself, that a high-contrast full-bleed photo on the page makes the
+        // sign-change count read as "text-like" across nearly the entire frame, collapsing the
+        // span to the full image width and leaving black background/binding uncropped in the
+        // final output. See DetectBrightnessSpan's own doc comment for the full trade-off.
+        var span = DetectBrightnessSpan(gray, topY, botY, w);
         if (span is not { } s)
         {
             // No span detected — mirror the notebook's own "skip edge trace" fallback by
@@ -1614,7 +1721,7 @@ public partial class ImageProcessor
 
         // Method 4 runs on the BRIDGED (pre-Sav-Gol) curves, not the smoothed ones — see
         // AltDetectSpreadBoundary's matching remark on its own Method 4 call for why.
-        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topBridged, bottomBridged, img.Cols / 2, hasRealGutter: false);
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topBridged, bottomBridged, img.Cols / 2);
 
         return new AltSinglePageBoundary(topRaw, topBridged, topSmooth, bottomRaw, bottomBridged, bottomSmooth, method4.Left, method4.Right, topBridgedCount, bottomBridgedCount);
     }
