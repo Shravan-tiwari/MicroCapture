@@ -38,6 +38,10 @@ namespace MicroCapture.Core.Migrations
                     b.Property<bool>("DewarpEnabled")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("DeviceId")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
                     b.Property<int>("Dpi")
                         .HasColumnType("INTEGER");
 
@@ -91,6 +95,8 @@ namespace MicroCapture.Core.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("CameraCalibrationId");
+
+                    b.HasIndex("DeviceId");
 
                     b.HasIndex("ProjectId");
 

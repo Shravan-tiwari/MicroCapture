@@ -12,8 +12,10 @@
             <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
                     BorderThickness="1" Margin="14" CornerRadius="10" ClipToBounds="True">
                 <Grid Name="ContainerGrid">
+                    <!-- Crop mode: show live preview of current crop shape, not the full original image.
+                         This way the operator sees exactly what they're about to save at full size. -->
                     <Image Name="TargetImage"
-                           Source="{Binding Image}"
+                           Source="{Binding PreviewImage}"
                            IsVisible="{Binding ShowFullSpreadTarget}"
                            Stretch="Uniform"
                            HorizontalAlignment="Center"

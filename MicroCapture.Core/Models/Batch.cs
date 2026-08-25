@@ -13,6 +13,7 @@ public class Batch
     public string Status { get; set; } = "Active"; // Active, Completed, Exported
     public DateTime StartTime { get; set; } = DateTime.UtcNow;
     public DateTime? EndTime { get; set; }
+    public string DeviceId { get; set; } = Environment.MachineName;
     
     public bool SplitBookPages { get; set; } = false;
 

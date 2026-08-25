@@ -950,17 +950,20 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!IsConnected) { StatusText = "Camera not connected"; return; }
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
-        PageCount++;
+        var frameCount = Frames.Count;
+        PageCount += frameCount > 0 ? frameCount : 1;
         var pageStr = PageCount.ToString("D6");
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}";
 
-        StatusText = $"Capturing page {pageStr}...";
+        StatusText = $"Capturing page{(frameCount > 0 ? "s" : "")} ...";
         try
         {
             Directory.CreateDirectory(_outputDirectory);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
 
-            // Record in durable queue
+            // Record in durable queue — when using fixed frames, one capture button press creates
+            // one job, but ProcessFixedFrames will output multiple files (one per frame). Increment
+            // PageCount by frameCount so the pages are numbered correctly for the frame set.
             var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
             // A job is now queued under the current geometry — lock frame editing until it lands.
             _ = RefreshFrameEditPermissionAsync();
@@ -973,7 +976,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
-            StatusText = $"Page {pageStr} captured — {Path.GetFileName(filePath)}";
+            StatusText = $"Page{(frameCount > 0 ? "s" : "")} captured — {Path.GetFileName(filePath)}";
         }
         catch (Exception ex)
         {
@@ -994,19 +997,24 @@ public partial class MainWindowViewModel : ViewModelBase
         if (ActiveCropReview != null) { StatusText = "Finish or cancel crop review before capturing."; return; }
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
-        var pageStr = PageCount.ToString("D6");
-        var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}_R";
+        var frameCount = GetCurrentFixedFrameCount();
+        var firstPageInSet = PageCount - frameCount + 1;
+        var pageStr = frameCount > 0 ? $"{firstPageInSet}-{PageCount}" : PageCount.ToString("D6");
+        var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{firstPageInSet.ToString("D6")}_R";
 
-        StatusText = $"Recapturing page {pageStr}...";
+        StatusText = $"Recapturing page{(frameCount > 0 ? "s" : "")} {pageStr}...";
         try
         {
-            await _queueService.SupersedePageAsync(_currentBatchId, PageCount);
+            // Supersede all pages in this frame set
+            for (var p = firstPageInSet; p <= PageCount; p++)
+                await _queueService.SupersedePageAsync(_currentBatchId, p);
+
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
             var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
             _ = RefreshFrameEditPermissionAsync();
 
-            // Update thumbnail for the recaptured page
-            var existing = RecentCaptures.Where(t => t.PageNumber == PageCount).ToList();
+            // Update thumbnails for the recaptured pages
+            var existing = RecentCaptures.Where(t => t.PageNumber >= firstPageInSet && t.PageNumber <= PageCount).ToList();
             foreach (var thumbnail in existing)
             {
                 thumbnail.Thumbnail?.Dispose();
@@ -1017,7 +1025,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
-            StatusText = $"Page {pageStr} recaptured";
+            StatusText = $"Page{(frameCount > 0 ? "s" : "")} {pageStr} recaptured";
         }
         catch (Exception ex)
         {
