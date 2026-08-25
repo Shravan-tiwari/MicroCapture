@@ -46,6 +46,7 @@ public class BatchExportService
         var batch = await _dbContext.Batches
             .AsNoTracking()
             .Include(b => b.Captures)
+            .Include(b => b.WatermarkPreset)
             .FirstOrDefaultAsync(b => b.Id == batchId);
 
         if (batch == null)
@@ -102,6 +103,10 @@ public class BatchExportService
                         using var canvas = document.BeginPage(bitmap.Width, bitmap.Height);
                         canvas.DrawBitmap(bitmap, 0, 0, SKSamplingOptions.Default);
                         DrawSearchText(canvas, f);
+                        // Watermark is drawn last so it stays the topmost layer on the page —
+                        // PDF only, per the feature's current scope (see WatermarkRenderer).
+                        if (batch.WatermarkEnabled && batch.WatermarkPreset != null)
+                            WatermarkRenderer.Draw(canvas, bitmap, batch.WatermarkPreset);
                         document.EndPage();
                     }
                     job.ExportStatus = "Completed";
@@ -290,7 +295,7 @@ public class BatchExportService
     ///    batches processed before this change, whose derivatives still live there and were never
     ///    moved.
     /// 4. <see cref="CaptureJob.OriginalFilePath"/> itself, if nothing else was found.</summary>
-    internal static List<string> GetProcessedFilesForJob(CaptureJob job)
+    public static List<string> GetProcessedFilesForJob(CaptureJob job)
     {
         // Tier 1: the exact recorded path(s), if this job has them and they still exist.
         if (!string.IsNullOrWhiteSpace(job.ProcessedFilePath))

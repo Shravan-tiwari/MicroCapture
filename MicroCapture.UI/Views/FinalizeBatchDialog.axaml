@@ -53,6 +53,23 @@
                           ToolTip.Tip="Embeds a near-invisible OCR text layer so the PDF's text is selectable/searchable. Runs OCR on any page that doesn't have it yet, which can take a while for a large batch."
                           Foreground="{StaticResource InkMutedBrush}"/>
 
+                <StackPanel Spacing="6" IsVisible="{Binding IsPdfFormat}">
+                    <CheckBox IsChecked="{Binding WatermarkEnabled}" Content="Watermark"
+                              ToolTip.Tip="Burns the selected watermark preset into every exported PDF page."
+                              Foreground="{StaticResource InkMutedBrush}"/>
+                    <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding WatermarkEnabled}">
+                        <ComboBox ItemsSource="{Binding WatermarkPresets}" SelectedItem="{Binding SelectedWatermarkPreset}" Width="160">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}"/>
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+                        <Button Content="Edit Watermark…" Classes="secondary"
+                                Command="{Binding EditWatermarkCommand}" CommandParameter="{Binding $parent[Window]}"/>
+                    </StackPanel>
+                </StackPanel>
+
                 <StackPanel Spacing="6">
                     <TextBlock Text="FILE NAME" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
                     <TextBox Text="{Binding FileName}" Background="{StaticResource Surface2Brush}"

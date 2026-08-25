@@ -68,6 +68,19 @@ public class Batch
     public string? CameraCalibrationId { get; set; }
     public CameraCalibration? CameraCalibration { get; set; }
 
+    // Whether a watermark should be burned into this batch's exported PDF pages at
+    // Finalize/Export time — kept independent of WatermarkPresetId so an operator can pick a
+    // preset ahead of time and still switch watermarking off for one particular export,
+    // mirroring DewarpEnabled/BinarizeEnabled/BleedthroughEnabled's "toggle independent of
+    // configuration" shape.
+    public bool WatermarkEnabled { get; set; } = false;
+
+    // Live reference to the chosen WatermarkPreset — intentionally NOT snapshotted at Start
+    // Batch, see WatermarkPreset's own doc comment. Null means no preset chosen yet, or the
+    // previously-chosen preset was deleted (WatermarkPresetId is set null, not cascaded).
+    public string? WatermarkPresetId { get; set; }
+    public WatermarkPreset? WatermarkPreset { get; set; }
+
     public Project? Project { get; set; }
     public ICollection<CaptureJob> Captures { get; set; } = new List<CaptureJob>();
 }

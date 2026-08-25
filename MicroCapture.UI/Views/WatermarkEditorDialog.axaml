@@ -1,0 +1,80 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        xmlns:controls="using:MicroCapture.UI.Controls"
+        x:Class="MicroCapture.UI.Views.WatermarkEditorDialog"
+        Title="Edit Watermark"
+        Icon="/Assets/microcapture-icon.png"
+        Width="900" Height="640"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource CanvasBrush}">
+    <Border Classes="panel" Margin="18" Padding="20">
+        <Grid RowDefinitions="Auto, *, Auto, Auto" ColumnDefinitions="2*, 1*">
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Text="EDIT WATERMARK"
+                       Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+
+            <!-- Live preview + drag/resize/rotate overlay -->
+            <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource Surface2Brush}" CornerRadius="8"
+                    Margin="0,0,10,0" ClipToBounds="True">
+                <Panel>
+                    <Image Source="{Binding PreviewImage}" Stretch="Uniform"/>
+                    <controls:WatermarkOverlayEditor
+                        Transform="{Binding Transform, Mode=TwoWay}"
+                        PageImageSize="{Binding PageImageSize}"
+                        WatermarkType="{Binding WatermarkType}"
+                        TextContent="{Binding TextContent}"
+                        LogoBitmap="{Binding LogoPreviewBitmap}"
+                        WatermarkOpacity="{Binding Opacity}"
+                        IsEditingEnabled="True"/>
+                </Panel>
+            </Border>
+
+            <!-- Watermark options -->
+            <StackPanel Grid.Row="1" Grid.Column="1" Spacing="14">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="PRESET NAME" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding PresetName}" Background="{StaticResource Surface2Brush}"
+                             Foreground="{StaticResource InkBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="TYPE" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <ComboBox ItemsSource="{Binding WatermarkTypes}" SelectedItem="{Binding WatermarkType}" HorizontalAlignment="Stretch"/>
+                </StackPanel>
+
+                <StackPanel Spacing="6" IsVisible="{Binding IsTextMode}">
+                    <TextBlock Text="TEXT" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding TextContent}" AcceptsReturn="False" Background="{StaticResource Surface2Brush}"
+                             Foreground="{StaticResource InkBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <TextBlock Text="COLOR (#RRGGBB)" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" Margin="0,6,0,0"/>
+                    <TextBox Text="{Binding TextColor}" Background="{StaticResource Surface2Brush}"
+                             Foreground="{StaticResource InkBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                </StackPanel>
+
+                <StackPanel Spacing="6" IsVisible="{Binding IsLogoMode}">
+                    <TextBlock Text="LOGO" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <Border Width="120" Height="80" Background="{StaticResource Surface2Brush}" CornerRadius="6" HorizontalAlignment="Left">
+                        <Image Source="{Binding LogoPreviewBitmap}" Stretch="Uniform" Margin="6"/>
+                    </Border>
+                    <Button Content="Choose Image…" Classes="secondary" HorizontalAlignment="Stretch"
+                            Command="{Binding PickLogoFileCommand}" CommandParameter="{Binding $parent[Window]}"/>
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="OPACITY" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <Slider Minimum="0" Maximum="1" Value="{Binding Opacity}"/>
+                </StackPanel>
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding StatusText}"
+                       TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,14,0,0"/>
+
+            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal"
+                        HorizontalAlignment="Right" Margin="0,14,0,0" Spacing="10">
+                <Button Content="Cancel" Classes="secondary" Command="{Binding CancelCommand}"/>
+                <Button Content="Save" Classes="primary" Command="{Binding SaveCommand}"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

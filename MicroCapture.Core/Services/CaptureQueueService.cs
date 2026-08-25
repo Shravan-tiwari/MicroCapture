@@ -90,6 +90,43 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "ProcessedFilePath", "TEXT NULL");
         EnsureColumn("CaptureJobs", "CaptureFormat", "TEXT NOT NULL DEFAULT 'TIFF'");
         EnsureColumn("CaptureJobs", "Dpi", "INTEGER NOT NULL DEFAULT 150");
+        // WatermarkPresets is a brand-new table, same situation as CameraCalibrations above.
+        EnsureWatermarkPresetsTable();
+        EnsureColumn("Batches", "WatermarkEnabled", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("Batches", "WatermarkPresetId", "TEXT NULL");
+    }
+
+    private void EnsureWatermarkPresetsTable()
+    {
+        var connection = _dbContext.Database.GetDbConnection();
+        var wasClosed = connection.State != System.Data.ConnectionState.Open;
+        if (wasClosed) connection.Open();
+        try
+        {
+            using var create = connection.CreateCommand();
+            create.CommandText =
+                "CREATE TABLE IF NOT EXISTS \"WatermarkPresets\" (" +
+                "\"Id\" TEXT NOT NULL CONSTRAINT \"PK_WatermarkPresets\" PRIMARY KEY, " +
+                "\"Name\" TEXT NOT NULL DEFAULT '', " +
+                "\"CreatedUtc\" TEXT NOT NULL, " +
+                "\"WatermarkType\" TEXT NOT NULL DEFAULT 'Text', " +
+                "\"TextContent\" TEXT NULL, " +
+                "\"FontFamily\" TEXT NULL, " +
+                "\"FontSize\" REAL NOT NULL DEFAULT 48.0, " +
+                "\"TextColor\" TEXT NULL, " +
+                "\"LogoImagePath\" TEXT NULL, " +
+                "\"X\" REAL NOT NULL DEFAULT 0, " +
+                "\"Y\" REAL NOT NULL DEFAULT 0, " +
+                "\"Width\" REAL NOT NULL DEFAULT 0, " +
+                "\"Height\" REAL NOT NULL DEFAULT 0, " +
+                "\"RotationDegrees\" REAL NOT NULL DEFAULT 0, " +
+                "\"Opacity\" REAL NOT NULL DEFAULT 0.5)";
+            create.ExecuteNonQuery();
+        }
+        finally
+        {
+            if (wasClosed) connection.Close();
+        }
     }
 
     private void EnsureCameraCalibrationsTable()

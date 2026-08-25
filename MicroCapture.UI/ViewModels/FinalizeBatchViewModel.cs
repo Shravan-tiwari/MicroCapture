@@ -14,6 +14,7 @@ using MicroCapture.Core.Data;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
 using MicroCapture.Processing;
+using MicroCapture.UI.Views;
 
 namespace MicroCapture.UI.ViewModels;
 
@@ -49,6 +50,7 @@ public partial class FinalizeBatchViewModel : ViewModelBase
 
     public ObservableCollection<FinalizePageRow> Pages { get; } = new();
     public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
+    public ObservableCollection<WatermarkPreset> WatermarkPresets { get; } = new();
 
     [ObservableProperty] private string _selectedFormat = "PDF";
     [ObservableProperty] private bool _embedSearchableText = true;
@@ -56,9 +58,36 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     [ObservableProperty] private string _destinationDirectory = string.Empty;
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private string _statusText = string.Empty;
+    [ObservableProperty] private bool _watermarkEnabled;
+    [ObservableProperty] private WatermarkPreset? _selectedWatermarkPreset;
 
     public bool IsPdfFormat => SelectedFormat == "PDF";
     partial void OnSelectedFormatChanged(string value) => OnPropertyChanged(nameof(IsPdfFormat));
+
+    // Unlike MainWindowViewModel's PersistBatchSettingAsync (immediate persistence during a
+    // live capture session, since the setting must take effect for the very next shutter
+    // press), these two toggles only ever matter at export time — but persisting them
+    // immediately anyway matches the rest of the codebase's "every batch-setting toggle
+    // persists the moment it changes" convention, and means ExportAsync doesn't need its own
+    // separate save-then-export step.
+    partial void OnWatermarkEnabledChanged(bool value) => PersistWatermarkSetting(b => b.WatermarkEnabled = value);
+    partial void OnSelectedWatermarkPresetChanged(WatermarkPreset? value) => PersistWatermarkSetting(b => b.WatermarkPresetId = value?.Id);
+
+    private async void PersistWatermarkSetting(Action<Batch> apply)
+    {
+        if (_dbContext == null!) return; // design-time instance
+        try
+        {
+            var batch = await _dbContext.Batches.FindAsync(_batch.Id);
+            if (batch == null) return;
+            apply(batch);
+            await _dbContext.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not save watermark setting: {ex.Message}";
+        }
+    }
 
     public FinalizeResult? Result { get; private set; }
     public event EventHandler? CloseRequested;
@@ -71,6 +100,8 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         SelectedFormat = string.IsNullOrWhiteSpace(batch.PreferredExportFormat) ? "PDF" : batch.PreferredExportFormat;
         DestinationDirectory = outputDirectory;
         FileName = MicroCapture.Core.FileNaming.Sanitize(string.IsNullOrEmpty(batch.Name) ? batch.BatchCode : batch.Name) + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        _watermarkEnabled = batch.WatermarkEnabled;
+        _ = LoadWatermarkPresetsAsync(batch.WatermarkPresetId);
 
         // LoadPages() originally ran exactly once, against the Batch.Captures snapshot handed in
         // by MainWindowViewModel.OpenFinalizeBatchAsync at the moment the dialog opened. If any
@@ -98,6 +129,30 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     {
         var jobs = CaptureQueueService.GetCompletedJobsForBatch(_batch.Captures);
         ApplyPages(jobs);
+    }
+
+    private async Task LoadWatermarkPresetsAsync(string? selectedPresetId)
+    {
+        if (_dbContext == null!) return; // design-time instance
+        List<WatermarkPreset> presets;
+        try
+        {
+            presets = await _dbContext.WatermarkPresets.AsNoTracking().OrderBy(p => p.Name).ToListAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[FinalizeBatchViewModel] Could not load watermark presets: {ex.Message}");
+            return;
+        }
+
+        WatermarkPresets.Clear();
+        foreach (var p in presets) WatermarkPresets.Add(p);
+        // Assign the backing field directly, not the property — the property's generated setter
+        // fires OnSelectedWatermarkPresetChanged, which persists to the DB (see below). That
+        // would be wrong here: this call is restoring the batch's already-saved choice after an
+        // async reload, not the operator making a new one.
+        _selectedWatermarkPreset = WatermarkPresets.FirstOrDefault(p => p.Id == selectedPresetId);
+        OnPropertyChanged(nameof(SelectedWatermarkPreset));
     }
 
     /// <summary>Re-queries the DB (not the <see cref="_batch"/>.Captures snapshot captured when
@@ -211,6 +266,31 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         var picked = folders.FirstOrDefault();
         if (picked?.TryGetLocalPath() is { } localPath)
             DestinationDirectory = localPath;
+    }
+
+    [RelayCommand]
+    private async Task EditWatermarkAsync(Avalonia.Controls.Window owner)
+    {
+        if (Pages.Count == 0)
+        {
+            StatusText = "Wait for at least one page to finish processing before editing a watermark.";
+            return;
+        }
+
+        var job = await _dbContext.CaptureJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == Pages[0].JobId);
+        if (job == null) return;
+        var samplePath = BatchExportService.GetProcessedFilesForJob(job).FirstOrDefault();
+        if (samplePath == null)
+        {
+            StatusText = "Could not find a sample page to preview the watermark against.";
+            return;
+        }
+
+        var saved = await WatermarkEditorDialog.RunAsync(owner, _dbContext, SelectedWatermarkPreset, samplePath);
+        if (saved == null) return;
+
+        await LoadWatermarkPresetsAsync(saved.Id);
+        WatermarkEnabled = true; // opening the editor and saving implies the operator wants it applied
     }
 
     private bool CanExport() => !IsBusy && Pages.Count > 0;

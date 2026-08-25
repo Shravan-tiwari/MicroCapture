@@ -11,6 +11,7 @@ public class AppDbContext : DbContext
     public DbSet<Batch> Batches { get; set; } = null!;
     public DbSet<CaptureJob> CaptureJobs { get; set; } = null!;
     public DbSet<CameraCalibration> CameraCalibrations { get; set; } = null!;
+    public DbSet<WatermarkPreset> WatermarkPresets { get; set; } = null!;
 
     public string DbPath { get; }
 
@@ -60,6 +61,17 @@ public class AppDbContext : DbContext
             .HasOne(b => b.CameraCalibration)
             .WithMany()
             .HasForeignKey(b => b.CameraCalibrationId)
+            .IsRequired(false);
+
+        // Unlike CameraCalibration (Restrict/ClientSetNull by default), deleting a
+        // WatermarkPreset should not be blocked by, or cascade into, batches that reference it
+        // — null the FK out instead, matching Batch.WatermarkPreset's own "live reference, not
+        // a snapshot" doc comment.
+        modelBuilder.Entity<Batch>()
+            .HasOne(b => b.WatermarkPreset)
+            .WithMany()
+            .HasForeignKey(b => b.WatermarkPresetId)
+            .OnDelete(DeleteBehavior.SetNull)
             .IsRequired(false);
     }
 }
