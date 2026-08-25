@@ -52,9 +52,22 @@ public partial class WatermarkEditorViewModel : ViewModelBase
         OnPropertyChanged(nameof(IsTextMode));
         OnPropertyChanged(nameof(IsLogoMode));
         SchedulePreviewUpdate();
+        SaveCommand.NotifyCanExecuteChanged();
     }
 
-    partial void OnTextContentChanged(string value) => SchedulePreviewUpdate();
+    // CanSave() reads PresetName/TextContent/LogoImagePath, but [RelayCommand]'s generated
+    // CanExecute only re-runs automatically for properties it's told to watch — without these,
+    // the Save button's enabled state froze at whatever CanSave() returned when the dialog first
+    // opened (disabled) and never updated again, even after the operator typed a name or picked
+    // a logo file that made CanSave() true.
+    partial void OnPresetNameChanged(string value) => SaveCommand.NotifyCanExecuteChanged();
+    partial void OnLogoImagePathChanged(string? value) => SaveCommand.NotifyCanExecuteChanged();
+
+    partial void OnTextContentChanged(string value)
+    {
+        SchedulePreviewUpdate();
+        SaveCommand.NotifyCanExecuteChanged();
+    }
     partial void OnFontSizeChanged(double value) => SchedulePreviewUpdate();
     partial void OnTextColorChanged(string value) => SchedulePreviewUpdate();
     partial void OnOpacityChanged(double value) => SchedulePreviewUpdate();
@@ -155,14 +168,17 @@ public partial class WatermarkEditorViewModel : ViewModelBase
             var ext = Path.GetExtension(picked);
             var target = WatermarkAssetPaths.FileFor(_presetId, ext);
             File.Copy(picked, target, overwrite: true);
+            var bitmap = new Bitmap(target); // decode first — don't commit LogoImagePath/preview if this throws
             LogoImagePath = target;
             LogoPreviewBitmap?.Dispose();
-            LogoPreviewBitmap = new Bitmap(target);
+            LogoPreviewBitmap = bitmap;
+            StatusText = string.Empty;
             SchedulePreviewUpdate();
         }
         catch (Exception ex)
         {
-            StatusText = $"Could not load logo image: {ex.Message}";
+            StatusText = $"Could not load logo image ({Path.GetFileName(picked)}): {ex.Message}";
+            Console.Error.WriteLine($"[WatermarkEditorViewModel] Logo load failed for '{picked}': {ex}");
         }
     }
 
