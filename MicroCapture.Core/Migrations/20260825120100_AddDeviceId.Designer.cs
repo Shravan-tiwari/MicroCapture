@@ -164,15 +164,15 @@ namespace MicroCapture.Core.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("Brightness")
-                        .HasColumnType("TEXT");
+                    b.Property<double>("Brightness")
+                        .HasColumnType("REAL");
 
                     b.Property<string>("CaptureFormat")
                         .IsRequired()
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("Contrast")
-                        .HasColumnType("TEXT");
+                    b.Property<double>("Contrast")
+                        .HasColumnType("REAL");
 
                     b.Property<string>("DewarpCurve")
                         .HasColumnType("TEXT");
@@ -230,17 +230,17 @@ namespace MicroCapture.Core.Migrations
                     b.Property<int>("RotationDegrees")
                         .HasColumnType("INTEGER");
 
-                    b.Property<string>("Saturation")
-                        .HasColumnType("TEXT");
+                    b.Property<double>("Saturation")
+                        .HasColumnType("REAL");
 
-                    b.Property<string>("Sharpness")
-                        .HasColumnType("TEXT");
+                    b.Property<double>("Sharpness")
+                        .HasColumnType("REAL");
 
                     b.Property<DateTime>("Timestamp")
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("WhiteBalance")
-                        .HasColumnType("TEXT");
+                    b.Property<double>("WhiteBalance")
+                        .HasColumnType("REAL");
 
                     b.HasKey("Id");
 
