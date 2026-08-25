@@ -1782,7 +1782,13 @@ public partial class MainWindowViewModel : ViewModelBase
                 var bytes = cropRect is { } r
                     ? MicroCapture.Processing.ImageDecodeHelper.GetCroppedDisplayBytes(filePath, r.X, r.Y, r.Width, r.Height)
                     : File.ReadAllBytes(filePath);
-                if (bytes == null) return;
+                if (bytes == null)
+                {
+                    Console.Error.WriteLine(cropRect is { } rr
+                        ? $"Thumbnail crop failed for '{filePath}' rect=({rr.X},{rr.Y},{rr.Width},{rr.Height}) — file missing/undecodable or rect fully outside image bounds."
+                        : $"Thumbnail decode failed for '{filePath}' — file missing or undecodable.");
+                    return;
+                }
 
                 foreach (var thumbnail in placeholders)
                 {
