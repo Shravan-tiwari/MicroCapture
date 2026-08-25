@@ -4395,6 +4395,35 @@ public partial class ImageProcessor
     /// brightness/contrast read; saturation after tone since it's evaluated in the corrected
     /// image's own HSV space; sharpness last so it sharpens the final tonal result rather than
     /// being partially undone by a later contrast pass.</summary>
+    /// <summary>Re-applies the adjustment stack directly on top of an already-processed
+    /// derivative, in place — for a page whose raw original has already been deleted (see
+    /// BatchExportService.DeleteOriginals, which runs once a batch is exported) and so can no
+    /// longer go through the normal crop/dewarp/adjust-from-scratch pipeline in Process(). No
+    /// crop, dewarp, QC, or CLAHE — just rotate/flip/tone/color/sharpen against whatever pixels
+    /// are already there, overwriting the same file. Each call's adjustment values are a fresh
+    /// delta applied to the derivative's current state (not restated from zero), so calling this
+    /// twice compounds — e.g. two 90° rotations bake in as 180° total. That's the intended
+    /// behavior for "edit an already-exported page again," not a bug: there is no original left
+    /// to recompute the edit from scratch against.</summary>
+    public static bool ReapplyAdjustmentsToDerivative(string derivativePath, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
+    {
+        if (!File.Exists(derivativePath)) return false;
+        try
+        {
+            using var src = Cv2.ImRead(derivativePath, ImreadModes.Color);
+            if (src.Empty()) return false;
+
+            using var adjusted = ApplyManualAdjustments(src, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+            Cv2.ImWrite(derivativePath, adjusted);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ImageProcessor] ReapplyAdjustmentsToDerivative failed for '{derivativePath}': {ex}");
+            return false;
+        }
+    }
+
     public static Mat ApplyManualAdjustments(Mat src, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
     {
         var working = src.Clone();

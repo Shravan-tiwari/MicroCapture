@@ -22,7 +22,21 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private readonly AppDbContext _dbContext;
     private readonly CaptureQueueService _queueService;
     private readonly string _imagePath;
+    /// <summary>The file this session is actually editing — the raw original normally, or the
+    /// processed derivative when <see cref="IsPostExportAdjustOnly"/> is true. Exposed so a
+    /// caller can re-decode the up-to-date thumbnail straight from disk after a post-export Save
+    /// (which writes directly to this same path), without needing its own copy of the path.</summary>
+    public string ImagePath => _imagePath;
     private string _batchId = string.Empty;
+
+    // True when this job's raw original was already deleted (batch exported — see
+    // BatchExportService.DeleteOriginals) and _imagePath points at the processed derivative
+    // instead. There is no un-cropped source left to re-detect or re-crop against, so this mode
+    // is restricted to tone/rotation touch-ups applied directly on top of the derivative's
+    // current pixels — see Save's own branch and ImageProcessor.ReapplyAdjustmentsToDerivative.
+    [ObservableProperty] private bool _isPostExportAdjustOnly;
+
+    public string SaveButtonLabel => IsPostExportAdjustOnly ? "Save Touch-Up" : "Save & Reprocess";
     // Job IDs the "Apply adjustments to selected" filmstrip action opened this window for, if
     // any — when non-empty, Save's bulk-apply path targets exactly this set instead of the
     // whole batch. Empty for the ordinary single-page open (click a thumbnail).
@@ -281,7 +295,54 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         }
         if (!File.Exists(job.OriginalFilePath))
         {
-            LoadErrorMessage = "This page's original image is no longer available (the batch may already be finalized/exported).";
+            // The raw original is gone (batch exported — see BatchExportService.DeleteOriginals),
+            // but the processed derivative usually still exists. Fall back to editing that
+            // directly: tone/rotation touch-ups only, no re-crop (there's no un-cropped source
+            // left to crop from) — see IsPostExportAdjustOnly and Save's own branch.
+            var derivative = job.ProcessedFilePath?.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(File.Exists);
+            if (derivative == null)
+            {
+                LoadErrorMessage = "This page's image is no longer available (the batch may already be finalized/exported).";
+                return;
+            }
+
+            IsPostExportAdjustOnly = true;
+            _imagePath = derivative;
+            _batchId = job.BatchId;
+            // Sliders start at zero here, not at job's stored totals: post-export adjustments
+            // are a fresh delta applied on top of whatever is already baked into the derivative
+            // (see ReapplyAdjustmentsToDerivative's own doc comment), not a restatement of the
+            // cumulative total from the original processing run.
+            _loadedHasManualAdjustments = false;
+            _loadedRotationDegrees = 0;
+            _loadedFlipHorizontal = false;
+            _loadedFlipVertical = false;
+            _loadedBrightness = 0;
+            _loadedContrast = 0;
+            _loadedSaturation = 0;
+            _loadedSharpness = 0;
+            _loadedWhiteBalance = 0;
+
+            try
+            {
+                var bytes = ImageDecodeHelper.GetDisplayBytes(derivative);
+                if (bytes == null) throw new InvalidOperationException("Could not decode derivative.");
+                using var ms = new MemoryStream(bytes);
+                var bmp = new Bitmap(ms);
+                Image = bmp;
+                ImageWidth = (int)bmp.Size.Width;
+                ImageHeight = (int)bmp.Size.Height;
+                SetCorners(RectCorners(0, 0, ImageWidth, ImageHeight));
+                _previewRenderer = CropPreviewRenderer.Create(derivative);
+                IsAdjustMode = true;
+                BoundaryHintText = "Original photo already deleted (batch exported) — tone/rotation touch-ups only.";
+                RenderPreview();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[CropReviewViewModel] Post-export derivative load failed: {ex}");
+                LoadErrorMessage = $"Could not load this page: {ex.Message}";
+            }
             return;
         }
 
@@ -887,6 +948,24 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private async Task Save()
     {
         if (Image == null) { ReviewClosed?.Invoke(this, EventArgs.Empty); return; }
+
+        if (IsPostExportAdjustOnly)
+        {
+            // No original left to re-queue for the normal background-worker reprocess — apply
+            // the adjustment delta directly to the derivative file in place, synchronously,
+            // right here. Nothing to persist on the CaptureJob row itself: RotationDegrees/
+            // Brightness/etc. describe a from-scratch recipe against an original that no longer
+            // exists, and this mode's sliders are a delta on top of the file's current pixels,
+            // not a value that means anything stored back onto the job for a future reprocess.
+            if (HasNonDefaultAdjustments)
+            {
+                MicroCapture.Processing.ImageProcessor.ReapplyAdjustmentsToDerivative(
+                    _imagePath, RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance);
+            }
+            Saved?.Invoke(this, EventArgs.Empty);
+            ReviewClosed?.Invoke(this, EventArgs.Empty);
+            return;
+        }
 
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)

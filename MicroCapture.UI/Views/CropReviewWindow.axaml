@@ -131,7 +131,12 @@
                             </StackPanel>
                         </StackPanel>
 
-                        <StackPanel Spacing="8">
+                        <!-- Bulk-apply writes adjustment fields meant to be recomputed from each
+                             target job's own original — meaningless once this job's own edit is
+                             a delta-on-derivative rather than a from-scratch value, so it's
+                             hidden entirely in that mode rather than silently doing the wrong
+                             thing for every other page it would touch. -->
+                        <StackPanel Spacing="8" IsVisible="{Binding !IsPostExportAdjustOnly}">
                             <TextBlock Text="BATCH" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
                             <Button Content="Apply to All in Batch" Command="{Binding ApplyToAllCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
                             <Button Content="Apply to Selected" Command="{Binding ApplyToSelectionCommand}" Classes="secondary"
@@ -160,15 +165,21 @@
                                    Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="13"/>
                     </StackPanel>
 
+                    <!-- Crop/split/dewarp geometry no longer applies once the raw original is
+                         gone (batch already exported) — only tone/rotation touch-ups on the
+                         existing derivative are offered, and Adjust mode is forced on for the
+                         whole session, so its own toggle button is redundant here too. -->
                     <Button Content="Switch to page-by-page" Command="{Binding ToggleSplitEditModeCommand}"
                             IsVisible="{Binding IsLineSplitMode}" Classes="accentGhost"/>
                     <Button Content="Switch to split line" Command="{Binding ToggleSplitEditModeCommand}"
                             IsVisible="{Binding IsQuadSplitMode}" Classes="accentGhost"/>
                     <Button Content="{Binding DewarpEditButtonLabel}" Command="{Binding ToggleDewarpEditModeCommand}"
                             ToolTip.Tip="Manually trace this page's actual top/bottom curve when auto-detection isn't confident enough"
+                            IsVisible="{Binding !IsPostExportAdjustOnly}"
                             Classes="accentGhost"/>
                     <Button Content="{Binding AdjustEditButtonLabel}" Command="{Binding ToggleAdjustModeCommand}"
                             ToolTip.Tip="Rotate, flip, and adjust brightness/contrast/saturation/sharpness/white balance"
+                            IsVisible="{Binding !IsPostExportAdjustOnly}"
                             Classes="accentGhost"/>
                 </StackPanel>
 
@@ -185,7 +196,7 @@
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10">
                     <Button Content="Reset" Command="{Binding ResetCommand}" Classes="secondary"/>
                     <Button Content="Cancel" Command="{Binding CancelCommand}" Classes="secondary"/>
-                    <Button Content="Save &amp; Reprocess" Command="{Binding SaveCommand}" Classes="primary"/>
+                    <Button Content="{Binding SaveButtonLabel}" Command="{Binding SaveCommand}" Classes="primary"/>
                 </StackPanel>
             </Grid>
         </Border>

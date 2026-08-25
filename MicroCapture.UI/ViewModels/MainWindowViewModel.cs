@@ -1340,12 +1340,54 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
         if (openInAdjustMode) cropReviewViewModel.IsAdjustMode = true;
-        // Give the thumbnail immediate feedback on save instead of leaving it looking
-        // unchanged for the ~1s the background worker takes to actually pick the job back up.
         cropReviewViewModel.Saved += (_, _) =>
         {
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
-            if (thumbnail != null) thumbnail.Status = "Reprocessing…";
+            if (thumbnail != null)
+            {
+                if (cropReviewViewModel.IsPostExportAdjustOnly)
+                {
+                    // No background worker will ever pick this job up (its original is gone —
+                    // Save already wrote the edit straight to the derivative file, synchronously,
+                    // in CropReviewViewModel.Save), so there is no later JobCompleted event to
+                    // refresh the thumbnail the normal way. Re-decode right here instead of
+                    // leaving the thumbnail stuck on a "Reprocessing…" status that will never
+                    // resolve on its own.
+                    thumbnail.Status = "Processed";
+                    try
+                    {
+                        var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(cropReviewViewModel.ImagePath);
+                        if (bytes != null)
+                        {
+                            using var stream = new MemoryStream(bytes);
+                            var newThumb = Bitmap.DecodeToWidth(stream, 120);
+                            var old = thumbnail.Thumbnail;
+                            thumbnail.Thumbnail = newThumb;
+                            old?.Dispose();
+
+                            // Also refresh the persisted on-disk thumbnail (see AddThumbnail),
+                            // so a later resume from Recent shows this edit too instead of the
+                            // stale pre-edit version.
+                            var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, _activeBatchCode, thumbnail.PageNumber);
+                            using var freshStream = new MemoryStream(bytes);
+                            var freshThumb = Bitmap.DecodeToWidth(freshStream, 120);
+                            freshThumb.Save(thumbPath);
+                            freshThumb.Dispose();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Post-export thumbnail refresh failed: {ex}");
+                    }
+                }
+                else
+                {
+                    // Give the thumbnail immediate feedback on save instead of leaving it looking
+                    // unchanged for the ~1s the background worker takes to actually pick the job
+                    // back up.
+                    thumbnail.Status = "Reprocessing…";
+                }
+            }
             ClearSelection();
         };
         cropReviewViewModel.ReviewClosed += (_, _) => CloseCropReview();
