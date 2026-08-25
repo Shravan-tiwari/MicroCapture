@@ -190,7 +190,7 @@ public class CaptureQueueService
         }
     }
 
-    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF", int dpi = 150)
+    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF", int dpi = 150, string? leftCropBox = null)
     {
         var job = new CaptureJob
         {
@@ -202,6 +202,22 @@ public class CaptureQueueService
             CaptureFormat = captureFormat,
             Dpi = dpi
         };
+
+        // A pre-supplied crop box means this job is one frame of a fixed-frame capture — the
+        // same source image shared by several sibling jobs (one per frame), each cropped to its
+        // own calibrated rectangle. Marking it as an ordinary manual-override crop routes it
+        // through Process()'s single-page manual path (ProcessSinglePage -> FinishPageProcessing),
+        // which is what actually applies rotation/brightness/contrast/etc. — the old
+        // ProcessFixedFrames passthrough path never called FinishPageProcessing at all, so manual
+        // adjustments were silently dropped for every fixed-frame batch. Piggybacking on the
+        // existing manual-crop machinery also means Crop Review, "Apply to All", and export all
+        // treat this frame exactly like any other independently-reviewed page — no special-casing
+        // needed anywhere else.
+        if (!string.IsNullOrEmpty(leftCropBox))
+        {
+            job.ManualOverrideApplied = true;
+            job.LeftCropBox = leftCropBox;
+        }
 
         _dbContext.CaptureJobs.Add(job);
         await _dbContext.SaveChangesAsync();

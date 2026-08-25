@@ -266,12 +266,15 @@ public partial class MainWindowViewModel : ViewModelBase
                 // A job just left the queue — this is what re-unlocks frame editing once nothing
                 // is still in flight under the current geometry.
                 _ = RefreshFrameEditPermissionAsync();
-                // For an ordinary (non-fixed-frame) job this matches exactly one thumbnail at
-                // FrameIndex 0 — identical to the old single-thumbnail behavior. For a
-                // fixed-frame job, AddThumbnail already inserted one placeholder per calibrated
-                // frame, sharing this same FilePath; each gets its own slice of OutputFilePaths.
-                var thumbnails = RecentCaptures.Where(t => t.FilePath == result.OriginalFilePath);
-                foreach (var thumbnail in thumbnails)
+                // Match by JobId, not OriginalFilePath: several sibling jobs (one per fixed
+                // frame) can share the same source capture file, so FilePath alone is no longer
+                // a unique key — each job now gets its own ProcessingResult (stamped with
+                // JobId by BackgroundProcessingWorker) and its own single thumbnail row. A
+                // normal split-spread job (left/right from one page) is still exactly one job
+                // with 2 OutputFilePaths — that page's own single thumbnail just shows the left
+                // half's preview (index 0), same as before this change.
+                var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == result.JobId);
+                if (thumbnail != null)
                 {
                     thumbnail.Status = !result.Success ? "Processing failed"
                         : result.OcrStatus == "Failed" ? "Processed — OCR failed"
@@ -279,7 +282,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         : result.QcVerdict == "WARNING" ? "Processed — needs review"
                         : "Processed";
 
-                    if (result.Success && thumbnail.FrameIndex >= 0 && thumbnail.FrameIndex < result.OutputFilePaths.Count)
+                    if (result.Success && result.OutputFilePaths.Count > 0)
                     {
                         try
                         {
@@ -287,7 +290,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             // Bitmap decoder can't read directly — bridge through the same
                             // OpenCV-based decode path batch export uses, or the thumbnail
                             // silently never updates past the raw just-captured preview.
-                            var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(result.OutputFilePaths[thumbnail.FrameIndex]);
+                            var bytes = MicroCapture.Processing.ImageDecodeHelper.GetDisplayBytes(result.OutputFilePaths[0]);
                             if (bytes != null)
                             {
                                 using var stream = new MemoryStream(bytes);
@@ -299,7 +302,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         }
                         catch (Exception ex)
                         {
-                            Console.Error.WriteLine($"Thumbnail refresh failed for '{result.OutputFilePaths[thumbnail.FrameIndex]}': {ex}");
+                            Console.Error.WriteLine($"Thumbnail refresh failed for '{result.OutputFilePaths[0]}': {ex}");
                         }
                     }
                 }
@@ -883,10 +886,11 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task LoadRecentCapturesFromBatchAsync(Batch batch)
     {
         RecentCaptures.Clear();
-        var frameCount = batch.UseFixedFrames && !string.IsNullOrWhiteSpace(batch.FixedFrames)
-            ? Math.Max(1, MicroCapture.Processing.ImageProcessor.ParseFixedFrames(batch.FixedFrames).Length)
-            : 1;
 
+        // Each page — whether an ordinary auto-detect capture or one fixed frame — is its own
+        // CaptureJob with its own PageNumber (see CaptureAsync), so grouping by PageNumber
+        // already yields exactly one row per page here; no separate "loop N frames per job"
+        // multiplication is needed (or correct) anymore.
         var latestPerPage = batch.Captures
             .Where(job => job.ProcessingStatus != "Superseded")
             .GroupBy(job => job.PageNumber)
@@ -908,29 +912,23 @@ public partial class MainWindowViewModel : ViewModelBase
             if (sourcePath == null) continue;
             try
             {
-                // This reloads the raw capture (or its persisted thumbnail), not each frame's
-                // actual processed crop — an existing limitation shared with ordinary batches
-                // (resume never re-fetches per-frame derivatives), not something new here.
                 var bytes = await Task.Run(() => File.ReadAllBytes(sourcePath));
                 var status = job.ProcessingStatus == "Completed" ? "Processed"
                     : job.ProcessingStatus == "Failed" ? "Processing failed"
                     : "Processing";
 
-                for (var i = 0; i < frameCount; i++)
+                using var stream = new MemoryStream(bytes);
+                var thumb = await Task.Run(() => Bitmap.DecodeToWidth(stream, 120));
+                RecentCaptures.Add(new ThumbnailItem
                 {
-                    using var stream = new MemoryStream(bytes);
-                    var thumb = await Task.Run(() => Bitmap.DecodeToWidth(stream, 120));
-                    RecentCaptures.Add(new ThumbnailItem
-                    {
-                        JobId = job.Id,
-                        PageNumber = job.PageNumber,
-                        FrameIndex = i,
-                        Thumbnail = thumb,
-                        BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
-                        Status = status,
-                        FilePath = job.OriginalFilePath
-                    });
-                }
+                    JobId = job.Id,
+                    PageNumber = job.PageNumber,
+                    FrameIndex = 0,
+                    Thumbnail = thumb,
+                    BorderColor = job.ManualOverrideApplied ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor((job.PageNumber - 1) % 8)) : null,
+                    Status = status,
+                    FilePath = job.OriginalFilePath
+                });
             }
             catch (Exception ex)
             {
@@ -951,8 +949,9 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
         var frameCount = Frames.Count;
+        var firstPageNumber = PageCount + 1;
         PageCount += frameCount > 0 ? frameCount : 1;
-        var pageStr = PageCount.ToString("D6");
+        var pageStr = firstPageNumber.ToString("D6");
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}";
 
         StatusText = $"Capturing page{(frameCount > 0 ? "s" : "")} ...";
@@ -961,15 +960,42 @@ public partial class MainWindowViewModel : ViewModelBase
             Directory.CreateDirectory(_outputDirectory);
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
 
-            // Record in durable queue — when using fixed frames, one capture button press creates
-            // one job, but ProcessFixedFrames will output multiple files (one per frame). Increment
-            // PageCount by frameCount so the pages are numbered correctly for the frame set.
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+            if (frameCount > 0)
+            {
+                // Each fixed frame becomes its own independent CaptureJob — its own page
+                // number, own crop box, own thumbnail — instead of one job producing N output
+                // files under a single shared page number. This is what lets each frame get its
+                // own Crop Review, its own place in the export, and (critically) actually apply
+                // manual adjustments: routing through EnqueueCaptureAsync's leftCropBox overload
+                // marks the job ManualOverrideApplied, so it goes through Process()'s single-page
+                // manual-crop path (which calls FinishPageProcessing) instead of the old
+                // ProcessFixedFrames passthrough, which never applied rotation/brightness/etc. at
+                // all.
+                var capturedSize = MicroCapture.Processing.ImageDecodeHelper.GetPixelSize(filePath);
+                var scaleX = capturedSize is { } cs1 && FrameReferenceWidth > 0 ? (double)cs1.Width / FrameReferenceWidth : 1.0;
+                var scaleY = capturedSize is { } cs2 && FrameReferenceHeight > 0 ? (double)cs2.Height / FrameReferenceHeight : 1.0;
+
+                for (var i = 0; i < frameCount; i++)
+                {
+                    var pageNumber = firstPageNumber + i;
+                    var frame = Frames[i];
+                    var px = (int)Math.Round(frame.X * scaleX);
+                    var py = (int)Math.Round(frame.Y * scaleY);
+                    var pw = (int)Math.Round(frame.Width * scaleX);
+                    var ph = (int)Math.Round(frame.Height * scaleY);
+                    var cropBox = FormattableString.Invariant($"{px},{py},{pw},{ph}");
+                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox);
+                    AddThumbnail(frameJob.Id, filePath, pageNumber, frameIndex: i, cropRect: (px, py, pw, ph));
+                }
+            }
+            else
+            {
+                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+                AddThumbnail(job.Id, filePath, PageCount);
+            }
+
             // A job is now queued under the current geometry — lock frame editing until it lands.
             _ = RefreshFrameEditPermissionAsync();
-
-            // Add thumbnail
-            AddThumbnail(job.Id, filePath, PageCount);
 
             // Require the page's content to actually change before auto-capture (or the
             // readiness indicator) can trigger again for this same physical page.
@@ -981,7 +1007,7 @@ public partial class MainWindowViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Capture failed: {ex.Message}";
-            PageCount--; // Revert count
+            PageCount = firstPageNumber - 1; // Revert count
         }
         }
         finally { Volatile.Write(ref _captureInProgress, 0); }
@@ -997,12 +1023,16 @@ public partial class MainWindowViewModel : ViewModelBase
         if (ActiveCropReview != null) { StatusText = "Finish or cancel crop review before capturing."; return; }
         if (!IsConnected || _currentBatchId == null || PageCount == 0) return;
 
-        var frameCount = GetCurrentFixedFrameCount();
-        var firstPageInSet = PageCount - frameCount + 1;
-        var pageStr = frameCount > 0 ? $"{firstPageInSet}-{PageCount}" : PageCount.ToString("D6");
+        var frameCount = Frames.Count;
+        // GetCurrentFixedFrameCount() covers split-book-pages too (2 outputs from 1 job), which
+        // still uses the single-job path below — only genuine fixed frames (Frames.Count > 0)
+        // get split into independent per-frame jobs.
+        var pagesInSet = GetCurrentFixedFrameCount();
+        var firstPageInSet = PageCount - pagesInSet + 1;
+        var pageStr = pagesInSet > 1 ? $"{firstPageInSet}-{PageCount}" : PageCount.ToString("D6");
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{firstPageInSet.ToString("D6")}_R";
 
-        StatusText = $"Recapturing page{(frameCount > 0 ? "s" : "")} {pageStr}...";
+        StatusText = $"Recapturing page{(pagesInSet > 1 ? "s" : "")} {pageStr}...";
         try
         {
             // Supersede all pages in this frame set
@@ -1010,22 +1040,48 @@ public partial class MainWindowViewModel : ViewModelBase
                 await _queueService.SupersedePageAsync(_currentBatchId, p);
 
             var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
-            var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
-            _ = RefreshFrameEditPermissionAsync();
 
-            // Update thumbnails for the recaptured pages
+            // Clear out the old thumbnails for this frame set before adding the new ones —
+            // same "remove then re-add" shape CaptureAsync uses for a fresh capture.
             var existing = RecentCaptures.Where(t => t.PageNumber >= firstPageInSet && t.PageNumber <= PageCount).ToList();
             foreach (var thumbnail in existing)
             {
                 thumbnail.Thumbnail?.Dispose();
                 RecentCaptures.Remove(thumbnail);
             }
-            AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
+
+            if (frameCount > 0)
+            {
+                // Same per-frame independent-job shape as CaptureAsync — see its own comment for
+                // why (manual-crop routing is what makes adjustments/Crop Review/export work).
+                var capturedSize = MicroCapture.Processing.ImageDecodeHelper.GetPixelSize(filePath);
+                var scaleX = capturedSize is { } cs1 && FrameReferenceWidth > 0 ? (double)cs1.Width / FrameReferenceWidth : 1.0;
+                var scaleY = capturedSize is { } cs2 && FrameReferenceHeight > 0 ? (double)cs2.Height / FrameReferenceHeight : 1.0;
+
+                for (var i = 0; i < frameCount; i++)
+                {
+                    var pageNumber = firstPageInSet + i;
+                    var frame = Frames[i];
+                    var px = (int)Math.Round(frame.X * scaleX);
+                    var py = (int)Math.Round(frame.Y * scaleY);
+                    var pw = (int)Math.Round(frame.Width * scaleX);
+                    var ph = (int)Math.Round(frame.Height * scaleY);
+                    var cropBox = FormattableString.Invariant($"{px},{py},{pw},{ph}");
+                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox);
+                    AddThumbnail(frameJob.Id, filePath, pageNumber, isRecapture: true, frameIndex: i, cropRect: (px, py, pw, ph));
+                }
+            }
+            else
+            {
+                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+                AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
+            }
+            _ = RefreshFrameEditPermissionAsync();
 
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
-            StatusText = $"Page{(frameCount > 0 ? "s" : "")} {pageStr} recaptured";
+            StatusText = $"Page{(pagesInSet > 1 ? "s" : "")} {pageStr} recaptured";
         }
         catch (Exception ex)
         {
@@ -1304,14 +1360,11 @@ public partial class MainWindowViewModel : ViewModelBase
         current?.Dispose();
     }
 
-    /// <summary>Number of output pages one capture is expected to produce, for the current
-    /// batch's mode — used to decide how many placeholder thumbnails one shutter press should
-    /// create. Fixed frames and split-book-pages are mutually exclusive (see
-    /// OnSplitBookPagesChanged and the Frames collection handler), so at most one of these
-    /// branches ever applies; both produce N&gt;1 files per capture
-    /// (ImageProcessor.ProcessFixedFrames / Process's split branch), each of which needs its own
-    /// thumbnail slot or only the first output file ever gets shown (see JobCompleted's
-    /// FrameIndex-indexed lookup into result.OutputFilePaths).</summary>
+    /// <summary>Number of pages one Recapture is expected to supersede/recreate for the current
+    /// batch's mode. Fixed frames are handled directly in CaptureAsync/RecaptureAsync (each
+    /// frame is its own independent CaptureJob — see those methods' own comments); this helper
+    /// now only matters for split-book-pages recapture, where one job still legitimately produces
+    /// 2 output files (left/right half of one spread) under a single page number.</summary>
     private int GetCurrentFixedFrameCount()
     {
         if (Frames.Count > 0) return Frames.Count;
@@ -1669,36 +1722,33 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false)
+    private void AddThumbnail(string jobId, string filePath, int pageNumber, bool isRecapture = false, int? frameIndex = null, (int X, int Y, int Width, int Height)? cropRect = null)
     {
-        var frameCount = GetCurrentFixedFrameCount();
-
-        // Insert the placeholder row(s) synchronously, on this (UI) thread, before returning —
-        // NOT via Dispatcher.UIThread.Post. AddThumbnail is called right after EnqueueCaptureAsync
+        // frameIndex identifies which single fixed frame this job/thumbnail is for (each frame
+        // is now its own independent CaptureJob — see CaptureAsync); null means an ordinary
+        // auto-detect capture with no frame concept, i.e. exactly one thumbnail for the job.
+        var thumbnail = new ThumbnailItem
+        {
+            JobId = jobId,
+            PageNumber = pageNumber,
+            FrameIndex = frameIndex ?? 0,
+            BorderColor = frameIndex is { } fi ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(fi)) : null,
+            Status = isRecapture ? "Recapturing" : "Processing",
+            FilePath = filePath
+        };
+        // Insert the placeholder row synchronously, on this (UI) thread, before returning — NOT
+        // via Dispatcher.UIThread.Post. AddThumbnail is called right after EnqueueCaptureAsync
         // writes the job to the DB as "Pending", and BackgroundProcessingWorker's poll loop can
         // pick that job up and finish it within milliseconds. JobCompleted's handler (below)
-        // matches on RecentCaptures.Where(t => t.FilePath == result.OriginalFilePath) to know
-        // which thumbnail to update — if that handler's own Dispatcher.Post ran before this
-        // method's deferred Post got its turn, the match found nothing and the "Processing"
-        // status update was silently lost forever, with no later event to correct it (confirmed
-        // root cause of thumbnails that never advance past "Processing"). Inserting the row here,
-        // before this method returns, guarantees it already exists by the time any worker
-        // callback for this job's FilePath can possibly run.
-        var placeholders = new List<ThumbnailItem>(frameCount);
-        for (var i = frameCount - 1; i >= 0; i--)
-        {
-            var thumbnail = new ThumbnailItem
-            {
-                JobId = jobId,
-                PageNumber = pageNumber,
-                FrameIndex = i,
-                BorderColor = frameCount > 1 ? new Avalonia.Media.SolidColorBrush(FixedFrameColorPalette.GetColor(i)) : null,
-                Status = isRecapture ? "Recapturing" : "Processing",
-                FilePath = filePath
-            };
-            RecentCaptures.Insert(0, thumbnail);
-            placeholders.Add(thumbnail);
-        }
+        // matches on RecentCaptures.Where(t => t.JobId == result matching job) to know which
+        // thumbnail to update — if that handler's own Dispatcher.Post ran before this method's
+        // deferred Post got its turn, the match found nothing and the "Processing" status update
+        // was silently lost forever, with no later event to correct it (confirmed root cause of
+        // thumbnails that never advance past "Processing"). Inserting the row here, before this
+        // method returns, guarantees it already exists by the time any worker callback for this
+        // job can possibly run.
+        RecentCaptures.Insert(0, thumbnail);
+        var placeholders = new List<ThumbnailItem> { thumbnail };
 
         // Keep last 100 thumbnails to avoid memory buildup
         while (RecentCaptures.Count > 100)
@@ -1715,8 +1765,6 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             try
             {
-                var bytes = File.ReadAllBytes(filePath);
-
                 // Learn the rig's true capture resolution from a real shot, so the frame overlay
                 // can report sizes in output pixels rather than live-preview pixels — and so an
                 // aspect mismatch between feed and capture gets flagged rather than silently
@@ -1725,6 +1773,16 @@ public partial class MainWindowViewModel : ViewModelBase
                 {
                     Avalonia.Threading.Dispatcher.UIThread.Post(() => NoteCaptureDimensions(capW, capH));
                 }
+
+                // A fixed-frame job's thumbnail must show only that frame's own region — several
+                // sibling jobs share this same source file, so decoding the whole thing here
+                // would show every frame the same full-spread image (confirmed operator-visible
+                // bug). Route through the OpenCV-backed cropper for those; plain auto-detect
+                // captures keep the direct file-bytes decode.
+                var bytes = cropRect is { } r
+                    ? MicroCapture.Processing.ImageDecodeHelper.GetCroppedDisplayBytes(filePath, r.X, r.Y, r.Width, r.Height)
+                    : File.ReadAllBytes(filePath);
+                if (bytes == null) return;
 
                 foreach (var thumbnail in placeholders)
                 {
@@ -1802,8 +1860,8 @@ public partial class MainWindowViewModel : ViewModelBase
             Console.Error.WriteLine($"Processed-derivative cleanup failed for '{item.FilePath}': {ex}");
         }
 
-        // A fixed-frame capture has one thumbnail per frame sharing this JobId — deleting the
-        // underlying job (above) affects all of them together, so the thumbnail strip must too.
+        // Each thumbnail has its own JobId now (one frame == one independent job — see
+        // CaptureAsync), so this only ever matches the single row being deleted.
         foreach (var sibling in RecentCaptures.Where(t => t.JobId == item.JobId).ToList())
         {
             sibling.Thumbnail?.Dispose();

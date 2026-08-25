@@ -12,6 +12,12 @@ public class ProcessingResult
     public List<string> OutputFilePaths { get; set; } = new();
     public string OriginalFilePath { get; set; } = string.Empty;
 
+    // The CaptureJob this result belongs to — stamped by BackgroundProcessingWorker after
+    // Process()/ProcessFixedFrames returns. Needed because several sibling jobs (one per fixed
+    // frame) can share the same OriginalFilePath, so JobCompleted's UI handler can no longer use
+    // OriginalFilePath alone to find the one thumbnail this result is actually for.
+    public string JobId { get; set; } = string.Empty;
+
     // Auto-crop
     public bool WasCropped { get; set; }
     public double CropConfidence { get; set; }

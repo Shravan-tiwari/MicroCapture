@@ -122,6 +122,10 @@ public class BackgroundProcessingWorker
                     var result = useFixedFrames
                         ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, frameReferenceWidth: job.Batch!.FixedFrameImageWidth, frameReferenceHeight: job.Batch!.FixedFrameImageHeight, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat)
                         : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat);
+                    // Stamped so JobCompleted's UI handler can match the one thumbnail this
+                    // result is for — several sibling jobs (one per fixed frame) can share the
+                    // same OriginalFilePath, so that alone is no longer a unique key.
+                    result.JobId = job.Id;
 
                     if (result.Success && result.OutputFilePaths.Count > 0)
                     {
