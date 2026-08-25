@@ -1338,8 +1338,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
         ActiveCropReview?.Dispose();
 
+        // This window only ever offers Adjust mode now (manual crop-quad/split-line/dewarp-curve
+        // editing removed), so openInAdjustMode no longer needs to do anything here.
         var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
-        if (openInAdjustMode) cropReviewViewModel.IsAdjustMode = true;
         cropReviewViewModel.Saved += (_, _) =>
         {
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);

@@ -1,10 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using Avalonia.Controls;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -16,6 +14,13 @@ using MicroCapture.Processing;
 
 namespace MicroCapture.UI.ViewModels;
 
+/// <summary>Post-capture touch-up window: rotate/flip/tone/color/sharpen adjustments only.
+/// Manual crop-quad/split-line/dewarp-curve editing has been removed — it was unreliable in
+/// practice, and boundary/curve correction is now handled entirely by the automatic Method 4
+/// pipeline (see ImageProcessor.Process/AltBoundaryPipeline.cs), which always re-detects the
+/// page boundary on reprocess. Saving from here re-queues the job through that same automatic
+/// path (or applies a delta directly to the derivative when the original is gone — see
+/// IsPostExportAdjustOnly).</summary>
 public partial class CropReviewViewModel : ViewModelBase, IDisposable
 {
     private readonly string _jobId;
@@ -42,38 +47,8 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     // whole batch. Empty for the ordinary single-page open (click a thumbnail).
     private readonly IReadOnlyList<string> _selectionForBulkApply;
 
-    // Cached so Reset can re-apply the smart-detected starting point instead of falling back
-    // to an unhelpful full-frame box or an unconditioned 50/50 split.
-    private CropPoint[]? _detectedCorners;
-    private double _detectedSplitPercent = 50.0;
-    private CropPoint[]? _detectedLeftQuad;
-    private CropPoint[]? _detectedRightQuad;
-
-    // Method 4's raw traced boundary (top/bottom curve, left/right side edge, gutter line), in
-    // the original image's own pixel coordinates — kept separately from the 4-corner quads above
-    // so the overlay can draw what Method 4 actually found, while the draggable quad (derived
-    // from these same traces, see BuildQuadFromMethod4) remains the thing the operator edits and
-    // Save persists. Null when the job has a saved manual crop (no detection ran) or detection
-    // failed to load/decode the image.
-    [ObservableProperty] private CropPoint[]? _method4TopCurve;
-    [ObservableProperty] private CropPoint[]? _method4BottomCurve;
-    [ObservableProperty] private CropPoint[]? _method4LeftCurve;
-    [ObservableProperty] private CropPoint[]? _method4RightCurve;
-    [ObservableProperty] private CropPoint[]? _method4GutterLine;
-
-    // A previously-saved manual dewarp curve, if any — seeded into DewarpTopPoints/BottomPoints
-    // the first time the operator opens the curve editor this session. _dewarpTouched tracks
-    // whether they actually did, so Save doesn't write dewarp data nobody looked at.
-    private DewarpModel? _savedDewarp;
-    private bool _dewarpTouched;
-
-    // Cached once at load for fast, non-blocking corner-snapping and live preview during
-    // interactive dragging — never re-computed per drag frame.
-    private IReadOnlyList<CropPoint> _edgePoints = Array.Empty<CropPoint>();
     private CropPreviewRenderer? _previewRenderer;
     private readonly DispatcherTimer _previewTimer;
-
-    private const double SnapRadiusPixels = 15.0;
 
     /// <summary>Raised after a successful Save & Reprocess, before the window closes — lets
     /// MainWindow show immediate "reprocessing" feedback on the matching thumbnail instead of
@@ -82,83 +57,14 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     public event EventHandler? Saved;
 
     [ObservableProperty] private Bitmap? _image;
-    [ObservableProperty] private double _splitPercent = 50.0;
-    [ObservableProperty] private bool _isSplitBookPages;
-    [ObservableProperty] private bool _isSinglePage;
     [ObservableProperty] private string _boundaryHintText = string.Empty;
 
-    // Single-page mode: the 4 freely-draggable corners of the crop quad, in the original
-    // image's own pixel coordinates (ordered top-left, top-right, bottom-right, bottom-left).
-    [ObservableProperty] private CropPoint _topLeft;
-    [ObservableProperty] private CropPoint _topRight;
-    [ObservableProperty] private CropPoint _bottomRight;
-    [ObservableProperty] private CropPoint _bottomLeft;
-
-    // Split mode has two editing styles: a single shared line (simple, always available), or
-    // two independent per-page quads when detection is confident enough to offer it (or the
-    // operator switches to it manually). Each array is always exactly 4 corners, same order
-    // as above.
-    [ObservableProperty] private bool _isTwoQuadSplit;
-    [ObservableProperty] private CropPoint[] _leftQuad = new CropPoint[4];
-    [ObservableProperty] private CropPoint[] _rightQuad = new CropPoint[4];
-
-    // XAML-facing computed flags for which split sub-editor should be visible. Dewarp mode
-    // takes over the whole overlay when active — the crop shape underneath isn't touched, just
-    // not rendered/draggable while the operator is adjusting curvature instead.
-    public bool IsLineSplitMode => IsSplitBookPages && !IsTwoQuadSplit && !IsDewarpMode;
-    public bool IsQuadSplitMode => IsSplitBookPages && IsTwoQuadSplit && !IsDewarpMode;
-
-    partial void OnIsSplitBookPagesChanged(bool value)
-    {
-        OnPropertyChanged(nameof(IsLineSplitMode));
-        OnPropertyChanged(nameof(IsQuadSplitMode));
-    }
-
-    partial void OnIsTwoQuadSplitChanged(bool value)
-    {
-        OnPropertyChanged(nameof(IsLineSplitMode));
-        OnPropertyChanged(nameof(IsQuadSplitMode));
-    }
-
-    // Book-curve control points, in the *downscaled crop preview's* own pixel space (see
-    // CropPreviewRenderer.Scale) — not the original image's coordinates, since dewarp is
-    // defined relative to the already-cropped page. Always exactly DewarpModel.ControlPointCount
-    // long. X stays pinned to each point's slot; only Y is operator-adjustable (see
-    // ResolveDewarpPointDrag).
-    [ObservableProperty] private CropPoint[] _dewarpTopPoints = new CropPoint[DewarpModel.ControlPointCount];
-    [ObservableProperty] private CropPoint[] _dewarpBottomPoints = new CropPoint[DewarpModel.ControlPointCount];
-    [ObservableProperty] private bool _isDewarpMode;
-    [ObservableProperty] private int _dewarpSpaceWidth;
-    [ObservableProperty] private int _dewarpSpaceHeight;
-    // The undewarped crop the operator drags control points against — deliberately separate
-    // from PreviewImage (which shows the live *corrected* result) so the drag surface itself
-    // never moves under the cursor while it's being edited.
-    [ObservableProperty] private Bitmap? _dewarpBackdropImage;
-
-    public string DewarpEditButtonLabel => IsDewarpMode ? "Done Adjusting Curve" : "Adjust Curve";
-
-    // The main panel's full-spread image + drag overlay are only meaningful while the operator
-    // is actually working with crop/split geometry — Dewarp mode already swaps in its own
-    // backdrop, and Adjust mode swaps in the live-adjusted cropped-page preview (see
-    // CropReviewWindow.axaml's AdjustTargetImage) instead, since judging rotation/tone/color
-    // against the full uncropped spread was confusing and made changes hard to actually see.
-    public bool ShowFullSpreadTarget => !IsDewarpMode && !IsAdjustMode;
-
-    partial void OnIsDewarpModeChanged(bool value)
-    {
-        OnPropertyChanged(nameof(IsLineSplitMode));
-        OnPropertyChanged(nameof(IsQuadSplitMode));
-        OnPropertyChanged(nameof(DewarpEditButtonLabel));
-        OnPropertyChanged(nameof(ShowFullSpreadTarget));
-        SchedulePreviewUpdate();
-    }
-
-    partial void OnDewarpTopPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
-    partial void OnDewarpBottomPointsChanged(CropPoint[] value) => SchedulePreviewUpdate();
+    // The full-frame corners passed to the preview renderer — this window no longer offers
+    // crop-quad editing, so the preview always renders against the whole image.
+    private CropPoint[] _fullFrameCorners = Array.Empty<CropPoint>();
 
     // ───────────── ADJUST MODE (rotate/flip/tone/color/sharpen) ─────────────
 
-    [ObservableProperty] private bool _isAdjustMode;
     [ObservableProperty] private int _rotationDegrees;
     [ObservableProperty] private bool _flipHorizontal;
     [ObservableProperty] private bool _flipVertical;
@@ -168,8 +74,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private double _sharpness;
     [ObservableProperty] private double _whiteBalance;
 
-    // Cached so Reset (in Adjust mode) can restore exactly what was loaded/saved, same pattern
-    // as _detectedCorners for crop mode.
+    // Cached so Reset can restore exactly what was loaded/saved.
     private bool _loadedHasManualAdjustments;
     private int _loadedRotationDegrees;
     private bool _loadedFlipHorizontal;
@@ -179,15 +84,6 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     private double _loadedSaturation;
     private double _loadedSharpness;
     private double _loadedWhiteBalance;
-
-    public string AdjustEditButtonLabel => IsAdjustMode ? "Done Adjusting" : "Adjust";
-
-    partial void OnIsAdjustModeChanged(bool value)
-    {
-        OnPropertyChanged(nameof(AdjustEditButtonLabel));
-        OnPropertyChanged(nameof(ShowFullSpreadTarget));
-        SchedulePreviewUpdate();
-    }
 
     partial void OnRotationDegreesChanged(int value) => SchedulePreviewUpdate();
     partial void OnFlipHorizontalChanged(bool value) => SchedulePreviewUpdate();
@@ -232,21 +128,11 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         Saturation = preset.Saturation;
     }
 
-    [RelayCommand]
-    private void ToggleAdjustMode()
-    {
-        if (Image == null) return;
-        IsAdjustMode = !IsAdjustMode;
-    }
-
     private bool HasNonDefaultAdjustments =>
         RotationDegrees != 0 || FlipHorizontal || FlipVertical || Brightness != 0 ||
         Contrast != 0 || Saturation != 0 || Sharpness != 0 || WhiteBalance != 0;
 
-    // Live preview of the corrected image as it's edited. Split mode uses both (left/right);
-    // single-page mode uses only PreviewImage.
     [ObservableProperty] private Bitmap? _previewImage;
-    [ObservableProperty] private Bitmap? _secondaryPreviewImage;
 
     public int ImageWidth { get; private set; }
     public int ImageHeight { get; private set; }
@@ -332,9 +218,8 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 Image = bmp;
                 ImageWidth = (int)bmp.Size.Width;
                 ImageHeight = (int)bmp.Size.Height;
-                SetCorners(RectCorners(0, 0, ImageWidth, ImageHeight));
+                _fullFrameCorners = RectCorners(0, 0, ImageWidth, ImageHeight);
                 _previewRenderer = CropPreviewRenderer.Create(derivative);
-                IsAdjustMode = true;
                 BoundaryHintText = "Original photo already deleted (batch exported) — tone/rotation touch-ups only.";
                 RenderPreview();
             }
@@ -366,431 +251,29 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         Sharpness = job.Sharpness;
         WhiteBalance = job.WhiteBalance;
 
-        // Decode and show the image immediately, before running any boundary detection. Method 4
-        // detection below (DetectSpreadBoundaryMethod4/DetectSinglePageBoundaryMethod4) plus
-        // DetectEdgePoints and CropPreviewRenderer.Create are OpenCV passes that can take
-        // several seconds — or hang — on a difficult image. Previously Image was only ever set
-        // at the end of that whole pipeline, on the UI-thread Post below, so the window stayed
-        // completely blank the entire time no matter how long the operator waited, with no
-        // partial content to indicate anything was happening. Decoding just the bitmap is fast
-        // and independent of detection, so it goes first and is posted to the UI thread right
-        // away.
         try
         {
             using var quickStream = File.OpenRead(job.OriginalFilePath);
             var quickBmp = new Bitmap(quickStream);
-            Dispatcher.UIThread.Post(() =>
-            {
-                Image = quickBmp;
-                ImageWidth = (int)quickBmp.Size.Width;
-                ImageHeight = (int)quickBmp.Size.Height;
-                BoundaryHintText = "Detecting page boundary…";
-            });
+            var imageWidth = (int)quickBmp.Size.Width;
+            var imageHeight = (int)quickBmp.Size.Height;
+            Image = quickBmp;
+            ImageWidth = imageWidth;
+            ImageHeight = imageHeight;
+            _fullFrameCorners = RectCorners(0, 0, imageWidth, imageHeight);
+            _previewRenderer = CropPreviewRenderer.Create(job.OriginalFilePath);
+            BoundaryHintText = "Adjust rotation, flip, and tone/color — reprocessing re-detects the page boundary automatically.";
+            RenderPreview();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[CropReviewViewModel] Quick image decode failed: {ex}");
+            Console.Error.WriteLine($"[CropReviewViewModel] Image decode failed: {ex}");
             LoadErrorMessage = $"Could not load this page: {ex.Message}";
-            return;
         }
-
-        // Now run detection on a background thread — this fills in the crop overlay/curves
-        // once ready, without having delayed the image itself above.
-        Task.Run(() =>
-        {
-            try
-            {
-                using var stream = File.OpenRead(job.OriginalFilePath);
-                var bmp = new Bitmap(stream);
-                var batch = _dbContext.Batches.Find(job.BatchId);
-                var hasSavedCrop = job.ManualOverrideApplied && !string.IsNullOrWhiteSpace(job.LeftCropBox);
-                var savedDewarp = job.DewarpManualOverrideApplied && !string.IsNullOrWhiteSpace(job.DewarpCurve)
-                    ? ImageProcessor.ParseDewarpCurve(job.DewarpCurve!)
-                    : null;
-                var imageWidth = (int)bmp.Size.Width;
-                var imageHeight = (int)bmp.Size.Height;
-
-                CropPoint[]? savedCorners = null;
-                CropPoint[]? savedRightCorners = null;
-                bool? savedIsTwoQuad = null;
-                CropPoint[]? detectedCorners = null;
-                CropPoint[]? detectedLeftQuad = null;
-                CropPoint[]? detectedRightQuad = null;
-                double detectedSplit = 50.0;
-                double detectedConfidence = 0.0;
-                double highConfidenceThreshold = 0.5;
-                CropPoint[]? topCurve = null;
-                CropPoint[]? bottomCurve = null;
-                CropPoint[]? leftCurve = null;
-                CropPoint[]? rightCurve = null;
-                CropPoint[]? gutterLine = null;
-
-                // What the batch's own automatic pipeline (ImageProcessor.Process) would decide
-                // for THIS specific image, not just the batch-level checkbox — see
-                // DetectAutoSplit's own remarks. A saved crop's own shape (one box vs. two)
-                // still wins for a job the operator already reviewed; this only drives what gets
-                // detected/previewed for a job that hasn't been reviewed yet.
-                var isSplit = hasSavedCrop
-                    ? !string.IsNullOrWhiteSpace(job.RightCropBox)
-                    : new ImageProcessor().DetectAutoSplit(_imagePath, batch?.SplitBookPages == true);
-
-                if (hasSavedCrop)
-                {
-                    savedCorners = ImageProcessor.ParseCropShape(job.LeftCropBox!, imageWidth, imageHeight);
-                    if (isSplit && !string.IsNullOrWhiteSpace(job.RightCropBox))
-                    {
-                        savedRightCorners = ImageProcessor.ParseCropShape(job.RightCropBox!, imageWidth, imageHeight);
-                        // 8 comma-separated numbers means this was saved as an independent quad
-                        // (two-quad mode was used); 4 means a plain rect/strip (line mode).
-                        savedIsTwoQuad = job.LeftCropBox!.Split(',').Length == 8;
-                    }
-                }
-                else
-                {
-                    var processor = new ImageProcessor();
-                    highConfidenceThreshold = processor.CropConfidenceThreshold;
-                    if (isSplit)
-                    {
-                        var spread = processor.DetectSpreadBoundaryMethod4(_imagePath);
-                        if (spread.HasValue)
-                        {
-                            var b = spread.Value;
-                            topCurve = ToCurve(b.TopFinal);
-                            bottomCurve = ToCurve(b.BottomFinal);
-                            leftCurve = ToCurve(b.Left.Columns, b.Left.RowLo, columnIsX: false);
-                            rightCurve = ToCurve(b.Right.Columns, b.Right.RowLo, columnIsX: false);
-                            gutterLine = b.Gutter.Line.Select(p => new CropPoint(p.Column, p.Row)).ToArray();
-
-                            var gutterMidCol = (b.Gutter.TopNotch.Column + b.Gutter.BottomNotch.Column) / 2.0;
-                            detectedLeftQuad = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth, xMax: gutterMidCol);
-                            detectedRightQuad = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth, xMin: gutterMidCol);
-                        }
-                        else
-                        {
-                            detectedSplit = processor.DetectGutterSplitPercent(_imagePath);
-                        }
-                    }
-                    else
-                    {
-                        var single = processor.DetectSinglePageBoundaryMethod4(_imagePath);
-                        if (single.HasValue)
-                        {
-                            var b = single.Value;
-                            topCurve = ToCurve(b.TopFinal);
-                            bottomCurve = ToCurve(b.BottomFinal);
-                            leftCurve = ToCurve(b.Left.Columns, b.Left.RowLo, columnIsX: false);
-                            rightCurve = ToCurve(b.Right.Columns, b.Right.RowLo, columnIsX: false);
-                            detectedCorners = BuildQuadFromMethod4(topCurve, bottomCurve, leftCurve, rightCurve, imageWidth);
-                            detectedConfidence = highConfidenceThreshold;
-                        }
-                    }
-                }
-
-                var edgePoints = ImageProcessor.DetectEdgePoints(_imagePath);
-                var previewRenderer = CropPreviewRenderer.Create(_imagePath);
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    try
-                    {
-                        Image = bmp;
-                        LoadErrorMessage = null;
-                        ImageWidth = imageWidth;
-                        ImageHeight = imageHeight;
-                        IsSplitBookPages = isSplit;
-                        IsSinglePage = !isSplit;
-                        _edgePoints = edgePoints;
-                        _previewRenderer = previewRenderer;
-                        _detectedCorners = detectedCorners;
-                        _detectedSplitPercent = detectedSplit;
-                        _detectedLeftQuad = detectedLeftQuad;
-                        _detectedRightQuad = detectedRightQuad;
-                        _savedDewarp = savedDewarp;
-                        Method4TopCurve = topCurve;
-                        Method4BottomCurve = bottomCurve;
-                        Method4LeftCurve = leftCurve;
-                        Method4RightCurve = rightCurve;
-                        Method4GutterLine = gutterLine;
-
-                        if (hasSavedCrop && savedCorners != null)
-                        {
-                            if (isSplit && savedIsTwoQuad == true && savedRightCorners != null)
-                            {
-                                IsTwoQuadSplit = true;
-                                LeftQuad = savedCorners;
-                                RightQuad = savedRightCorners;
-                            }
-                            else if (isSplit)
-                            {
-                                // Derive the split ratio from the saved left box's own width —
-                                // works whether it was saved as a legacy rect or an axis-aligned quad.
-                                IsTwoQuadSplit = false;
-                                var leftWidth = savedCorners[1].X - savedCorners[0].X;
-                                SplitPercent = imageWidth > 0
-                                    ? Math.Clamp(leftWidth / imageWidth * 100.0, 1.0, 99.0)
-                                    : 50.0;
-                            }
-                            else
-                            {
-                                SetCorners(savedCorners);
-                            }
-                            BoundaryHintText = "Previously saved crop restored — adjust if needed.";
-                        }
-                        else if (isSplit && detectedLeftQuad != null && detectedRightQuad != null)
-                        {
-                            IsTwoQuadSplit = true;
-                            LeftQuad = detectedLeftQuad;
-                            RightQuad = detectedRightQuad;
-                            BoundaryHintText = "Auto-detected two separate pages — drag a corner to adjust.";
-                        }
-                        else if (isSplit)
-                        {
-                            IsTwoQuadSplit = false;
-                            SplitPercent = detectedSplit;
-                            BoundaryHintText = "Estimated split point — drag the line to adjust.";
-                        }
-                        else if (detectedCorners != null)
-                        {
-                            SetCorners(detectedCorners);
-                            // Medium-confidence detections are still pre-filled — a suggestion
-                            // beats a blank full-frame box — but flagged so the operator knows
-                            // to actually check it rather than trusting it the way a
-                            // high-confidence detection earns.
-                            BoundaryHintText = detectedConfidence >= highConfidenceThreshold
-                                ? "Auto-detected boundary — drag a corner to adjust."
-                                : "Suggested boundary (lower confidence) — please check it carefully.";
-                        }
-                        else
-                        {
-                            SetCorners(RectCorners(0, 0, imageWidth, imageHeight));
-                            BoundaryHintText = "No boundary detected — showing full image.";
-                        }
-
-                        RenderPreview();
-                    }
-                    catch (Exception uiEx)
-                    {
-                        Console.Error.WriteLine($"[CropReviewViewModel] Applying loaded state failed: {uiEx}");
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[CropReviewViewModel] Background crop review load failed: {ex}");
-                Dispatcher.UIThread.Post(() => LoadErrorMessage = $"Could not load this page: {ex.Message}");
-            }
-        });
-    }
-
-    private void SetCorners(CropPoint[] corners)
-    {
-        TopLeft = corners[0];
-        TopRight = corners[1];
-        BottomRight = corners[2];
-        BottomLeft = corners[3];
     }
 
     private static CropPoint[] RectCorners(double x, double y, double w, double h) =>
         new[] { new CropPoint(x, y), new CropPoint(x + w, y), new CropPoint(x + w, y + h), new CropPoint(x, y + h) };
-
-    /// <summary>Converts a Method 4 per-column trace (<c>AltSpreadBoundary.TopFinal</c>/
-    /// <c>BottomFinal</c>, one row-value per column starting at column 0) into dense
-    /// <see cref="CropPoint"/>s in original-image pixel space, for the overlay to draw as a
-    /// polyline.</summary>
-    private static CropPoint[] ToCurve(double[] rowPerColumn) =>
-        rowPerColumn.Select((row, col) => new CropPoint(col, row)).ToArray();
-
-    /// <summary>Converts a Method 4 side-edge trace (<c>AltSideEdgeTrace.Columns</c>, one
-    /// x-position per row starting at <paramref name="rowLo"/>) into dense pixel-space points.
-    /// <paramref name="columnIsX"/> is always false here (kept for symmetry with
-    /// <see cref="ToCurve(double[])"/> — the side trace is naturally row-indexed, x is the
-    /// value), named so a call site reads as "x is the column value, not the loop index".</summary>
-    private static CropPoint[] ToCurve(double[] xPerRow, int rowLo, bool columnIsX) =>
-        xPerRow.Select((x, i) => new CropPoint(x, rowLo + i)).ToArray();
-
-    /// <summary>Collapses Method 4's raw traced curves down to the 4-corner quad the existing
-    /// draggable-crop UI expects, by sampling the top/bottom curves and left/right side traces
-    /// at the requested column range's endpoints. <paramref name="xMin"/>/<paramref name="xMax"/>
-    /// restrict the sample to one half of a spread (left half: xMax = gutter column, right half:
-    /// xMin = gutter column); omitted for a single page, which uses the traces' own full extent.
-    /// This is a starting point for editing, not the shape shown to the operator — the overlay
-    /// draws the real curves separately (see Method4TopCurve etc.).</summary>
-    private static CropPoint[] BuildQuadFromMethod4(
-        CropPoint[]? topCurve, CropPoint[]? bottomCurve, CropPoint[]? leftCurve, CropPoint[]? rightCurve,
-        int imageWidth, double? xMin = null, double? xMax = null)
-    {
-        var lo = Math.Clamp((int)Math.Round(xMin ?? 0), 0, imageWidth - 1);
-        var hi = Math.Clamp((int)Math.Round(xMax ?? (imageWidth - 1)), lo, imageWidth - 1);
-
-        double TopAt(int x) => topCurve != null && x < topCurve.Length ? topCurve[x].Y : 0;
-        double BottomAt(int x) => bottomCurve != null && x < bottomCurve.Length ? bottomCurve[x].Y : 0;
-
-        // Side traces are row-indexed (one x-value per row), not column-indexed — use their own
-        // median x as a stable left/right bound rather than trying to look up a single row.
-        var leftX = leftCurve is { Length: > 0 } lc ? lc.Average(p => p.X) : lo;
-        var rightX = rightCurve is { Length: > 0 } rc ? rc.Average(p => p.X) : hi;
-        leftX = Math.Max(leftX, lo);
-        rightX = Math.Min(rightX, hi);
-        if (rightX <= leftX) { leftX = lo; rightX = hi; }
-
-        var topLeftY = TopAt((int)Math.Round(leftX));
-        var topRightY = TopAt((int)Math.Round(rightX));
-        var bottomLeftY = BottomAt((int)Math.Round(leftX));
-        var bottomRightY = BottomAt((int)Math.Round(rightX));
-
-        return new[]
-        {
-            new CropPoint(leftX, topLeftY),
-            new CropPoint(rightX, topRightY),
-            new CropPoint(rightX, bottomRightY),
-            new CropPoint(leftX, bottomLeftY),
-        };
-    }
-
-    /// <summary>Called by the window while a corner is being dragged: snaps to a nearby real
-    /// edge when one is close enough, then clamps the result so the quad can never become
-    /// concave or self-intersecting. Also schedules a debounced live-preview update.</summary>
-    public CropPoint ResolveCornerDrag(int cornerIndex, CropPoint rawPosition)
-    {
-        var snapped = TrySnapToEdge(rawPosition);
-        var corners = new[] { TopLeft, TopRight, BottomRight, BottomLeft };
-        var resolved = CropGeometry.ClampCornerToConvex(corners, cornerIndex, snapped);
-        SchedulePreviewUpdate();
-        return resolved;
-    }
-
-    /// <summary>Same as <see cref="ResolveCornerDrag"/>, for a corner of one of the two
-    /// independent per-page quads in split mode.</summary>
-    public CropPoint ResolveSplitCornerDrag(bool isLeftPage, int cornerIndex, CropPoint rawPosition)
-    {
-        var snapped = TrySnapToEdge(rawPosition);
-        var corners = isLeftPage ? LeftQuad : RightQuad;
-        var resolved = CropGeometry.ClampCornerToConvex(corners, cornerIndex, snapped);
-        SchedulePreviewUpdate();
-        return resolved;
-    }
-
-    [RelayCommand]
-    private void ToggleSplitEditMode()
-    {
-        if (!IsSplitBookPages || Image == null) return;
-
-        if (IsTwoQuadSplit)
-        {
-            // Switching to line mode: derive an approximate split percent from the current quads.
-            var rightEdgeOfLeft = (LeftQuad[1].X + LeftQuad[2].X) / 2.0;
-            SplitPercent = ImageWidth > 0 ? Math.Clamp(rightEdgeOfLeft / ImageWidth * 100.0, 1.0, 99.0) : 50.0;
-            IsTwoQuadSplit = false;
-            BoundaryHintText = "Split line — drag to adjust, or switch to page-by-page.";
-        }
-        else
-        {
-            // Switching to page-by-page mode: seed both quads from the current split line.
-            var splitX = ImageWidth * (SplitPercent / 100.0);
-            LeftQuad = RectCorners(0, 0, splitX, ImageHeight);
-            RightQuad = RectCorners(splitX, 0, ImageWidth - splitX, ImageHeight);
-            IsTwoQuadSplit = true;
-            BoundaryHintText = "Two independent pages — drag a corner to adjust.";
-        }
-        SchedulePreviewUpdate();
-    }
-
-    /// <summary>The crop shape dewarp is edited and previewed against — the left/single page's
-    /// quad, since a saved manual curve currently applies to just that one shape (the pipeline
-    /// still auto-detects an independent curve for a split spread's right half).</summary>
-    private CropPoint[] CurrentPrimaryCorners() =>
-        IsSplitBookPages && IsTwoQuadSplit ? LeftQuad
-        : IsSplitBookPages ? RectCorners(0, 0, ImageWidth * (SplitPercent / 100.0), ImageHeight)
-        : new[] { TopLeft, TopRight, BottomRight, BottomLeft };
-
-    [RelayCommand]
-    private void ToggleDewarpEditMode()
-    {
-        if (Image == null) return;
-        if (!IsDewarpMode) SeedDewarpPoints();
-        IsDewarpMode = !IsDewarpMode;
-    }
-
-    /// <summary>Seeds the curve editor from (in priority order) a previously-saved manual
-    /// curve, an auto-detected one, or — when neither is available — a flat pair of lines the
-    /// operator can drag from scratch. Runs against a fresh crop-preview render so the control
-    /// points land in that render's own pixel space (see CropPreviewRenderer.Scale), which is
-    /// what Save later converts back to full-resolution coordinates.</summary>
-    private void SeedDewarpPoints()
-    {
-        var renderer = _previewRenderer;
-        if (renderer == null) return;
-
-        var bytes = renderer.RenderPreview(CurrentPrimaryCorners());
-        if (bytes == null) return;
-
-        try
-        {
-            using var ms = new MemoryStream(bytes);
-            var backdrop = new Bitmap(ms);
-            var old = DewarpBackdropImage;
-            DewarpBackdropImage = backdrop;
-            old?.Dispose();
-            DewarpSpaceWidth = (int)backdrop.Size.Width;
-            DewarpSpaceHeight = (int)backdrop.Size.Height;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[CropReviewViewModel] Dewarp preview backdrop failed: {ex}");
-            return;
-        }
-
-        _dewarpTouched = true;
-        var model = _savedDewarp ?? ImageProcessor.DetectDewarpCurveFromBytes(bytes);
-        if (model is { } m)
-        {
-            DewarpTopPoints = m.TopControlPoints;
-            DewarpBottomPoints = m.BottomControlPoints;
-        }
-        else
-        {
-            BoundaryHintText = "No confident curve detected — drag the lines to trace the page's actual bend.";
-            DewarpTopPoints = EvenlySpacedRow(DewarpSpaceWidth, DewarpSpaceHeight * 0.12);
-            DewarpBottomPoints = EvenlySpacedRow(DewarpSpaceWidth, DewarpSpaceHeight * 0.92);
-        }
-    }
-
-    private static CropPoint[] EvenlySpacedRow(int width, double y)
-    {
-        var points = new CropPoint[DewarpModel.ControlPointCount];
-        for (var i = 0; i < points.Length; i++)
-            points[i] = new CropPoint(width <= 1 ? 0 : (double)i / (points.Length - 1) * (width - 1), y);
-        return points;
-    }
-
-    /// <summary>Called by the window while a dewarp control point is being dragged: pins X to
-    /// the point's own slot (only curvature height is operator-adjustable) and clamps Y to the
-    /// preview's bounds.</summary>
-    public CropPoint ResolveDewarpPointDrag(bool isTop, int index, CropPoint rawPosition)
-    {
-        var points = isTop ? DewarpTopPoints : DewarpBottomPoints;
-        var pinnedX = index >= 0 && index < points.Length ? points[index].X : rawPosition.X;
-        var y = DewarpSpaceHeight > 0 ? Math.Clamp(rawPosition.Y, 0, DewarpSpaceHeight) : rawPosition.Y;
-        SchedulePreviewUpdate();
-        return new CropPoint(pinnedX, y);
-    }
-
-    private CropPoint TrySnapToEdge(CropPoint dragged)
-    {
-        if (_edgePoints.Count == 0) return dragged;
-
-        var nearestDistSq = double.MaxValue;
-        CropPoint? nearest = null;
-        foreach (var candidate in _edgePoints)
-        {
-            var dx = candidate.X - dragged.X;
-            var dy = candidate.Y - dragged.Y;
-            var distSq = dx * dx + dy * dy;
-            if (distSq < nearestDistSq) { nearestDistSq = distSq; nearest = candidate; }
-        }
-
-        return nearest is { } point && nearestDistSq <= SnapRadiusPixels * SnapRadiusPixels ? point : dragged;
-    }
 
     private void SchedulePreviewUpdate()
     {
@@ -800,64 +283,18 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
 
     private void RenderPreview()
     {
-        if (_previewRenderer == null) return;
-
-        if (IsAdjustMode)
-        {
-            RenderPreviewInto(CurrentPrimaryCorners(), isPrimary: true);
-            SecondaryPreviewImage = null;
-            return;
-        }
-
-        if (IsDewarpMode)
-        {
-            RenderPreviewInto(CurrentPrimaryCorners(), isPrimary: true);
-            SecondaryPreviewImage = null;
-            return;
-        }
-
-        if (IsSplitBookPages && IsTwoQuadSplit)
-        {
-            RenderPreviewInto(LeftQuad, isPrimary: true);
-            RenderPreviewInto(RightQuad, isPrimary: false);
-        }
-        else if (IsSplitBookPages)
-        {
-            var splitX = ImageWidth * (SplitPercent / 100.0);
-            RenderPreviewInto(RectCorners(0, 0, splitX, ImageHeight), isPrimary: true);
-            RenderPreviewInto(RectCorners(splitX, 0, ImageWidth - splitX, ImageHeight), isPrimary: false);
-        }
-        else
-        {
-            RenderPreviewInto(new[] { TopLeft, TopRight, BottomRight, BottomLeft }, isPrimary: true);
-            SecondaryPreviewImage = null;
-        }
-    }
-
-    private void RenderPreviewInto(CropPoint[] corners, bool isPrimary)
-    {
         var renderer = _previewRenderer;
         if (renderer == null) return;
 
-        // Snapshot under IsDewarpMode/IsAdjustMode's current values, not re-read inside the
-        // background task — the operator could toggle modes or drag a slider again before this
-        // frame finishes rendering.
-        DewarpModel? dewarpSnapshot = IsDewarpMode
-            ? new DewarpModel((CropPoint[])DewarpTopPoints.Clone(), (CropPoint[])DewarpBottomPoints.Clone())
-            : null;
-        var adjustSnapshot = IsAdjustMode
-            ? (RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance)
-            : ((int, bool, bool, double, double, double, double, double)?)null;
+        var corners = _fullFrameCorners;
+        var adjustSnapshot = (RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance);
 
         Task.Run(() =>
         {
-            byte[]? bytes;
-            if (adjustSnapshot is { } a)
-                bytes = renderer.RenderPreviewWithAdjustments(corners, a.Item1, a.Item2, a.Item3, a.Item4, a.Item5, a.Item6, a.Item7, a.Item8);
-            else if (dewarpSnapshot is { } d)
-                bytes = renderer.RenderPreviewWithDewarp(corners, d);
-            else
-                bytes = renderer.RenderPreview(corners);
+            var bytes = renderer.RenderPreviewWithAdjustments(corners,
+                adjustSnapshot.RotationDegrees, adjustSnapshot.FlipHorizontal, adjustSnapshot.FlipVertical,
+                adjustSnapshot.Brightness, adjustSnapshot.Contrast, adjustSnapshot.Saturation,
+                adjustSnapshot.Sharpness, adjustSnapshot.WhiteBalance);
             if (bytes == null) return;
             Dispatcher.UIThread.Post(() =>
             {
@@ -865,18 +302,9 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 {
                     using var ms = new MemoryStream(bytes);
                     var bitmap = new Bitmap(ms);
-                    if (isPrimary)
-                    {
-                        var old = PreviewImage;
-                        PreviewImage = bitmap;
-                        old?.Dispose();
-                    }
-                    else
-                    {
-                        var old = SecondaryPreviewImage;
-                        SecondaryPreviewImage = bitmap;
-                        old?.Dispose();
-                    }
+                    var old = PreviewImage;
+                    PreviewImage = bitmap;
+                    old?.Dispose();
                 }
                 catch (Exception ex)
                 {
@@ -886,48 +314,20 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         });
     }
 
-    partial void OnSplitPercentChanged(double value) => SchedulePreviewUpdate();
-    partial void OnLeftQuadChanged(CropPoint[] value) => SchedulePreviewUpdate();
-    partial void OnRightQuadChanged(CropPoint[] value) => SchedulePreviewUpdate();
-
     [RelayCommand]
     private void Reset()
     {
         if (Image == null) return;
 
-        if (IsAdjustMode)
-        {
-            // Restores whatever was loaded/last-saved for this job, not necessarily zero —
-            // matches the crop/dewarp Reset's own behavior of returning to the last-known-good
-            // state rather than an arbitrary default.
-            RotationDegrees = _loadedRotationDegrees;
-            FlipHorizontal = _loadedFlipHorizontal;
-            FlipVertical = _loadedFlipVertical;
-            Brightness = _loadedBrightness;
-            Contrast = _loadedContrast;
-            Saturation = _loadedSaturation;
-            Sharpness = _loadedSharpness;
-            WhiteBalance = _loadedWhiteBalance;
-            SchedulePreviewUpdate();
-            return;
-        }
-
-        if (IsSplitBookPages && IsTwoQuadSplit)
-        {
-            if (_detectedLeftQuad != null && _detectedRightQuad != null)
-            {
-                LeftQuad = _detectedLeftQuad;
-                RightQuad = _detectedRightQuad;
-            }
-        }
-        else if (IsSplitBookPages)
-        {
-            SplitPercent = _detectedSplitPercent;
-        }
-        else
-        {
-            SetCorners(_detectedCorners ?? RectCorners(0, 0, ImageWidth, ImageHeight));
-        }
+        // Restores whatever was loaded/last-saved for this job, not necessarily zero.
+        RotationDegrees = _loadedRotationDegrees;
+        FlipHorizontal = _loadedFlipHorizontal;
+        FlipVertical = _loadedFlipVertical;
+        Brightness = _loadedBrightness;
+        Contrast = _loadedContrast;
+        Saturation = _loadedSaturation;
+        Sharpness = _loadedSharpness;
+        WhiteBalance = _loadedWhiteBalance;
         SchedulePreviewUpdate();
     }
 
@@ -970,50 +370,14 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         var job = await _dbContext.CaptureJobs.FindAsync(_jobId);
         if (job != null)
         {
-            // Adjust mode never touches crop/split geometry — TopLeft/TopRight/BottomRight/
-            // BottomLeft (and the split quads) only exist to drive the Crop/Split UI, and their
-            // current values reflect whatever detection or a prior save last put there, not
-            // necessarily anything the operator has looked at or confirmed this session. Saving
-            // from Adjust mode used to unconditionally recompute and overwrite LeftCropBox/
-            // RightCropBox from those same values regardless of which mode was active — a no-op
-            // in the common case, but a real risk of persisting a stale/not-yet-settled crop box
-            // any time Adjust is used without the operator also reviewing Crop/Split first
-            // (confirmed to produce a degenerate, effectively-empty crop in one reproduction).
-            // Skipping the crop write entirely when only adjustments changed removes that risk
-            // — geometry is only ever written by an actual Crop/Split save.
-            if (!IsAdjustMode)
-            {
-                var previousLeftBox = job.LeftCropBox;
-                var previousRightBox = job.RightCropBox;
-                var wasAlreadyManual = job.ManualOverrideApplied;
-
-                if (IsSplitBookPages && IsTwoQuadSplit)
-                {
-                    job.LeftCropBox = FormatCorners(LeftQuad);
-                    job.RightCropBox = FormatCorners(RightQuad);
-                }
-                else if (IsSplitBookPages)
-                {
-                    var leftWidth = Math.Clamp((int)(ImageWidth * (SplitPercent / 100.0)), 1, ImageWidth - 1);
-                    job.LeftCropBox = $"0,0,{leftWidth},{ImageHeight}";
-                    job.RightCropBox = $"{leftWidth},0,{ImageWidth - leftWidth},{ImageHeight}";
-                }
-                else
-                {
-                    job.LeftCropBox = FormatCorners(TopLeft, TopRight, BottomRight, BottomLeft);
-                    job.RightCropBox = null;
-                }
-
-                // Only pin this job to the legacy manual-crop pipeline (see ImageProcessor.Process's
-                // manualOverride branch) if the operator actually changed the crop geometry from
-                // what was already there — a job that already had a saved manual crop stays manual
-                // regardless (re-saving without touching it is still an explicit confirm of a manual
-                // shape), but a fresh, never-reviewed job that gets opened and saved untouched should
-                // stay on the automatic Method 4 path, not silently lose it forever.
-                var geometryChanged = job.LeftCropBox != previousLeftBox || job.RightCropBox != previousRightBox;
-                job.ManualOverrideApplied = wasAlreadyManual || geometryChanged;
-            }
-
+            // Manual crop-quad/split-line/dewarp-curve editing has been removed from this
+            // window — this Save path only ever writes rotate/flip/tone/color/sharpen deltas
+            // now. LeftCropBox/RightCropBox/DewarpCurve/ManualOverrideApplied/
+            // DewarpManualOverrideApplied are intentionally left untouched here: a job re-queued
+            // from this window falls through to ImageProcessor.Process's automatic (Method 4)
+            // path exactly like a fresh capture, unless some OTHER mechanism (e.g. fixed-frame
+            // capture's own EnqueueCaptureAsync call) already marked it manual — that mechanism
+            // is untouched by this change and still owns those fields.
             job.RotationDegrees = RotationDegrees;
             job.FlipHorizontal = FlipHorizontal;
             job.FlipVertical = FlipVertical;
@@ -1023,19 +387,6 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             job.Sharpness = Sharpness;
             job.WhiteBalance = WhiteBalance;
             job.HasManualAdjustments = _loadedHasManualAdjustments || HasNonDefaultAdjustments;
-
-            // Dewarp control points live in the crop-preview renderer's downscaled pixel space
-            // (see SeedDewarpPoints) — convert back to full-resolution coordinates, matching
-            // what the pipeline applies against the actual cropped page.
-            if (_dewarpTouched && _previewRenderer != null)
-            {
-                var scale = _previewRenderer.Scale;
-                var fullResModel = new DewarpModel(
-                    ScalePoints(DewarpTopPoints, 1.0 / scale),
-                    ScalePoints(DewarpBottomPoints, 1.0 / scale));
-                job.DewarpCurve = ImageProcessor.FormatDewarpCurve(fullResModel);
-                job.DewarpManualOverrideApplied = true;
-            }
 
             job.ProcessingStatus = "Pending"; // Re-queue it
             job.QcStatus = "Pending";
@@ -1126,15 +477,6 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         _dbContext.SaveChanges();
         Saved?.Invoke(this, EventArgs.Empty);
     }
-
-    // Explicit invariant-culture formatting: the delimiter is a comma, and several Windows
-    // locales use ',' as the decimal separator — culture-sensitive formatting here would
-    // silently corrupt every saved crop on those systems.
-    private static string FormatCorners(params CropPoint[] corners) => string.Join(",", corners.SelectMany(c =>
-        new[] { c.X.ToString("F1", CultureInfo.InvariantCulture), c.Y.ToString("F1", CultureInfo.InvariantCulture) }));
-
-    private static CropPoint[] ScalePoints(CropPoint[] points, double factor) =>
-        points.Select(p => new CropPoint(p.X * factor, p.Y * factor)).ToArray();
 
     public void Dispose()
     {

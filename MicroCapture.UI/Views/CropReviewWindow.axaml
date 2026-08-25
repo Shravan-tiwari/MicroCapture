@@ -12,41 +12,17 @@
             <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
                     BorderThickness="1" Margin="14" CornerRadius="10" ClipToBounds="True">
                 <Grid Name="ContainerGrid">
-                    <!-- Crop mode: show live preview of current crop shape, not the full original image.
-                         This way the operator sees exactly what they're about to save at full size. -->
-                    <Image Name="TargetImage"
-                           Source="{Binding PreviewImage}"
-                           IsVisible="{Binding ShowFullSpreadTarget}"
-                           Stretch="Uniform"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center"/>
-                    <!-- Dewarp mode edits against the already-cropped (but not yet dewarped)
-                         page, so the operator can see and trace the page's actual curved text
-                         lines — the corrected result previews separately, in the LIVE PREVIEW
-                         panel, so the surface being dragged against never moves under the
-                         cursor while adjusting it. -->
-                    <Image Name="DewarpBackdropTargetImage"
-                           Source="{Binding DewarpBackdropImage}"
-                           IsVisible="{Binding IsDewarpMode}"
-                           Stretch="Uniform"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center"/>
-                    <!-- Adjust mode judges rotation/tone/color against the actual cropped page,
-                         shown large, instead of the full uncropped spread — PreviewImage is the
-                         same live-adjusted render the small LIVE PREVIEW panel already computes
-                         (RenderPreviewInto), just shown at full size here so changes are
-                         actually visible rather than needing to be judged from a thumbnail. -->
+                    <!-- Adjust mode judges rotation/tone/color against the actual page, shown
+                         large — PreviewImage is the same live-adjusted render the small LIVE
+                         PREVIEW panel already computes (RenderPreviewInto), just shown at full
+                         size here so changes are actually visible rather than needing to be
+                         judged from a thumbnail. This window only ever offers Adjust mode now —
+                         manual crop-quad/split-line/dewarp-curve editing has been removed. -->
                     <Image Name="AdjustTargetImage"
                            Source="{Binding PreviewImage}"
-                           IsVisible="{Binding IsAdjustMode}"
                            Stretch="Uniform"
                            HorizontalAlignment="Center"
                            VerticalAlignment="Center"/>
-                    <Canvas Name="OverlayCanvas"
-                            Background="Transparent"
-                            IsVisible="{Binding ShowFullSpreadTarget}"
-                            HorizontalAlignment="Stretch"
-                            VerticalAlignment="Stretch"/>
                     <TextBlock Text="{Binding LoadErrorMessage}"
                                IsVisible="{Binding LoadErrorMessage, Converter={x:Static acv:StringConverters.IsNotNullOrEmpty}}"
                                Foreground="{StaticResource InkMutedBrush}"
@@ -61,25 +37,12 @@
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                 <StackPanel Spacing="12">
                     <TextBlock Text="LIVE PREVIEW" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
-                    <Image Source="{Binding PreviewImage}" Stretch="Uniform"
-                           IsVisible="{Binding IsSinglePage}" MaxHeight="500"/>
-                    <StackPanel Orientation="Horizontal" Spacing="10" IsVisible="{Binding IsSplitBookPages}">
-                        <StackPanel Spacing="5" Width="150">
-                            <TextBlock Text="Left" Classes="caption"/>
-                            <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface2Brush}">
-                                <Image Source="{Binding PreviewImage}" Stretch="Uniform"/>
-                            </Border>
-                        </StackPanel>
-                        <StackPanel Spacing="5" Width="150">
-                            <TextBlock Text="Right" Classes="caption"/>
-                            <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface2Brush}">
-                                <Image Source="{Binding SecondaryPreviewImage}" Stretch="Uniform"/>
-                            </Border>
-                        </StackPanel>
-                    </StackPanel>
+                    <Image Source="{Binding PreviewImage}" Stretch="Uniform" MaxHeight="500"/>
 
-                    <!-- Adjust mode: rotate/flip/tone/color/sharpen controls, grouped -->
-                    <StackPanel Spacing="16" IsVisible="{Binding IsAdjustMode}" Margin="0,8,0,0">
+                    <!-- Rotate/flip/tone/color/sharpen controls, grouped — this window only ever
+                         offers Adjust mode now (manual crop-quad/split-line/dewarp-curve editing
+                         removed; reprocessing re-detects the page boundary automatically). -->
+                    <StackPanel Spacing="16" Margin="0,8,0,0">
                         <StackPanel Spacing="8">
                             <TextBlock Text="PRESETS" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
                             <WrapPanel>
@@ -151,45 +114,14 @@
         <!-- Bottom Action Bar -->
         <Border Grid.Row="1" Classes="panel" Margin="14,0,14,14" Padding="16,12">
             <Grid ColumnDefinitions="Auto, *, Auto">
-                <!-- Mode & Instruction Text -->
+                <!-- Instruction Text -->
                 <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
-                    <TextBlock Text="Split Book Pages" IsVisible="{Binding IsSplitBookPages}"
-                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                    <TextBlock Text="Single Page Crop" IsVisible="{Binding IsSinglePage}"
-                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" VerticalAlignment="Center"/>
-
                     <StackPanel Orientation="Horizontal" Spacing="7" VerticalAlignment="Center">
                         <Ellipse Width="7" Height="7" VerticalAlignment="Center"
                                  Fill="{Binding BoundaryHintText, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                         <TextBlock Text="{Binding BoundaryHintText}"
                                    Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="13"/>
                     </StackPanel>
-
-                    <!-- Crop/split/dewarp geometry no longer applies once the raw original is
-                         gone (batch already exported) — only tone/rotation touch-ups on the
-                         existing derivative are offered, and Adjust mode is forced on for the
-                         whole session, so its own toggle button is redundant here too. -->
-                    <Button Content="Switch to page-by-page" Command="{Binding ToggleSplitEditModeCommand}"
-                            IsVisible="{Binding IsLineSplitMode}" Classes="accentGhost"/>
-                    <Button Content="Switch to split line" Command="{Binding ToggleSplitEditModeCommand}"
-                            IsVisible="{Binding IsQuadSplitMode}" Classes="accentGhost"/>
-                    <Button Content="{Binding DewarpEditButtonLabel}" Command="{Binding ToggleDewarpEditModeCommand}"
-                            ToolTip.Tip="Manually trace this page's actual top/bottom curve when auto-detection isn't confident enough"
-                            IsVisible="{Binding !IsPostExportAdjustOnly}"
-                            Classes="accentGhost"/>
-                    <Button Content="{Binding AdjustEditButtonLabel}" Command="{Binding ToggleAdjustModeCommand}"
-                            ToolTip.Tip="Rotate, flip, and adjust brightness/contrast/saturation/sharpness/white balance"
-                            IsVisible="{Binding !IsPostExportAdjustOnly}"
-                            Classes="accentGhost"/>
-                </StackPanel>
-
-                <!-- Book Split Slider (Visible only in line-split mode) -->
-                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center"
-                            IsVisible="{Binding IsLineSplitMode}" Spacing="10" VerticalAlignment="Center">
-                    <TextBlock Text="Split Point" Foreground="{StaticResource InkSubtleBrush}" FontSize="13" VerticalAlignment="Center"/>
-                    <Slider Minimum="1" Maximum="99" Value="{Binding SplitPercent}" Width="200" VerticalAlignment="Center"/>
-                    <TextBlock Text="{Binding SplitPercent, StringFormat='{}{0:F0}%'}"
-                               Foreground="{StaticResource PrimaryHoverBrush}" FontWeight="SemiBold" Width="40" VerticalAlignment="Center"/>
                 </StackPanel>
 
                 <!-- Action Buttons -->
