@@ -94,6 +94,7 @@ public class CaptureQueueService
         EnsureWatermarkPresetsTable();
         EnsureColumn("Batches", "WatermarkEnabled", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "WatermarkPresetId", "TEXT NULL");
+        EnsureColumn("Batches", "DeviceId", "TEXT NULL");
     }
 
     private void EnsureWatermarkPresetsTable()
