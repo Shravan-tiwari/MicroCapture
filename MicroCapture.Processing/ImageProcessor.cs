@@ -604,6 +604,28 @@ public partial class ImageProcessor
             // notebook behavior to defer to here — kept exactly as before rather than re-derived.
             // Skipped entirely under manualOverride: an operator who already reviewed the crop
             // in Crop Review made an explicit choice that shouldn't be second-guessed.
+            //
+            // dewarpEnabled (the "Book Curve Correction" checkbox) gates the ENTIRE Method 4
+            // pipeline here — boundary detection, spread splitting, and curve-straightening are
+            // one inseparable operation in AltFlattenSpread/AltFlattenSinglePage, so there is no
+            // way to keep splitting while skipping the curve remap. Unchecked means the raw
+            // captured frame passes straight to FinishPageProcessing (finger removal,
+            // bleedthrough, enhancement, binarize, DPI resample) with no crop, no split, no
+            // dewarp — a two-page spread captured with the checkbox off comes out as a single
+            // unsplit page, same as any other capture. This mirrors ProcessFixedFrames's
+            // passthroughFixedFrames branch for how to build a ProcessingResult without Method
+            // 4, except FinishPageProcessing still runs here (that branch skips it; this
+            // shouldn't, since "no curve correction" isn't "no adjustments").
+            if (!manualOverride && !dewarpEnabled)
+            {
+                using var passthroughFinished = FinishPageProcessing(src, result, binarizeEnabled, meta.Dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+                var outPassthrough = WritePageOutput(outputDirectory, Path.GetFileNameWithoutExtension(inputPath), passthroughFinished, meta, result.WasBinarized, captureFormat, singlePageInputPath: inputPath);
+                result.OutputFilePaths.Add(outPassthrough);
+                result.WasCropped = false;
+                result.Success = true;
+                return result;
+            }
+
             if (!manualOverride)
             {
                 var autoGutter = DetectGutter(src, GutterMinFlankMarginFraction);
@@ -895,33 +917,43 @@ public partial class ImageProcessor
                 // calibrated rectangle may not exactly match the real page edge, so the trace
                 // needs margin around it to find the true boundary (FixedFrameSearchPadFraction,
                 // same convention the old searchRegion path used).
-                var padded = ClampRectToBounds(new Rect(
-                    (int)Math.Round(rect.X - rect.Width * FixedFrameSearchPadFraction),
-                    (int)Math.Round(rect.Y - rect.Height * FixedFrameSearchPadFraction),
-                    (int)Math.Round(rect.Width * (1 + 2 * FixedFrameSearchPadFraction)),
-                    (int)Math.Round(rect.Height * (1 + 2 * FixedFrameSearchPadFraction))), src.Cols, src.Rows);
-                var sub = new Mat(src, padded);
                 var frameResult = new ProcessingResult { OriginalFilePath = inputPath };
-                var altResult = AltFlattenSinglePage(sub);
-                // A featureless/low-signal capture (nothing for Method 4 to find anywhere in
-                // the padded search region — confirmed on a flat solid-color synthetic image)
-                // makes AltFlattenPage's own defensive fallback return an unrefined pass-through
-                // of the padded region, not the operator's actual calibrated rectangle — worse
-                // than just trusting the calibration directly, since it includes the extra
-                // search margin and none of the correction the padding exists to allow for. Fall
-                // back to a plain crop of the calibrated rect itself in that case; it's the
-                // rig's own known-good boundary, not a heuristic guess.
                 Mat flat;
-                if (altResult.FoundRealEdges)
+                if (!dewarpEnabled)
                 {
-                    flat = altResult.Flattened;
-                    sub.Dispose();
+                    // Book Curve Correction off: skip Method 4 entirely, same as Process()'s
+                    // own automatic-path skip-branch — take the calibrated rectangle as-is with
+                    // no boundary search, no split, no curve-straighten.
+                    flat = new Mat(src, rect).Clone();
                 }
                 else
                 {
-                    altResult.Flattened.Dispose();
-                    sub.Dispose();
-                    flat = new Mat(src, rect).Clone();
+                    var padded = ClampRectToBounds(new Rect(
+                        (int)Math.Round(rect.X - rect.Width * FixedFrameSearchPadFraction),
+                        (int)Math.Round(rect.Y - rect.Height * FixedFrameSearchPadFraction),
+                        (int)Math.Round(rect.Width * (1 + 2 * FixedFrameSearchPadFraction)),
+                        (int)Math.Round(rect.Height * (1 + 2 * FixedFrameSearchPadFraction))), src.Cols, src.Rows);
+                    var sub = new Mat(src, padded);
+                    var altResult = AltFlattenSinglePage(sub);
+                    // A featureless/low-signal capture (nothing for Method 4 to find anywhere in
+                    // the padded search region — confirmed on a flat solid-color synthetic image)
+                    // makes AltFlattenPage's own defensive fallback return an unrefined pass-through
+                    // of the padded region, not the operator's actual calibrated rectangle — worse
+                    // than just trusting the calibration directly, since it includes the extra
+                    // search margin and none of the correction the padding exists to allow for. Fall
+                    // back to a plain crop of the calibrated rect itself in that case; it's the
+                    // rig's own known-good boundary, not a heuristic guess.
+                    if (altResult.FoundRealEdges)
+                    {
+                        flat = altResult.Flattened;
+                        sub.Dispose();
+                    }
+                    else
+                    {
+                        altResult.Flattened.Dispose();
+                        sub.Dispose();
+                        flat = new Mat(src, rect).Clone();
+                    }
                 }
                 string detectedFramePath;
                 using (flat)
