@@ -595,15 +595,22 @@ public partial class ImageProcessor
             // correction + tilt fix) in exactly ONE Cv2.Remap call with InterpolationFlags.Linear,
             // matching the notebook exactly — this is the fix for that compounding-blur behavior.
             //
-            // The spine-shadow gutter signal (DetectGutter) still decides split-vs-single: this
-            // is a real, validated signal (see its own doc comment — confirmed against the
-            // operator's real photo fixtures, all 4 genuine spreads scored gutter confidence
-            // 0.23-0.79 and the one genuine single trapezoid page scored 0.05, cleanly on either
-            // side of GutterConfidenceThreshold) and the notebook itself never covers this
-            // decision (it only ever processes already-split single-page images), so there is no
-            // notebook behavior to defer to here — kept exactly as before rather than re-derived.
-            // Skipped entirely under manualOverride: an operator who already reviewed the crop
-            // in Crop Review made an explicit choice that shouldn't be second-guessed.
+            // Split-vs-single now comes from Method 4's OWN gutter-notch detection
+            // (AltGutterDetection.NotchFound — see AltDetectGutterNotch/AltFindNotchTurningPoint)
+            // instead of the separate ImageProcessor.DetectGutter spine-shadow-brightness
+            // heuristic this used to call here. That heuristic scans for the darkest column in a
+            // fixed central band with no notion of what's actually there — confirmed wrong on a
+            // real capture where a dark on-page photo sitting inside the search band outscored
+            // the genuine (much subtler) spine shadow, and it decides split-vs-single completely
+            // independently of the boundary detection that then actually runs, so its mistake
+            // and Method 4's own gutter-notch result could (and did) disagree. Method 4 already
+            // computes a real gutter notch as part of tracing the boundary either way, and now
+            // reports whether it actually found one (a genuine turning point on both curves, not
+            // a fallback to the seed column) — using that single signal for both decisions means
+            // there's only one gutter detector in this path, not two that can contradict each
+            // other, and the checkbox now runs nothing but the notebook's own cells. Skipped
+            // entirely under manualOverride: an operator who already reviewed the crop in Crop
+            // Review made an explicit choice that shouldn't be second-guessed.
             //
             // dewarpEnabled (the "Book Curve Correction" checkbox) gates the ENTIRE Method 4
             // pipeline here — boundary detection, spread splitting, and curve-straightening are
@@ -628,13 +635,16 @@ public partial class ImageProcessor
 
             if (!manualOverride)
             {
-                var autoGutter = DetectGutter(src, GutterMinFlankMarginFraction);
-                var autoSplit = splitPages
-                    || (autoGutter.Confidence >= GutterConfidenceThreshold && autoGutter.AbsoluteDropLevels >= GutterAbsoluteDropThreshold);
+                // Method 4 already traces the gutter notch as part of boundary detection either
+                // way (AltDetectSpreadBoundary, inside AltFlattenSpread) — run it once and use
+                // its own NotchFound signal to decide split-vs-single, rather than asking a
+                // second, independent detector first and possibly disagreeing with what Method 4
+                // itself then finds.
+                var altSpread = AltFlattenSpread(src);
+                var autoSplit = splitPages || altSpread.Boundary.Gutter.NotchFound;
 
                 if (autoSplit)
                 {
-                    var altSpread = AltFlattenSpread(src);
                     using var leftFlat = altSpread.Left.Flattened;
                     using var rightFlat = altSpread.Right.Flattened;
                     // Method 4 doesn't expose a separate "found real edges" flag on its result
@@ -659,6 +669,12 @@ public partial class ImageProcessor
                 }
                 else
                 {
+                    // No genuine gutter notch found -- this isn't a two-page spread. Discard the
+                    // speculative split flatten (computed above so its own NotchFound signal
+                    // could drive this decision) and fall through to the single-page path.
+                    altSpread.Left.Flattened.Dispose();
+                    altSpread.Right.Flattened.Dispose();
+
                     var altSingle = AltFlattenSinglePage(src);
                     using var flat = altSingle.Flattened;
                     // Same reasoning as the split branch above: "output dimensions differ from

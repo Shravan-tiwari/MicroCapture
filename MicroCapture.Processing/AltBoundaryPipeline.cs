@@ -317,10 +317,30 @@ public partial class ImageProcessor
 
     // --- Phase 2 tunables (ported from the notebook's own hardcoded constants). ---
 
-    /// <summary>Half-width (px) of the window searched around the seeded gutter-x for the
-    /// top/bottom curves' own notch extremum. Ported as-is from the notebook
-    /// (`search_half_width = 150`).</summary>
-    public int AltGutterNotchSearchHalfWidthPx { get; set; } = 150;
+    /// <summary>Half-widths (px) of the expanding windows searched around the seeded gutter-x
+    /// for the top/bottom curves' own notch turning point (see <see cref="AltDetectGutterNotch"/>).
+    /// Ported from the notebook's fixed Cell 5A (`(60, 120, 200, 300, 450)`), which replaced an
+    /// earlier single fixed-width version that is exactly the bug this fix addresses: a plain
+    /// global argmax/argmin over one wide window locks onto whatever the curve's most extreme
+    /// value happens to be anywhere in that window — including a point sitting right at the
+    /// window boundary that isn't a real turning point at all, just where the search stopped.
+    /// Expanding the window only when no genuine interior turning point is found avoids that.</summary>
+    public int[] AltGutterNotchSearchHalfWidthsPx { get; set; } = { 60, 120, 200, 300, 450 };
+
+    /// <summary>Odd smoothing window (px) applied to the top/bottom curves before notch-finding,
+    /// so single-column noise (finger/text contrast) can't fake a turning point. Ported from the
+    /// notebook's fixed Cell 5A (`smooth_win = 15`).</summary>
+    public int AltGutterNotchSmoothWindowPx { get; set; } = 15;
+
+    /// <summary>Minimum prominence (px) a candidate turning point must have — relative to the
+    /// smoothed curve's local baseline within ±40px — to count as a genuine notch rather than
+    /// noise. Ported from the notebook's fixed Cell 5A (`min_prominence=3.0`).</summary>
+    public double AltGutterNotchMinProminencePx { get; set; } = 3.0;
+
+    /// <summary>Candidates within this many px of a search window's edge are rejected — a
+    /// boundary point is not a confirmed turning point, just where the search stopped looking.
+    /// Ported from the notebook's fixed Cell 5A (`edge_margin=5`).</summary>
+    public int AltGutterNotchEdgeMarginPx { get; set; } = 5;
 
     /// <summary>HSV-saturation threshold below which local color is considered washed out by
     /// glare and not trustworthy for the side-edge trace's Cb-chroma tiebreaker — a different
@@ -335,8 +355,12 @@ public partial class ImageProcessor
     public readonly record struct AltGutterPoint(double Row, double Column);
 
     /// <summary>Result of <see cref="AltDetectGutterNotch"/>: the two notch anchor points found
-    /// in the already-traced top/bottom curves, plus the straight line connecting them.</summary>
-    public readonly record struct AltGutterDetection(AltEdgePoint TopNotch, AltEdgePoint BottomNotch, AltGutterPoint[] Line);
+    /// in the already-traced top/bottom curves, plus the straight line connecting them.
+    /// <see cref="NotchFound"/> is true only when BOTH curves show a genuine turning point (see
+    /// <see cref="AltFindNotchTurningPoint"/>) — a real spine notch, not a fallback to the seed
+    /// column because no notch exists. This is the honest signal for "is this actually a
+    /// two-page spread": a single page has no gutter to notch toward, so neither curve turns.</summary>
+    public readonly record struct AltGutterDetection(AltEdgePoint TopNotch, AltEdgePoint BottomNotch, AltGutterPoint[] Line, bool NotchFound);
 
     /// <summary>Finds the book gutter as two anchor points, NOT a per-row search — an earlier
     /// per-row Gx search wandered by ~200px chasing local text/shadow contrast near the spine
@@ -351,22 +375,15 @@ public partial class ImageProcessor
     /// local *min* of row) and connects the two notch points with a straight line. The notebook's
     /// own comment on this: "only slightly curved — if this isn't curved enough visually, next
     /// step is a gentle quadratic bow" — this ships the straight-line version; a quadratic bow is
-    /// explicitly deferred, not silently added.</summary>
+    /// explicitly deferred, not silently added.
+    ///
+    /// Uses <see cref="AltFindNotchTurningPoint"/> for each curve — a genuine turning-point
+    /// search, not a plain extremum over a fixed window (see that method's doc for why the
+    /// naive version fails on real captures).</summary>
     public AltGutterDetection AltDetectGutterNotch(double[] topEdge, double[] bottomEdge, int gutterSeedColumn)
     {
-        var w = topEdge.Length;
-        var loX = Math.Max(0, gutterSeedColumn - AltGutterNotchSearchHalfWidthPx);
-        var hiX = Math.Min(w, gutterSeedColumn + AltGutterNotchSearchHalfWidthPx);
-
-        var topNotchX = loX;
-        var topNotchVal = double.MinValue;
-        for (var x = loX; x < hiX; x++)
-            if (topEdge[x] > topNotchVal) { topNotchVal = topEdge[x]; topNotchX = x; }
-
-        var botNotchX = loX;
-        var botNotchVal = double.MaxValue;
-        for (var x = loX; x < hiX; x++)
-            if (bottomEdge[x] < botNotchVal) { botNotchVal = bottomEdge[x]; botNotchX = x; }
+        var (topNotchX, topNotchVal, topFound) = AltFindNotchTurningPoint(topEdge, gutterSeedColumn, findMax: true);
+        var (botNotchX, botNotchVal, botFound) = AltFindNotchTurningPoint(bottomEdge, gutterSeedColumn, findMax: false);
 
         var topNotch = new AltEdgePoint(topNotchX, topNotchVal);
         var botNotch = new AltEdgePoint(botNotchX, botNotchVal);
@@ -381,7 +398,131 @@ public partial class ImageProcessor
             line[i] = new AltGutterPoint(row, col);
         }
 
-        return new AltGutterDetection(topNotch, botNotch, line);
+        return new AltGutterDetection(topNotch, botNotch, line, topFound && botFound);
+    }
+
+    /// <summary>Finds a genuine local extremum (turning point) of <paramref name="curve"/> near
+    /// <paramref name="seedColumn"/> — a peak (<paramref name="findMax"/> true) or valley (false)
+    /// with real prominence, strictly interior to the search window (never at the window
+    /// boundary — a boundary point is not a turning point, just where the search stopped
+    /// looking). Searches expanding windows around the seed until a qualifying turning point is
+    /// found; never falls back to a plain global/boundary extremum.
+    ///
+    /// This replaces an earlier version that took the single global argmax/argmin of the curve
+    /// over one fixed-width window. On real captures the top/bottom edge curves are noisy and
+    /// keep drifting well past the gutter (finger/text contrast, the page's own bow), so the true
+    /// notch is often NOT the most extreme value in that window — some unrelated point, including
+    /// the window's own edge, can be more extreme. That is precisely what made the gutter anchor
+    /// land ~150-250px into a page instead of at the spine. Ported from the notebook's fixed
+    /// Cell 5A (`find_notch`).</summary>
+    private (int Column, double Row, bool Found) AltFindNotchTurningPoint(double[] curve, int seedColumn, bool findMax)
+    {
+        var n = curve.Length;
+        var smoothed = AltSmooth1D(curve, AltGutterNotchSmoothWindowPx);
+        var edgeMargin = AltGutterNotchEdgeMarginPx;
+
+        foreach (var halfWidth in AltGutterNotchSearchHalfWidthsPx)
+        {
+            var lo = Math.Max(0, seedColumn - halfWidth);
+            var hi = Math.Min(n, seedColumn + halfWidth);
+            var winLen = hi - lo;
+            if (winLen < 3) continue;
+
+            var bestX = -1;
+            var bestDist = int.MaxValue;
+
+            var i = 1;
+            while (i < winLen - 1)
+            {
+                // A turning point can be a flat plateau after smoothing/rounding (several equal
+                // samples at the exact extremum), not just a single strictly-extreme sample —
+                // requiring i-1 and i+1 to be STRICTLY on the far side, with no tolerance for
+                // float rounding, made a genuine notch invisible here: two adjacent smoothed
+                // values that are mathematically equal (935.6 == 935.6) came out as
+                // 935.5999999999999 vs 935.6 after the box-filter convolution, and relying on
+                // that accidental epsilon to break the tie is not something to depend on — a
+                // different (but equally valid) accumulation order can just as easily land the
+                // tie the other way and make the true notch vanish. Detect the whole flat run
+                // explicitly instead: walk forward while values stay within
+                // AltGutterNotchPlateauEpsilon of the start, then require a genuine (non-flat)
+                // rise/fall strictly outside the plateau on both sides.
+                var runStart = i;
+                var runVal = smoothed[lo + i];
+                var j = i;
+                while (j + 1 < winLen - 1 && Math.Abs(smoothed[lo + j + 1] - runVal) <= AltGutterNotchPlateauEpsilon) j++;
+                var runEnd = j; // inclusive, same window-local indexing as runStart
+
+                var before = smoothed[lo + runStart - 1];
+                var after = smoothed[lo + runEnd + 1];
+                var isCandidate = findMax
+                    ? before < runVal - AltGutterNotchPlateauEpsilon && after < runVal - AltGutterNotchPlateauEpsilon
+                    : before > runVal + AltGutterNotchPlateauEpsilon && after > runVal + AltGutterNotchPlateauEpsilon;
+
+                if (isCandidate)
+                {
+                    // Anchor on the plateau's midpoint -- with no single strict extremum among
+                    // equal-height samples, the middle of the flat run is the least-arbitrary
+                    // choice.
+                    var mid = (runStart + runEnd) / 2;
+
+                    if (mid >= edgeMargin && mid < winLen - edgeMargin)
+                    {
+                        var baseLo = Math.Max(0, mid - 40);
+                        var baseHi = Math.Min(winLen - 1, mid + 40);
+                        var prominence = findMax
+                            ? smoothed[lo + mid] - Math.Min(smoothed[lo + baseLo], smoothed[lo + baseHi])
+                            : Math.Max(smoothed[lo + baseLo], smoothed[lo + baseHi]) - smoothed[lo + mid];
+
+                        if (prominence >= AltGutterNotchMinProminencePx)
+                        {
+                            var dist = Math.Abs(mid - (seedColumn - lo));
+                            if (dist < bestDist) { bestDist = dist; bestX = lo + mid; }
+                        }
+                    }
+                }
+
+                i = runEnd + 1;
+            }
+
+            if (bestX >= 0) return (bestX, curve[bestX], true);
+        }
+
+        // no expansion found a qualifying turning point -- the curve truly has no notch here;
+        // use the seed itself rather than guessing.
+        var clamped = Math.Clamp(seedColumn, 0, n - 1);
+        return (clamped, curve[clamped], false);
+    }
+
+    /// <summary>Tolerance (px) for treating adjacent smoothed samples as "the same height" when
+    /// detecting a plateau at a turning point (see <see cref="AltFindNotchTurningPoint"/>) —
+    /// small enough to never merge two genuinely different features, large enough to absorb
+    /// float rounding from the box-filter convolution.</summary>
+    public double AltGutterNotchPlateauEpsilon { get; set; } = 1e-6;
+
+    /// <summary>Simple box-filter smoothing with edge-replicated padding, used to keep
+    /// single-column noise from faking a turning point in <see cref="AltFindNotchTurningPoint"/>.
+    /// Ported from the notebook's fixed Cell 5A (`smooth1d`).</summary>
+    private static double[] AltSmooth1D(double[] a, int window)
+    {
+        if (window < 3) return (double[])a.Clone();
+
+        var n = a.Length;
+        var pad = window / 2;
+        var padded = new double[n + 2 * pad];
+        for (var i = 0; i < pad; i++) padded[i] = a[0];
+        Array.Copy(a, 0, padded, pad, n);
+        for (var i = 0; i < pad; i++) padded[pad + n + i] = a[n - 1];
+
+        var result = new double[n];
+        var acc = 0.0;
+        for (var i = 0; i < window; i++) acc += padded[i];
+        result[0] = acc / window;
+        for (var i = 1; i < n; i++)
+        {
+            acc += padded[i + window - 1] - padded[i - 1];
+            result[i] = acc / window;
+        }
+        return result;
     }
 
     /// <summary>Row-direction analogue of <see cref="AltFindSustainedTransitionRow"/>, used to
@@ -1347,21 +1488,31 @@ public partial class ImageProcessor
         var topBridgedCount = CountBridged(topRaw, topBridged);
         var bottomBridgedCount = CountBridged(bottomRaw, bottomBridged);
 
+        // Gutter seed: plain image-center column, matching the notebook's own `gutter_x_global
+        // = Wf // 2` exactly ("crude center seed -- no Cb-valley gutter estimate to anchor to").
+        // An earlier version preferred ImageProcessor.DetectGutter's spine-shadow-brightness
+        // estimate as a supposedly better seed, but that detector scans for the darkest column
+        // in a fixed central band with no notion of what's actually IN that band — a dark
+        // on-page photo sitting inside the search band reads as a stronger "gutter" than the
+        // real (much subtler) spine shadow, confirmed on a real capture where it seeded ~290px
+        // off the true spine. AltFindNotchTurningPoint's expanding-window turning-point search
+        // (see its own doc comment) doesn't need a precise seed to find the real notch — a
+        // plain center guess is sufficient and matches the notebook's own approach, so there is
+        // no reason to import a second, less reliable detector's guess here.
+        //
+        // Gutter notch runs on the BRIDGED (pre-Sav-Gol) curves, not the smoothed ones — this
+        // matches the notebook's own cell order exactly: Cell 5A (gutter notch) operates on
+        // `top_edge_final`/`bottom_edge`, and Cell 6D (Sav-Gol smoothing) runs AFTER it, only for
+        // the side-edge/span detection downstream. Confirmed as a real bug when this ran on the
+        // smoothed curves instead: AltSavGolWindow=151 is wide enough that its degree-2 fit
+        // flattens away the gutter notch's own (often modest, ~5-10px) dip entirely, so
+        // NotchFound came back false even when the notch's plain coordinates were still right by
+        // coincidence — silently breaking the split-vs-single decision on a real two-page spread.
+        var gutterSeedColumn = img.Cols / 2;
+        var gutter = AltDetectGutterNotch(topBridged, bottomBridged, gutterSeedColumn);
+
         var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
         var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
-
-        // Gutter seed: prefer the already-validated spine-shadow detector (ImageProcessor.
-        // DetectGutter — real per-batch signal, confirmed against real fixtures per its own doc
-        // comment) over the notebook's own crude `Wf // 2` fallback, which is only ever a last
-        // resort when no better measurement exists (the notebook's own comment on
-        // gutter_x_global says exactly this: "crude center seed -- no Cb-valley gutter estimate
-        // to anchor to"). Falls back to center when DetectGutter isn't confident, matching the
-        // notebook's own fallback behavior.
-        var gutterDetection = DetectGutter(img, GutterMinFlankMarginFraction);
-        var gutterSeedColumn = gutterDetection.Confidence >= GutterConfidenceThreshold
-            ? Math.Clamp((int)Math.Round(img.Cols * gutterDetection.Fraction), 0, img.Cols - 1)
-            : img.Cols / 2;
-        var gutter = AltDetectGutterNotch(topSmooth, bottomSmooth, gutterSeedColumn);
 
         var gutterMidCol = Math.Clamp((int)Math.Round((gutter.TopNotch.Column + gutter.BottomNotch.Column) / 2.0), 0, img.Cols - 1);
 
@@ -1479,7 +1630,7 @@ public partial class ImageProcessor
         sb.AppendLine($"Page size: {mat.Cols}x{mat.Rows}");
         sb.AppendLine($"Top edge: {boundary.TopBridgedCount}/{mat.Cols} columns bridged (low-confidence)");
         sb.AppendLine($"Bottom edge: {boundary.BottomBridgedCount}/{mat.Cols} columns bridged (low-confidence)");
-        sb.AppendLine($"Gutter notch: top=({boundary.Gutter.TopNotch.Column},{boundary.Gutter.TopNotch.Row:F1}) bottom=({boundary.Gutter.BottomNotch.Column},{boundary.Gutter.BottomNotch.Row:F1})");
+        sb.AppendLine($"Gutter notch: top=({boundary.Gutter.TopNotch.Column},{boundary.Gutter.TopNotch.Row:F1}) bottom=({boundary.Gutter.BottomNotch.Column},{boundary.Gutter.BottomNotch.Row:F1}) NotchFound={boundary.Gutter.NotchFound}");
         sb.AppendLine($"Left edge: {boundary.Left.LowConfidenceRows} rows bridged ({boundary.Left.GlareChromaRecovered} recovered via glare-gated Cb tiebreaker), x range {boundary.Left.Columns.Min():F0}-{boundary.Left.Columns.Max():F0}");
         sb.AppendLine($"Right edge: {boundary.Right.LowConfidenceRows} rows bridged ({boundary.Right.GlareChromaRecovered} recovered via glare-gated Cb tiebreaker), x range {boundary.Right.Columns.Min():F0}-{boundary.Right.Columns.Max():F0}");
         return sb.ToString();
