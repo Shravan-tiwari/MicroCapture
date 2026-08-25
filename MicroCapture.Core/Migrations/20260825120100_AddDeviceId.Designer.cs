@@ -42,7 +42,6 @@ namespace MicroCapture.Core.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("DeviceId")
-                        .IsRequired()
                         .HasColumnType("TEXT");
 
                     b.Property<int>("Dpi")

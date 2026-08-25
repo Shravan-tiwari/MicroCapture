@@ -65,7 +65,7 @@ public partial class RecentBatchesViewModel : ViewModelBase
         // already touched this session. Filter by current device so only this machine's batches appear.
         var batches = await _dbContext.Batches
             .AsNoTracking()
-            .Where(b => b.DeviceId == currentDevice)
+            .Where(b => string.IsNullOrEmpty(b.DeviceId) || b.DeviceId == currentDevice)
             .Include(b => b.Project)
             .Include(b => b.Captures)
             .OrderByDescending(b => b.StartTime)

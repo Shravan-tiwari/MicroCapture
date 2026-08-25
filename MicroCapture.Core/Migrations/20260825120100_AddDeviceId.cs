@@ -14,8 +14,7 @@ namespace MicroCapture.Core.Migrations
                 name: "DeviceId",
                 table: "Batches",
                 type: "TEXT",
-                nullable: false,
-                defaultValue: "");
+                nullable: true);
 
             migrationBuilder.CreateIndex(
                 name: "IX_Batches_DeviceId",
