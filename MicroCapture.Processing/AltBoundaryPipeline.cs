@@ -1373,13 +1373,50 @@ public partial class ImageProcessor
         var profile = ComputeSignChangeProfile(gx, topY, botY);
         double threshold;
         try { threshold = OtsuSplit(profile.SignChanges, profile.Valid); }
-        catch (InvalidOperationException) { return null; }
+        catch (InvalidOperationException ex)
+        {
+            if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+                Console.WriteLine($"DEBUG DetectMethod4Span: OtsuSplit threw: {ex.Message}");
+            return null;
+        }
 
         var mask = new bool[w];
         for (var x = 0; x < w; x++) mask[x] = profile.Valid[x] && profile.SignChanges[x] >= threshold;
+
+        if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+        {
+            var validCount = 0;
+            var maskCountBeforeClean = 0;
+            var scMin = float.MaxValue;
+            var scMax = float.MinValue;
+            for (var x = 0; x < w; x++)
+            {
+                if (profile.Valid[x])
+                {
+                    validCount++;
+                    if (profile.SignChanges[x] < scMin) scMin = profile.SignChanges[x];
+                    if (profile.SignChanges[x] > scMax) scMax = profile.SignChanges[x];
+                }
+                if (mask[x]) maskCountBeforeClean++;
+            }
+            Console.WriteLine($"DEBUG DetectMethod4Span: w={w} validCount={validCount} signChangeRange=[{scMin},{scMax}] otsuThreshold={threshold:F3} maskCountBeforeClean={maskCountBeforeClean} spanGutterX={spanGutterX}");
+        }
+
         mask = CleanMask1D(mask, w);
 
-        return FindBookSpan(mask, w, spanGutterX);
+        if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+        {
+            var maskCountAfterClean = 0;
+            for (var x = 0; x < w; x++) if (mask[x]) maskCountAfterClean++;
+            Console.WriteLine($"DEBUG DetectMethod4Span: maskCountAfterClean={maskCountAfterClean}");
+        }
+
+        var result = FindBookSpan(mask, w, spanGutterX);
+
+        if (Environment.GetEnvironmentVariable("ALT_SPAN_DEBUG") == "1")
+            Console.WriteLine($"DEBUG DetectMethod4Span: FindBookSpan result={(result is { } r ? $"({r.Lo},{r.Hi})" : "null")}");
+
+        return result;
     }
 
     /// <summary>Full Method 4 side-boundary detection for a spread OR a genuine single page:
