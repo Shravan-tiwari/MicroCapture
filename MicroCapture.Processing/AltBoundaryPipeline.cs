@@ -1516,7 +1516,16 @@ public partial class ImageProcessor
 
         var gutterMidCol = Math.Clamp((int)Math.Round((gutter.TopNotch.Column + gutter.BottomNotch.Column) / 2.0), 0, img.Cols - 1);
 
-        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, gutterMidCol);
+        // Method 4 also runs on the BRIDGED (pre-Sav-Gol) curves, not the smoothed ones — same
+        // reasoning as the gutter notch above. The notebook's Method 4 cell sets `top_arr`/
+        // `bot_arr` straight from `top_edge_final`/`bottom_edge` (its Cell 4D output) thousands
+        // of lines before the Sav-Gol `smooth()` cell is even defined; Method 4 uses these to
+        // pick each side's row_top/row_bot search span and each column's sign-change trim
+        // window, so this was silently feeding it the wrong span/window on a tilted or
+        // physically curled photo (the wide 151-sample degree-2 fit flattens real top/bottom
+        // tilt and page-corner detail) — the same class of bug as the gutter fix: a downstream
+        // search window driven by an over-smoothed curve instead of the real traced one.
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topBridged, bottomBridged, gutterMidCol);
         var left = method4.Left;
         var right = method4.Right;
 
@@ -1566,7 +1575,9 @@ public partial class ImageProcessor
         var topSmooth = AltSavGolFilter(topBridged, AltSavGolWindow, AltSavGolPolyDegree);
         var bottomSmooth = AltSavGolFilter(bottomBridged, AltSavGolWindow, AltSavGolPolyDegree);
 
-        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topSmooth, bottomSmooth, img.Cols / 2, hasRealGutter: false);
+        // Method 4 runs on the BRIDGED (pre-Sav-Gol) curves, not the smoothed ones — see
+        // AltDetectSpreadBoundary's matching remark on its own Method 4 call for why.
+        var method4 = AltTraceSideEdgeMethod4Pair(img, gray, gx, topBridged, bottomBridged, img.Cols / 2, hasRealGutter: false);
 
         return new AltSinglePageBoundary(topRaw, topBridged, topSmooth, bottomRaw, bottomBridged, bottomSmooth, method4.Left, method4.Right, topBridgedCount, bottomBridgedCount);
     }
