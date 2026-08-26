@@ -211,6 +211,16 @@ public partial class MainWindowViewModel : ViewModelBase
     private (double X, double Y, double Width, double Height)? _smoothedRect;
     private byte[]? _lastDetectedSignature;
     private byte[]? _lastCapturedSignature;
+    // The signature equivalent of _smoothedRect. Position had jitter absorption; content did not,
+    // so on a blank or near-uniform page ordinary sensor noise between two consecutive checks
+    // could exceed ContentChangeThreshold and keep resetting the settle counter — auto-capture
+    // would then never fire no matter how still the page was. Kept as doubles because an EMA of
+    // byte samples needs sub-integer precision to converge.
+    private double[]? _smoothedSignature;
+    private const double SignatureSmoothingFactor = 0.45;
+    // Last gate that blocked an auto-capture, so transitions can be logged once rather than
+    // twice a second. See LogAutoCaptureGate.
+    private string? _lastAutoCaptureGate;
 
     // Thumbnail items for recent captures
     public ObservableCollection<ThumbnailItem> RecentCaptures { get; } = new();
@@ -471,12 +481,13 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!check.Decoded || check.Regions == null || check.Regions.Length == 0)
         {
             _stableFrameCount = 0;
+            _smoothedSignature = null;
             DocumentStatus = "Frames set — waiting for live view";
+            LogAutoCaptureGate("no-live-view", "frame mode: no decodable regions");
             return;
         }
 
         var signature = ConcatSignatures(check.Regions);
-        var previous = _lastDetectedSignature;
         _lastDetectedSignature = signature;
 
         // The geometry a shot would use is still moving under the operator's hand.
@@ -498,21 +509,32 @@ public partial class MainWindowViewModel : ViewModelBase
         if (minSharpness < LiveSharpnessThreshold)
         {
             _stableFrameCount = 0;
+            _smoothedSignature = SmoothSignature(_smoothedSignature, signature, SignatureSmoothingFactor);
             DocumentStatus = "✓ Frames set — focusing…";
+            LogAutoCaptureGate("sharpness", $"frame mode: weakest region {minSharpness:F1} < {LiveSharpnessThreshold} (per-region: {string.Join(", ", check.Regions.Select(r => r.Sharpness.ToString("F1")))})");
             return;
         }
 
-        var settled = previous != null && ContentDifference(signature, previous) < ContentChangeThreshold;
+        // Compare against the smoothed reference from before this update, then blend it toward
+        // the new sample — mirroring how _smoothedRect works in auto-detect mode. Comparing two
+        // consecutive raw signatures let sensor noise on a near-uniform page reset the counter
+        // indefinitely.
+        var settleDiff = SignatureDifference(signature, _smoothedSignature);
+        var settled = _smoothedSignature != null && settleDiff < ContentChangeThreshold;
+        _smoothedSignature = SmoothSignature(_smoothedSignature, signature, SignatureSmoothingFactor);
         _stableFrameCount = settled ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Frames set — hold still…";
+            LogAutoCaptureGate("settling", $"frame mode: content still moving, diff {settleDiff:F1} vs threshold {ContentChangeThreshold}, stable {_stableFrameCount}/{StableFramesRequired}");
             return;
         }
 
-        if (_lastCapturedSignature != null && ContentDifference(signature, _lastCapturedSignature) < ContentChangeThreshold)
+        var capturedDiff = ContentDifference(signature, _lastCapturedSignature);
+        if (_lastCapturedSignature != null && capturedDiff < ContentChangeThreshold)
         {
             DocumentStatus = "✓ Captured — swap page to continue";
+            LogAutoCaptureGate("same-as-last", $"frame mode: matches last capture, diff {capturedDiff:F1} < {ContentChangeThreshold}");
             return;
         }
 
@@ -523,6 +545,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         DocumentStatus = "✓ Capturing…";
+        LogAutoCaptureGate("firing", $"frame mode: {Frames.Count} frame(s), weakest sharpness {minSharpness:F1}");
         _lastCapturedSignature = signature;
         _stableFrameCount = 0;
         _ = CaptureAsync();
@@ -542,7 +565,9 @@ public partial class MainWindowViewModel : ViewModelBase
             _stableFrameCount = 0;
             _smoothedRect = null;
             _lastDetectedSignature = null;
+            _smoothedSignature = null;
             DocumentStatus = "Waiting for boundary";
+            LogAutoCaptureGate("no-boundary", "auto-detect: no page-sized contour found — check lighting/contrast against the backdrop, or draw frames instead");
             return;
         }
 
@@ -562,6 +587,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _stableFrameCount = 0;
             _smoothedRect = rect;
             DocumentStatus = "✓ Boundary detected — focusing…";
+            LogAutoCaptureGate("sharpness", $"auto-detect: document-region sharpness {check.Sharpness:F1} < {LiveSharpnessThreshold}");
             return;
         }
 
@@ -576,6 +602,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Boundary detected — hold still…";
+            LogAutoCaptureGate("settling", $"auto-detect: page still moving, stable {_stableFrameCount}/{StableFramesRequired}");
             return;
         }
 
@@ -584,6 +611,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (isSameAsLastCapture)
         {
             DocumentStatus = "✓ Captured — swap page to continue";
+            LogAutoCaptureGate("same-as-last", $"auto-detect: matches last capture, diff {contentDiff:F1} < {ContentChangeThreshold}");
             return;
         }
 
@@ -594,6 +622,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         DocumentStatus = "✓ Capturing…";
+        LogAutoCaptureGate("firing", $"auto-detect: sharpness {check.Sharpness:F1}, content diff {contentDiff:F1}");
         _lastCapturedSignature = check.ContentSignature;
         _stableFrameCount = 0;
         _ = CaptureAsync();
@@ -627,6 +656,50 @@ public partial class MainWindowViewModel : ViewModelBase
             from.Y + (to.Y - from.Y) * t,
             from.Width + (to.Width - from.Width) * t,
             from.Height + (to.Height - from.Height) * t);
+
+    /// <summary>Mean absolute difference between a raw signature and the smoothed reference —
+    /// the content counterpart of <see cref="IsRectStable"/>'s comparison against
+    /// <see cref="_smoothedRect"/>.</summary>
+    private static double SignatureDifference(byte[]? current, double[]? smoothed)
+    {
+        if (current == null || smoothed == null || current.Length != smoothed.Length || current.Length == 0) return double.MaxValue;
+        double sum = 0;
+        for (var i = 0; i < current.Length; i++) sum += Math.Abs(current[i] - smoothed[i]);
+        return sum / current.Length;
+    }
+
+    /// <summary>Blends the smoothed signature toward the newest sample, seeding it on first use.</summary>
+    private static double[] SmoothSignature(double[]? previous, byte[] current, double t)
+    {
+        if (previous == null || previous.Length != current.Length)
+        {
+            var seeded = new double[current.Length];
+            for (var i = 0; i < current.Length; i++) seeded[i] = current[i];
+            return seeded;
+        }
+        var blended = new double[current.Length];
+        for (var i = 0; i < current.Length; i++) blended[i] = previous[i] + (current[i] - previous[i]) * t;
+        return blended;
+    }
+
+    /// <summary>Records which gate is currently holding auto-capture back, with the numbers behind
+    /// it. Auto-capture failing in the field reads as "it just didn't fire" — the on-screen status
+    /// says which stage it's stuck at but vanishes immediately and carries no measured values, so
+    /// there's nothing to diagnose from afterwards. Logs only on a transition, since checks run
+    /// twice a second. Never throws: a diagnostics failure must not disturb capture.</summary>
+    private void LogAutoCaptureGate(string gate, string detail)
+    {
+        if (_lastAutoCaptureGate == gate) return;
+        _lastAutoCaptureGate = gate;
+        try
+        {
+            var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MicroCapture", "Logs");
+            Directory.CreateDirectory(directory);
+            File.AppendAllText(Path.Combine(directory, "auto-capture.log"),
+                $"[{DateTimeOffset.Now:O}] {gate} — {detail}{Environment.NewLine}");
+        }
+        catch { /* Diagnostics are best-effort. */ }
+    }
 
     // ---------- Commands ----------
 

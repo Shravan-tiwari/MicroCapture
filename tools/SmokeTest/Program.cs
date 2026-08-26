@@ -57,6 +57,7 @@ TestIndependentSkewedQuadsPerPage();
 await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
 TestLowContrastDetection();
 TestShadowedPageDetection();
+TestLiveViewDetectionIsRobust();
 TestBrightnessPassExcludesHandOverlap();
 TestUniformBrightnessImageStaysUndetected();
 TestBorderTouchingPageIsNotOverPadded();
@@ -247,6 +248,41 @@ string WriteLowContrastTestImage(string path, int imageWidth, int imageHeight, S
     canvas.Clear(new SKColor(backgroundGray, backgroundGray, backgroundGray));
     using var paint = new SKPaint { Color = new SKColor(pageGray, pageGray, pageGray), Style = SKPaintStyle.Fill, IsAntialias = false };
     canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Right, rect.Bottom), paint);
+    using var image = SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>A page carrying text-like internal detail on a plain dark backdrop, optionally
+/// blurred to simulate an out-of-focus capture. The internal detail is the point: a flat
+/// featureless rectangle has almost no focus signal at all (its Laplacian variance is near zero
+/// whether sharp or soft), so it can't distinguish focus states — only real page content can.</summary>
+string WriteDetailedPage(string path, int imageWidth, int imageHeight, SKRectI rect, bool blurred)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SKCanvas(bitmap);
+    canvas.Clear(new SKColor(40, 40, 40));
+    using var pagePaint = new SKPaint { Color = new SKColor(230, 230, 230), Style = SKPaintStyle.Fill, IsAntialias = false };
+    canvas.DrawRect(new SKRect(rect.Left, rect.Top, rect.Right, rect.Bottom), pagePaint);
+
+    // Text-like rules across the page, drawn into a layer so the blur applies to the page
+    // content rather than compositing oddly against the backdrop.
+    using var textPaint = new SKPaint
+    {
+        Color = new SKColor(30, 30, 30),
+        Style = SKPaintStyle.Fill,
+        IsAntialias = true,
+        ImageFilter = blurred ? SKImageFilter.CreateBlur(5, 5) : null
+    };
+    for (var y = rect.Top + 30; y < rect.Bottom - 20; y += 26)
+    {
+        var lineRight = rect.Right - 40 - ((y / 26) % 3) * 60;
+        canvas.DrawRect(new SKRect(rect.Left + 40, y, lineRight, y + 10), textPaint);
+    }
+
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -760,6 +796,65 @@ void TestEdgePointDetection()
 
     var nearTopEdge = points.Count(p => Math.Abs(p.Y - knownRect.Top) <= 5 && p.X > knownRect.Left && p.X < knownRect.Right);
     Check("Edge points cluster near the known top edge", nearTopEdge > 10);
+}
+
+/// <summary>The live-view auto-capture gate used to run a single fixed Canny(50,200) with a hard
+/// "page must fill 20% of frame" cutoff, long after the full-resolution path had moved to adaptive
+/// thresholds — so under dim or low-contrast light it found nothing and auto-capture sat at
+/// "Waiting for boundary" forever, and a page sitting slightly small or angled was rejected
+/// outright. These cover the conditions that used to fail.</summary>
+void TestLiveViewDetectionIsRobust()
+{
+    Console.WriteLine("\n-- Live-view detection survives low contrast, shadow, and a small page --");
+    var workDir = TempWorkDir();
+    // Live frames are ~960px wide, not the 800x600 the full-res tests use — keep this
+    // representative so the internal downscale-for-detection step is genuinely exercised.
+    const int imageWidth = 960, imageHeight = 640;
+
+    var lowContrast = File.ReadAllBytes(WriteLowContrastTestImage(
+        Path.Combine(workDir, "live_low_contrast.png"), imageWidth, imageHeight,
+        new SKRectI(60, 40, 900, 600), backgroundGray: 150, pageGray: 180));
+    var lowContrastCheck = ImageProcessor.CheckLiveFrame(lowContrast);
+    Check("Live view detects a low-contrast page (fixed Canny used to miss this)", lowContrastCheck.Detected);
+
+    var shadowed = File.ReadAllBytes(WriteShadowedTestImage(
+        Path.Combine(workDir, "live_shadowed.png"), imageWidth, imageHeight,
+        new SKRectI(60, 40, 900, 600), shadowBandWidth: 120));
+    var shadowedCheck = ImageProcessor.CheckLiveFrame(shadowed);
+    Check("Live view detects a page with a cast shadow", shadowedCheck.Detected);
+    if (shadowedCheck.Detected)
+        Check("Live view detection covers the full page, not just the unshadowed part",
+            shadowedCheck.Width >= 840 - 120);
+
+    // ~14% of frame: comfortably rejected by the old hard 0.2 cutoff, but a perfectly ordinary
+    // placement for a small document or a page pushed toward one side of the cradle.
+    var smallPage = File.ReadAllBytes(WriteLowContrastTestImage(
+        Path.Combine(workDir, "live_small_page.png"), imageWidth, imageHeight,
+        new SKRectI(300, 200, 700, 420), backgroundGray: 40, pageGray: 220));
+    Check("Live view detects a small/offset page the old 20% area cutoff rejected",
+        ImageProcessor.CheckLiveFrame(smallPage).Detected);
+
+    // The focus gate is only meaningful if its score actually tracks focus. Identical pages,
+    // one sharp and one blurred, must land on opposite sides of that comparison.
+    var pageRect = new SKRectI(60, 40, 900, 600);
+    var sharpPage = File.ReadAllBytes(WriteDetailedPage(
+        Path.Combine(workDir, "live_sharp.png"), imageWidth, imageHeight, pageRect, blurred: false));
+    var blurredPage = File.ReadAllBytes(WriteDetailedPage(
+        Path.Combine(workDir, "live_blurred.png"), imageWidth, imageHeight, pageRect, blurred: true));
+    var sharpCheck = ImageProcessor.CheckLiveFrame(sharpPage);
+    var blurredCheck = ImageProcessor.CheckLiveFrame(blurredPage);
+    Console.WriteLine($"  [info] sharp page sharpness={sharpCheck.Sharpness:F1}, blurred page sharpness={blurredCheck.Sharpness:F1}");
+    Check("Both the sharp and blurred pages are detected", sharpCheck.Detected && blurredCheck.Detected);
+    if (sharpCheck.Detected && blurredCheck.Detected)
+        Check("A blurred page scores lower sharpness than the same page in focus",
+            blurredCheck.Sharpness < sharpCheck.Sharpness);
+
+    // A frame with nothing page-like in it must still report nothing, or auto-capture would
+    // fire on an empty cradle.
+    var empty = File.ReadAllBytes(WriteLowContrastTestImage(
+        Path.Combine(workDir, "live_empty.png"), imageWidth, imageHeight,
+        new SKRectI(0, 0, 1, 1), backgroundGray: 40, pageGray: 40));
+    Check("An empty frame is not falsely detected as a page", !ImageProcessor.CheckLiveFrame(empty).Detected);
 }
 
 void TestLowContrastDetection()
@@ -2076,10 +2171,13 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
     PumpUntil(() => cropVm.Image != null);
     Check("Real UI flow: Crop Review loads the captured image", cropVm.Image != null);
 
-    // Drag the top-left handle inward by a large, deliberate amount — the same call the
-    // View's OnPointerMoved makes (resolve through the ViewModel, then assign the property).
-    var draggedTopLeft = new CropPoint(cropVm.TopLeft.X + 500, cropVm.TopLeft.Y + 400);
-    cropVm.TopLeft = cropVm.ResolveCornerDrag(0, draggedTopLeft);
+    // Make a large, deliberate adjustment so the reprocessed output is unmistakably different
+    // from the original. This used to drag the top-left crop handle, but manual crop-quad editing
+    // was removed from Crop Review (see the commit that stripped quad/split-line/dewarp editing);
+    // the flow under test here is edit -> save -> reprocess -> thumbnail refresh, which the
+    // surviving brightness/contrast adjustments exercise just as well.
+    cropVm.Brightness = 0.6;
+    cropVm.Contrast = 0.4;
     Dispatcher.UIThread.RunJobs();
 
     // Mirrors the subscription MainWindowViewModel.ReviewCrop wires up in the real app.
@@ -2176,9 +2274,9 @@ async Task TestCropReviewAdjustModeRotationReachesExport()
     var cropVm = new CropReviewViewModel(jobId, reviewDb, reviewQueue);
     PumpUntil(() => cropVm.Image != null);
 
-    // Exactly what the "Adjust" button + Rotate control do in the real UI: flip into Adjust
-    // mode, then apply a 90-degree rotation via the same command RotateClockwiseCommand fires.
-    cropVm.IsAdjustMode = true;
+    // What the Rotate control does in the real UI. There is no longer a separate Adjust mode to
+    // enter first — Crop Review is adjustments-only since manual crop-quad editing was removed —
+    // so this now just fires the same command the button does.
     cropVm.RotateClockwiseCommand.Execute(null);
     Dispatcher.UIThread.RunJobs();
     Check("Adjust flow: RotationDegrees is 90 after one clockwise rotate", cropVm.RotationDegrees == 90);

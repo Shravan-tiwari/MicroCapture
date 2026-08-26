@@ -400,6 +400,32 @@ public partial class ImageProcessor
     public double SharpenAmount { get; set; } = 0.6;
     public double SharpenSigma { get; set; } = 2.0;
 
+    // --- Live-view auto-capture gating ---
+
+    /// <summary>Width the live frame is downscaled to before boundary detection. Detection runs
+    /// on the UI thread, so cost matters; the page boundary is a large, low-frequency feature
+    /// that survives this comfortably, and the downsample also suppresses the paper texture and
+    /// sensor noise that fragment edges at full size.</summary>
+    private const int LiveDetectMaxWidth = 640;
+
+    /// <summary>Area (as a fraction of the downscaled frame) below which the direct adaptive pass
+    /// is considered to have found nothing page-like, triggering the illumination-normalized
+    /// retry. Mirrors the full-resolution pipeline's own fallback trigger.</summary>
+    private const double LiveFallbackAreaFraction = 0.05;
+
+    /// <summary>Smallest contour, as a fraction of frame area, still treated as a document.
+    /// Replaces a hard 0.2 cutoff that rejected any page sitting slightly small, angled or
+    /// partly out of frame.</summary>
+    private const double LiveMinDocumentAreaFraction = 0.06;
+
+    /// <summary>Edge length of the square grayscale thumbnail used as a page's content
+    /// signature, shared by both auto-detect and fixed-frame modes so the caller's single
+    /// content-change threshold means the same thing in each. Raised from 24: at that size a
+    /// fixed-layout form (masthead, ruled boxes, mostly-constant furniture) averaged out almost
+    /// identically page to page, so a genuine page turn could fall under the change threshold and
+    /// silently suppress the capture.</summary>
+    internal const int ContentSignatureSize = 40;
+
     /// <summary>Fast, non-mutating boundary check for live-view auto-capture gating.</summary>
     public static bool IsDocumentDetected(byte[] encodedImage) => CheckLiveFrame(encodedImage).Detected;
 
@@ -413,36 +439,61 @@ public partial class ImageProcessor
         {
             using var image = Cv2.ImDecode(encodedImage, ImreadModes.Grayscale);
             if (image.Empty()) return LiveFrameCheck.None;
-            using var blurred = new Mat();
-            using var edges = new Mat();
-            using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
-            using var joined = new Mat();
-            Cv2.GaussianBlur(image, blurred, new Size(5, 5), 0);
-            Cv2.Canny(blurred, edges, 50, 200);
-            Cv2.Dilate(edges, joined, kernel, iterations: 2);
-            Cv2.FindContours(joined, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-            if (contours.Length == 0) return LiveFrameCheck.None;
 
-            var imageArea = image.Width * image.Height;
-            var best = contours.OrderByDescending(contour => Cv2.ContourArea(contour)).First();
-            if (Cv2.ContourArea(best) / imageArea < 0.2) return LiveFrameCheck.None;
+            // Detect on a downscaled copy. This runs on the UI thread every 500ms (see
+            // MainWindowViewModel's live-view handler), and the adaptive-threshold pass costs
+            // more than the old fixed one — but it also genuinely helps accuracy, because
+            // downsampling suppresses paper texture and sensor noise that fragment page edges.
+            // Boundary geometry survives the scale easily; sharpness is still measured on the
+            // full-resolution image below, where blur is actually visible.
+            var scale = image.Width > LiveDetectMaxWidth ? (double)LiveDetectMaxWidth / image.Width : 1.0;
+            using var work = scale < 1.0 ? new Mat() : image.Clone();
+            if (scale < 1.0) Cv2.Resize(image, work, new Size(), scale, scale, InterpolationFlags.Area);
 
-            var rect = Cv2.BoundingRect(best);
+            var best = FindLiveDocumentContour(work);
+            if (best == null) return LiveFrameCheck.None;
 
-            using var laplacian = new Mat();
-            Cv2.Laplacian(image, laplacian, MatType.CV_64F);
-            Cv2.MeanStdDev(laplacian, out _, out var stddev);
-            var sharpness = stddev.Val0 * stddev.Val0;
+            var workArea = work.Width * (double)work.Height;
+            // Replaces a hard "must fill 20% of frame" cutoff, which rejected outright any page
+            // that sat slightly small, angled, or partly out of view — an all-or-nothing rule far
+            // more sensitive to placement than the offline pipeline's equivalent. The floor here
+            // exists only to reject obvious non-pages; robustness comes from the two-pass detector
+            // above rather than from tuning this number.
+            if (Cv2.ContourArea(best) / workArea < LiveMinDocumentAreaFraction) return LiveFrameCheck.None;
+
+            // Back to full-resolution coordinates — the caller's frame rect and everything
+            // downstream is expressed in the live image's own pixel space.
+            var detected = Cv2.BoundingRect(best);
+            var rect = scale < 1.0
+                ? new Rect((int)(detected.X / scale), (int)(detected.Y / scale), (int)(detected.Width / scale), (int)(detected.Height / scale))
+                : detected;
+
+            var safeX = Math.Clamp(rect.X, 0, image.Width - 1);
+            var safeY = Math.Clamp(rect.Y, 0, image.Height - 1);
+            var safeRect = new Rect(safeX, safeY,
+                Math.Clamp(rect.Width, 1, image.Width - safeX),
+                Math.Clamp(rect.Height, 1, image.Height - safeY));
+
+            // Sharpness over the DOCUMENT region, not the whole frame. Measuring the whole frame
+            // folded in desk, cradle and background: a textured backdrop inflated the score and
+            // masked a genuinely soft page, while a blank one suppressed it on a sharp page —
+            // both fighting a single fixed threshold. Fixed-frame mode already measures per
+            // region for exactly this reason (see MeasureRegion); this brings auto-detect in line.
+            double sharpness;
+            using (var region = new Mat(image, safeRect))
+            using (var laplacian = new Mat())
+            {
+                Cv2.Laplacian(region, laplacian, MatType.CV_64F);
+                Cv2.MeanStdDev(laplacian, out _, out var stddev);
+                sharpness = stddev.Val0 * stddev.Val0;
+            }
 
             byte[]? signature = null;
             try
             {
-                var safeX = Math.Clamp(rect.X, 0, image.Width - 1);
-                var safeY = Math.Clamp(rect.Y, 0, image.Height - 1);
-                var safeRect = new Rect(safeX, safeY, Math.Clamp(rect.Width, 1, image.Width - safeX), Math.Clamp(rect.Height, 1, image.Height - safeY));
                 using var region = new Mat(image, safeRect);
                 using var thumb = new Mat();
-                Cv2.Resize(region, thumb, new Size(24, 24), 0, 0, InterpolationFlags.Area);
+                Cv2.Resize(region, thumb, new Size(ContentSignatureSize, ContentSignatureSize), 0, 0, InterpolationFlags.Area);
                 thumb.GetArray(out byte[] pixels);
                 signature = pixels;
             }
@@ -452,7 +503,7 @@ public partial class ImageProcessor
                 // detection and focus results above remain fully valid without it.
             }
 
-            return new LiveFrameCheck(true, rect.X, rect.Y, rect.Width, rect.Height, image.Width, image.Height, sharpness, signature);
+            return new LiveFrameCheck(true, safeRect.X, safeRect.Y, safeRect.Width, safeRect.Height, image.Width, image.Height, sharpness, signature);
         }
         catch
         {
@@ -460,6 +511,57 @@ public partial class ImageProcessor
             // interrupt the stream or turn an operator capture into a crash.
             return LiveFrameCheck.None;
         }
+    }
+
+    /// <summary>Live-view page-boundary search, mirroring the full-resolution pipeline's
+    /// two-pass structure (see <see cref="FindDocumentContourPasses"/>). The live path used to
+    /// run a single fixed <c>Canny(50, 200)</c>, which the offline path was deliberately moved
+    /// away from because fixed thresholds systematically under- or over-detect edges as lighting
+    /// and page/background contrast vary — so under dim or uneven light the boundary was simply
+    /// never found and auto-capture sat at "Waiting for boundary" indefinitely. The fallback is
+    /// built into the detector rather than exposed as a confidence gate the caller has to
+    /// second-guess: try the direct adaptive pass, and only if it finds nothing plausibly
+    /// page-sized pay for the illumination-normalized retry, which is what rescues a strong cast
+    /// shadow.</summary>
+    private static Point[]? FindLiveDocumentContour(Mat gray)
+    {
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+
+        var imageArea = gray.Width * (double)gray.Height;
+        var direct = LargestContourWithAdaptiveCanny(blurred);
+        if (direct != null && Cv2.ContourArea(direct) / imageArea >= LiveFallbackAreaFraction) return direct;
+
+        // Divide out the low-frequency illumination to flatten a gradual shadow. Done only as a
+        // retry: normalizing unconditionally can wash out a genuinely low-contrast page, which is
+        // precisely the case the adaptive pass above handles best.
+        using var illumination = new Mat();
+        Cv2.GaussianBlur(gray, illumination, new Size(0, 0), sigmaX: 25);
+        using var normalized = new Mat();
+        Cv2.Divide(gray, illumination, normalized, scale: 255);
+        using var normalizedBlurred = new Mat();
+        Cv2.GaussianBlur(normalized, normalizedBlurred, new Size(5, 5), 0);
+        var fallback = LargestContourWithAdaptiveCanny(normalizedBlurred);
+
+        if (direct == null) return fallback;
+        if (fallback == null) return direct;
+        return Cv2.ContourArea(fallback) > Cv2.ContourArea(direct) ? fallback : direct;
+    }
+
+    /// <summary>One adaptive-Canny contour pass over an already-blurred grayscale image,
+    /// returning only the largest external contour. Shares <see cref="AutoCannyThresholds"/>
+    /// with the full-resolution pipeline so both paths respond to lighting the same way.</summary>
+    private static Point[]? LargestContourWithAdaptiveCanny(Mat blurredGray)
+    {
+        var (low, high) = AutoCannyThresholds(blurredGray);
+        using var edges = new Mat();
+        using var joined = new Mat();
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
+        Cv2.Canny(blurredGray, edges, low, high);
+        Cv2.Dilate(edges, joined, kernel, iterations: 2);
+        Cv2.FindContours(joined, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        if (contours.Length == 0) return null;
+        return contours.OrderByDescending(contour => Cv2.ContourArea(contour)).First();
     }
 
     /// <summary>Per-region live-view check driving auto-capture in fixed-frame mode. Unlike
@@ -477,9 +579,9 @@ public partial class ImageProcessor
     /// are stored in whenever a batch was calibrated at full resolution — and so a stream that
     /// changes resolution mid-session degrades gracefully instead of silently misaligning.</para>
     ///
-    /// <para>Signatures use the same 24x24 grayscale convention as <see cref="CheckLiveFrame"/>,
-    /// so the caller's existing content-difference comparison and its threshold carry over
-    /// unchanged.</para></summary>
+    /// <para>Signatures use the same <see cref="ContentSignatureSize"/>-square grayscale
+    /// convention as <see cref="CheckLiveFrame"/>, so the caller's existing content-difference
+    /// comparison and its threshold carry over unchanged.</para></summary>
     public static LiveRegionsCheck CheckLiveRegions(byte[] encodedImage, FixedFrameRect[] regionFractions)
     {
         try
@@ -530,7 +632,7 @@ public partial class ImageProcessor
             var sharpness = stddev.Val0 * stddev.Val0;
 
             using var thumb = new Mat();
-            Cv2.Resize(region, thumb, new Size(24, 24), 0, 0, InterpolationFlags.Area);
+            Cv2.Resize(region, thumb, new Size(ContentSignatureSize, ContentSignatureSize), 0, 0, InterpolationFlags.Area);
             thumb.GetArray(out byte[] pixels);
 
             return new RegionCheck(sharpness, pixels);
