@@ -38,9 +38,9 @@ public class BatchExportService
     public async Task<string> ExportBatchAsync(string batchId, string outputDirectory, string format,
         IReadOnlyList<string>? orderedJobIds = null, string? customFileName = null, string? customOutputDirectory = null)
     {
-        var normalizedFormat = format.Trim().ToUpperInvariant();
-        if (normalizedFormat is not ("PDF" or "TIFF" or "JPG" or "PNG"))
-            throw new ArgumentException($"Unsupported export format: {format}", nameof(format));
+        var exportFormat = ExportFormat.Resolve(format)
+            ?? throw new ArgumentException($"Unsupported export format: {format}", nameof(format));
+        var normalizedFormat = exportFormat.Name.ToUpperInvariant();
         // The capture worker updates a separate DbContext; use a no-tracking query so
         // export sees its latest statuses rather than stale navigation properties.
         var batch = await _dbContext.Batches
@@ -82,7 +82,17 @@ public class BatchExportService
 
         Directory.CreateDirectory(outputDirectory);
 
-        if (normalizedFormat == "PDF")
+        if (exportFormat.Kind == ExportKind.TextOnly)
+        {
+            return await ExportOcrTextAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName);
+        }
+
+        if (exportFormat.Kind == ExportKind.MultipageTiff)
+        {
+            return await ExportMultipageTiffAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName);
+        }
+
+        if (exportFormat.Kind == ExportKind.Pdf)
         {
             string pdfFileName = string.IsNullOrWhiteSpace(customFileName)
                 ? $"{batchPrefix}_{DateTime.Now:yyyyMMdd_HHmmss}.pdf"
@@ -90,8 +100,22 @@ public class BatchExportService
             string pdfFilePath = Path.Combine(outputDirectory, pdfFileName);
             string temporaryPath = pdfFilePath + ".partial";
 
+            var pdfMetadata = new SKDocumentPdfMetadata
+            {
+                Title = batch.Name ?? batchPrefix,
+                Author = Environment.UserName,
+                Creator = "MicroCapture",
+                Producer = "MicroCapture",
+                Creation = DateTime.Now,
+                Modified = DateTime.Now,
+                // PDF/A requires the text layer to be genuinely searchable and the document
+                // tagged; PdfA also makes Skia embed the fonts it draws with, which is the part
+                // an image-only scan plus an invisible OCR layer would otherwise fail on.
+                PdfA = exportFormat.RequiresPdfA
+            };
+
             using (var stream = new SKFileWStream(temporaryPath))
-            using (var document = SKDocument.CreatePdf(stream))
+            using (var document = SKDocument.CreatePdf(stream, pdfMetadata))
             {
                 foreach (var job in jobsToExport)
                 {
@@ -137,30 +161,48 @@ public class BatchExportService
                 var files = GetProcessedFilesForJob(job);
                 foreach (var f in files)
                 {
-                    string targetExt = normalizedFormat == "JPG" ? ".jpg" : (normalizedFormat == "TIFF" ? ".tif" : ".png");
+                    string targetExt = exportFormat.Extension;
                     string targetName = $"{batchPrefix}_Page_{pageIndex:D6}{targetExt}";
                     string targetPath = Path.Combine(exportDir, targetName);
-                    
-                    if (normalizedFormat is "JPG" or "PNG")
+
+                    var isJpeg = targetExt == ".jpg";
+                    var isPng = targetExt == ".png";
+
+                    if (isJpeg || isPng)
                     {
                         using var bitmap = DecodeImage(f);
                         if (bitmap != null)
                         {
                             using var img = SKImage.FromBitmap(bitmap);
-                            using var data = img.Encode(normalizedFormat == "JPG" ? SKEncodedImageFormat.Jpeg : SKEncodedImageFormat.Png, 95);
+                            using var data = img.Encode(isJpeg ? SKEncodedImageFormat.Jpeg : SKEncodedImageFormat.Png, 95);
                             // SKImage.Encode never writes a DPI/density field for either format —
                             // patch it in afterward (same fix WriteJpeg already applies to the
                             // direct-capture JPG path) so exported JPG/PNG pages don't silently
                             // read back as 96 DPI regardless of what was actually captured.
                             var bytes = data.ToArray();
-                            if (normalizedFormat == "JPG")
+                            if (isJpeg)
                                 ImageProcessor.StampJfifDensity(bytes, job.Dpi);
                             else
                                 ImageProcessor.StampPngDensity(ref bytes, job.Dpi);
                             File.WriteAllBytes(targetPath, bytes);
                         }
                     }
-                    else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff")
+                    else if (targetExt is ".jp2" or ".bmp")
+                    {
+                        // OpenCV owns both of these. Neither carries a DPI field the way TIFF and
+                        // JPEG do — BMP's header pixels-per-metre is widely ignored, and JPEG 2000
+                        // resolution boxes aren't written by OpenCV — so unlike the paths above
+                        // there's nothing to stamp; the DPI lives only in the batch's records.
+                        using var image = Cv2.ImRead(f, ImreadModes.Unchanged);
+                        if (image.Empty())
+                            throw new IOException($"Could not read page for export: {f}");
+                        if (!Cv2.ImWrite(targetPath, image))
+                            throw new IOException(
+                                $"Could not write {exportFormat.Name} export: {targetPath}. " +
+                                "This build of OpenCV may not include that encoder.");
+                    }
+                    else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff"
+                             && exportFormat.Compression != "None")
                     {
                         // The source is already a TIFF ImageProcessor wrote (with its own DPI/
                         // Author/Software tags, and — when binarized — genuine 1-bit/CCITT-G4
@@ -192,6 +234,185 @@ public class BatchExportService
             await _dbContext.SaveChangesAsync();
             return exportDir;
         }
+    }
+
+    /// <summary>Writes every page of the batch into one multi-page TIFF.
+    ///
+    /// <para>Uses LibTiff directly rather than OpenCV, which can only write a single image per
+    /// file. Each page is appended as its own IFD/directory, carrying its own dimensions and DPI,
+    /// so pages of differing size stay correct — which matters here because a split spread
+    /// produces halves that need not match the pages around them.</para>
+    ///
+    /// <para>Binarized pages keep 1-bit CCITT Group 4 encoding rather than being re-inflated to
+    /// 8-bit grey, preserving the size win that was the point of binarizing.</para></summary>
+    private async Task<string> ExportMultipageTiffAsync(Batch batch, List<CaptureJob> jobsToExport,
+        string outputDirectory, string batchPrefix, string? customFileName)
+    {
+        var fileName = string.IsNullOrWhiteSpace(customFileName)
+            ? $"{batchPrefix}_{DateTime.Now:yyyyMMdd_HHmmss}.tif"
+            : SanitizeFileName(customFileName) + ".tif";
+        var filePath = Path.Combine(outputDirectory, fileName);
+        var temporaryPath = filePath + ".partial";
+
+        Directory.CreateDirectory(outputDirectory);
+
+        var pages = jobsToExport
+            .SelectMany(job => GetProcessedFilesForJob(job).Select(file => (Job: job, File: file)))
+            .ToList();
+        if (pages.Count == 0) throw new Exception("No processed images found to export in this batch.");
+
+        using (var output = BitMiracle.LibTiff.Classic.Tiff.Open(temporaryPath, "w"))
+        {
+            if (output == null) throw new IOException($"Could not create multi-page TIFF: {temporaryPath}");
+
+            for (var i = 0; i < pages.Count; i++)
+            {
+                var (job, file) = pages[i];
+                AppendTiffPage(output, file, job.Dpi, i, pages.Count);
+            }
+        }
+
+        File.Move(temporaryPath, filePath, true);
+
+        foreach (var job in jobsToExport) job.ExportStatus = "Completed";
+        batch.Status = "Exported";
+        DeleteOriginals(jobsToExport);
+        DeleteOcrSidecars(jobsToExport);
+        AttachOrUpdateBatch(batch);
+        AttachOrUpdateJobs(jobsToExport);
+        await _dbContext.SaveChangesAsync();
+        return filePath;
+    }
+
+    /// <summary>Appends one page to an open multi-page TIFF.</summary>
+    private static void AppendTiffPage(BitMiracle.LibTiff.Classic.Tiff output, string sourcePath, int dpi, int pageIndex, int pageCount)
+    {
+        using var image = Cv2.ImRead(sourcePath, ImreadModes.Unchanged);
+        if (image.Empty()) throw new IOException($"Could not read page for export: {sourcePath}");
+
+        // A genuinely bitonal source stays bitonal. Cv2.ImRead returns it as 8-bit with only 0
+        // and 255 present, so detect that rather than trusting the file extension.
+        var isBitonal = image.Channels() == 1 && IsBlackAndWhiteOnly(image);
+
+        using var rgb = new Mat();
+        if (!isBitonal && image.Channels() == 1) Cv2.CvtColor(image, rgb, ColorConversionCodes.GRAY2RGB);
+        else if (!isBitonal && image.Channels() == 4) Cv2.CvtColor(image, rgb, ColorConversionCodes.BGRA2RGB);
+        else if (!isBitonal) Cv2.CvtColor(image, rgb, ColorConversionCodes.BGR2RGB);
+
+        var source = isBitonal ? image : rgb;
+        var width = source.Cols;
+        var height = source.Rows;
+
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGEWIDTH, width);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGELENGTH, height);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.SAMPLESPERPIXEL, isBitonal ? 1 : 3);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.BITSPERSAMPLE, isBitonal ? 1 : 8);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.ORIENTATION, BitMiracle.LibTiff.Classic.Orientation.TOPLEFT);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PLANARCONFIG, BitMiracle.LibTiff.Classic.PlanarConfig.CONTIG);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PHOTOMETRIC, isBitonal
+            ? BitMiracle.LibTiff.Classic.Photometric.MINISBLACK
+            : BitMiracle.LibTiff.Classic.Photometric.RGB);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.COMPRESSION, isBitonal
+            ? BitMiracle.LibTiff.Classic.Compression.CCITTFAX4
+            : BitMiracle.LibTiff.Classic.Compression.LZW);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.XRESOLUTION, (double)dpi);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.YRESOLUTION, (double)dpi);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.RESOLUTIONUNIT, BitMiracle.LibTiff.Classic.ResUnit.INCH);
+        // PAGENUMBER is what makes this a page sequence rather than an arbitrary pile of images,
+        // and is what viewers read to show "page 3 of 12".
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.SUBFILETYPE, BitMiracle.LibTiff.Classic.FileType.PAGE);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PAGENUMBER, pageIndex, pageCount);
+
+        if (isBitonal)
+        {
+            source.GetArray(out byte[] grey);
+            var stride = (width + 7) / 8;
+            var packed = new byte[stride];
+            for (var y = 0; y < height; y++)
+            {
+                Array.Clear(packed, 0, packed.Length);
+                var rowStart = y * width;
+                for (var x = 0; x < width; x++)
+                    if (grey[rowStart + x] != 0) packed[x / 8] |= (byte)(0x80 >> (x % 8));
+                output.WriteScanline(packed, y);
+            }
+        }
+        else
+        {
+            // GetArray only unpacks single-channel Mats into byte[]; reshape the interleaved
+            // 3-channel buffer to one channel of width*3 so the same bytes come out flat.
+            using var flat = source.Reshape(1);
+            flat.GetArray(out byte[] rgbBytes);
+            var stride = width * 3;
+            var row = new byte[stride];
+            for (var y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(rgbBytes, y * stride, row, 0, stride);
+                output.WriteScanline(row, y);
+            }
+        }
+
+        output.WriteDirectory();
+    }
+
+    /// <summary>Whether a single-channel image contains only pure black and white, i.e. it is
+    /// genuinely bitonal content that happens to be carried in an 8-bit buffer.</summary>
+    private static bool IsBlackAndWhiteOnly(Mat grey)
+    {
+        grey.GetArray(out byte[] pixels);
+        foreach (var pixel in pixels)
+            if (pixel != 0 && pixel != 255) return false;
+        return true;
+    }
+
+    /// <summary>Writes the batch's OCR text with no images — one text file per page plus a
+    /// combined file, since either shape is the one somebody wants and producing both costs
+    /// nothing.
+    ///
+    /// <para>Unlike the image exports this deliberately does NOT delete the originals: no archival
+    /// image output has been produced, so treating a text dump as "the batch has been exported"
+    /// and discarding the captures would destroy the actual work.</para></summary>
+    private async Task<string> ExportOcrTextAsync(Batch batch, List<CaptureJob> jobsToExport,
+        string outputDirectory, string batchPrefix, string? customFileName)
+    {
+        var subDirName = string.IsNullOrWhiteSpace(customFileName)
+            ? $"{batchPrefix}_OCR_{DateTime.Now:yyyyMMdd_HHmmss}"
+            : SanitizeFileName(customFileName);
+        var exportDir = Path.Combine(outputDirectory, subDirName);
+        Directory.CreateDirectory(exportDir);
+
+        var combined = new System.Text.StringBuilder();
+        var pageIndex = 1;
+        var pagesWithText = 0;
+
+        foreach (var job in jobsToExport)
+        {
+            foreach (var file in GetProcessedFilesForJob(job))
+            {
+                var sidecar = Path.ChangeExtension(file, ".txt");
+                var text = File.Exists(sidecar) ? await File.ReadAllTextAsync(sidecar) : string.Empty;
+                if (!string.IsNullOrWhiteSpace(text)) pagesWithText++;
+
+                await File.WriteAllTextAsync(Path.Combine(exportDir, $"{batchPrefix}_Page_{pageIndex:D6}.txt"), text);
+                combined.AppendLine($"--- Page {pageIndex} ---");
+                combined.AppendLine(text);
+                combined.AppendLine();
+                pageIndex++;
+            }
+            job.ExportStatus = "Completed";
+        }
+
+        await File.WriteAllTextAsync(Path.Combine(exportDir, $"{batchPrefix}_AllPages.txt"), combined.ToString());
+
+        if (pagesWithText == 0)
+            throw new InvalidOperationException(
+                "No OCR text was found for this batch. Run OCR first, then export again.");
+
+        batch.Status = "Exported";
+        AttachOrUpdateBatch(batch);
+        AttachOrUpdateJobs(jobsToExport);
+        await _dbContext.SaveChangesAsync();
+        return exportDir;
     }
 
     /// <summary>Deletes each exported job's original capture file, now that the batch's final

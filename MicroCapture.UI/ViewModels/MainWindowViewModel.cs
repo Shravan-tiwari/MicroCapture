@@ -198,7 +198,9 @@ public partial class MainWindowViewModel : ViewModelBase
     // untouched there, and every higher selection upsamples proportionally (never downsamples
     // away real captured detail). See ImageProcessor.BaselineDpi/ResizeForDpi.
     [ObservableProperty] private int _selectedDpi = 150;
-    public int[] AvailableDpiOptions { get; } = { 150, 200, 300, 400, 600, 800, 1200 };
+    // 150 is the rig's native captured size (see Batch.Dpi / ImageProcessor.BaselineDpi), so the
+    // values below it downsample and those above upsample.
+    public int[] AvailableDpiOptions { get; } = { 50, 100, 150, 200, 300, 400, 600, 800, 1000, 1200 };
 
     // Output file format is sticky PER CAPTURE, not per batch like DPI/dewarp/binarize/
     // bleedthrough above — read directly at capture-enqueue time (CaptureAsync/RecaptureAsync)
@@ -214,7 +216,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // already-processed jobs in the batch (they keep their original format).
         // This is just a "remember my last choice" convenience.
     }
-    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG", "PNG" };
+    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG", "PNG", "JP2", "BMP" };
 
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
     // in the background queue, off the capture path, so toggling this never affects shutter
@@ -1096,16 +1098,11 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Capture formats the dialog offers include names the capture pipeline doesn't use
-    /// as-is ("JPEG" vs "JPG"), and formats only the exporter can produce. Map to something the
-    /// capture path understands rather than letting an unknown value reach it.</summary>
-    private string NormalizeCaptureFormat(string format) => format switch
-    {
-        "JPEG" => "JPG",
-        "TIFF LZW" => "TIFF",
-        var f when AvailableCaptureFormats.Contains(f) => f,
-        _ => "TIFF"
-    };
+    /// <summary>The New Batch dialog offers operator-facing names ("JPEG", "TIFF LZW", "JPEG
+    /// 2000"); the capture pipeline stores and writes short ones. Resolved by the processor so
+    /// both sides agree on what a name means.</summary>
+    private static string NormalizeCaptureFormat(string format) =>
+        MicroCapture.Processing.ImageProcessor.NormalizeCaptureFormat(format);
 
     [RelayCommand]
     private async Task StartBatchAsync()

@@ -1351,21 +1351,62 @@ public partial class ImageProcessor
         // Binarized (pure black-and-white) output is always written as TIFF regardless of
         // captureFormat — see this method's own class-level remarks on WritePageOutput's
         // original JPG-vs-TIFF decision; PNG is excluded from that override for the same reason.
-        var useJpeg = !binarized && string.Equals(captureFormat, "JPG", StringComparison.OrdinalIgnoreCase);
-        var usePng = !binarized && string.Equals(captureFormat, "PNG", StringComparison.OrdinalIgnoreCase);
-        var extension = useJpeg ? ".jpg" : usePng ? ".png" : ".tif";
+        var format = binarized ? "TIFF" : NormalizeCaptureFormat(captureFormat);
+        var extension = CaptureFormatExtension(format);
         var finalFileName = singlePageInputPath != null
             ? SinglePageOutputFileName(singlePageInputPath, extension)
             : fileNameNoExt + extension;
         var path = Path.Combine(outputDirectory, finalFileName);
-        if (useJpeg)
-            WriteJpeg(path, mat, metadata);
-        else if (usePng)
-            WritePng(path, mat, metadata);
-        else
-            WriteTiff(path, mat, metadata, binarized);
+        switch (format)
+        {
+            case "JPG":
+                WriteJpeg(path, mat, metadata);
+                break;
+            case "PNG":
+                WritePng(path, mat, metadata);
+                break;
+            case "JP2":
+            case "BMP":
+                // OpenCV owns both. Neither carries a usable DPI field — BMP's pixels-per-metre
+                // header is widely ignored and OpenCV writes no JPEG 2000 resolution box — so
+                // unlike the TIFF/JPEG paths there is nothing to stamp; DPI lives in the batch
+                // record instead. A build without the codec fails loudly rather than silently
+                // producing an empty file.
+                if (!Cv2.ImWrite(path, mat))
+                    throw new IOException(
+                        $"Could not write {format} output: {path}. This build of OpenCV may not include that encoder.");
+                break;
+            default:
+                WriteTiff(path, mat, metadata, binarized);
+                break;
+        }
         return path;
     }
+
+    /// <summary>Maps a stored or operator-facing capture-format name onto the writers above.
+    /// Accepts the spellings the New Batch dialog offers ("JPEG", "TIFF LZW") alongside the
+    /// short forms already persisted on existing jobs ("JPG"), so a batch created either way
+    /// writes the same thing. Anything unrecognised falls back to TIFF rather than failing a
+    /// capture the operator has already taken.</summary>
+    public static string NormalizeCaptureFormat(string? captureFormat) => (captureFormat ?? string.Empty).Trim().ToUpperInvariant() switch
+    {
+        "JPG" or "JPEG" => "JPG",
+        "PNG" => "PNG",
+        "JP2" or "JPEG 2000" or "JPEG2000" or "JP2000" => "JP2",
+        "BMP" => "BMP",
+        // TIFF is always written LZW-compressed (see WriteTiff), so the two names are the same
+        // output; "TIFF LZW" exists only to make that explicit where an operator expects to see it.
+        _ => "TIFF"
+    };
+
+    public static string CaptureFormatExtension(string normalizedFormat) => normalizedFormat switch
+    {
+        "JPG" => ".jpg",
+        "PNG" => ".png",
+        "JP2" => ".jp2",
+        "BMP" => ".bmp",
+        _ => ".tif"
+    };
 
     /// <summary>Writes <paramref name="mat"/> (expected 8-bit single-channel, values only 0 or
     /// 255 — see <see cref="ApplySauvolaBinarization"/>) as a genuine 1-bit-per-pixel TIFF with

@@ -62,6 +62,9 @@ TestLiveViewDetectionIsRobust();
 TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
+TestEncoderSupport();
+await TestEveryExportFormatProducesOutput();
+TestMultipageTiffHasEveryPage();
 TestBatchLockIsAdvisory();
 await TestBatchAdoptedOnAnotherMachine();
 TestBrightnessPassExcludesHandOverlap();
@@ -991,6 +994,192 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+async Task TestEveryExportFormatProducesOutput()
+{
+    Console.WriteLine("\n-- Every offered export format actually produces a valid file --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "exports.db");
+
+    void SeedPageFiles()
+    {
+        // Re-created before each format: exporting deletes the originals it consumed.
+        for (var page = 1; page <= 2; page++)
+        {
+            var processed = Path.Combine(workDir, $"page{page}.tif");
+            if (!File.Exists(processed))
+            {
+                using var mat = new OpenCvSharp.Mat(200, 150, OpenCvSharp.MatType.CV_8UC3,
+                    new OpenCvSharp.Scalar(40 * page, 90, 200));
+                OpenCvSharp.Cv2.ImWrite(processed, mat);
+            }
+            var sidecar = Path.ChangeExtension(processed, ".txt");
+            if (!File.Exists(sidecar)) File.WriteAllText(sidecar, $"text of page {page}");
+        }
+    }
+
+    string batchId;
+    SeedPageFiles();
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "EXP", OutputDirectory = workDir };
+        db.Projects.Add(project);
+        var batch = new Batch { ProjectId = project.Id, BatchCode = "EXP-1", Name = "EXP-1", Dpi = 300 };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+
+        for (var page = 1; page <= 2; page++)
+        {
+            var processed = Path.Combine(workDir, $"page{page}.tif");
+            db.CaptureJobs.Add(new CaptureJob
+            {
+                BatchId = batch.Id, PageNumber = page, ProcessingStatus = "Completed",
+                OriginalFilePath = processed, ProcessedFilePath = processed, Dpi = 300
+            });
+        }
+        db.SaveChanges();
+    }
+
+    foreach (var format in MicroCapture.Processing.ExportFormat.SelectableNames)
+    {
+        // Each format gets its own destination: export marks the batch Exported and consumes the
+        // originals, so formats would otherwise interfere with each other.
+        var destination = Path.Combine(workDir, "out_" + new string(format.Where(char.IsLetterOrDigit).ToArray()));
+        Directory.CreateDirectory(destination);
+        SeedPageFiles();
+
+        using var db = new AppDbContext(dbPath);
+        foreach (var job in db.CaptureJobs.Where(j => j.BatchId == batchId))
+        {
+            job.ExportStatus = "Pending";
+            job.ProcessingStatus = "Completed";
+        }
+        db.Batches.First(b => b.Id == batchId).Status = "Active";
+        db.SaveChanges();
+
+        try
+        {
+            // Pumped rather than awaited directly: this suite runs on Avalonia's dispatcher
+            // thread, so a bare await parks the continuation on a loop nothing is running and
+            // the whole process deadlocks. See RunPumped's own remarks.
+            string resultPath = string.Empty;
+            await RunPumped(async () =>
+                resultPath = await new BatchExportService(db).ExportBatchAsync(batchId, destination, format),
+                timeoutMs: 60000);
+
+            var produced = Directory.Exists(resultPath)
+                ? Directory.GetFiles(resultPath, "*", SearchOption.AllDirectories)
+                : File.Exists(resultPath) ? new[] { resultPath } : Array.Empty<string>();
+            var nonEmpty = produced.Where(f => new FileInfo(f).Length > 0).ToArray();
+            Check($"Export '{format}' produces a non-empty output", nonEmpty.Length > 0);
+        }
+        catch (Exception ex)
+        {
+            Check($"Export '{format}' produces a non-empty output ({ex.GetType().Name}: {ex.Message})", false);
+        }
+    }
+}
+
+void TestMultipageTiffHasEveryPage()
+{
+    Console.WriteLine("\n-- A multi-page TIFF really contains each page, not just the first --");
+    var workDir = TempWorkDir();
+    var path = Path.Combine(workDir, "multi.tif");
+
+    using (var output = BitMiracle.LibTiff.Classic.Tiff.Open(path, "w"))
+    {
+        for (var i = 0; i < 3; i++)
+        {
+            var source = Path.Combine(workDir, $"src{i}.tif");
+            using (var mat = new OpenCvSharp.Mat(60 + i * 10, 80, OpenCvSharp.MatType.CV_8UC3,
+                       new OpenCvSharp.Scalar(20 * i, 100, 150)))
+            {
+                OpenCvSharp.Cv2.ImWrite(source, mat);
+            }
+            AppendTiffPageForTest(output!, source, 300, i, 3);
+        }
+    }
+
+    using var read = BitMiracle.LibTiff.Classic.Tiff.Open(path, "r");
+    Check("The multi-page TIFF opens", read != null);
+    if (read == null) return;
+
+    var pages = 0;
+    var heights = new List<int>();
+    do
+    {
+        pages++;
+        heights.Add(read.GetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGELENGTH)[0].ToInt());
+    } while (read.ReadDirectory());
+
+    Check("Every page is present as its own directory", pages == 3);
+    // Differing heights prove each page kept its own dimensions rather than being squeezed into
+    // the first page's — which is what a split spread beside a full page actually needs.
+    Check("Each page keeps its own dimensions", heights.Distinct().Count() == 3);
+}
+
+void AppendTiffPageForTest(BitMiracle.LibTiff.Classic.Tiff output, string sourcePath, int dpi, int index, int count)
+{
+    // Mirrors BatchExportService.AppendTiffPage, which is private; this asserts the multi-page
+    // structure that method relies on actually behaves as expected.
+    using var image = OpenCvSharp.Cv2.ImRead(sourcePath, OpenCvSharp.ImreadModes.Color);
+    using var rgb = new OpenCvSharp.Mat();
+    OpenCvSharp.Cv2.CvtColor(image, rgb, OpenCvSharp.ColorConversionCodes.BGR2RGB);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGEWIDTH, rgb.Cols);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGELENGTH, rgb.Rows);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.SAMPLESPERPIXEL, 3);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.BITSPERSAMPLE, 8);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.ORIENTATION, BitMiracle.LibTiff.Classic.Orientation.TOPLEFT);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PLANARCONFIG, BitMiracle.LibTiff.Classic.PlanarConfig.CONTIG);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PHOTOMETRIC, BitMiracle.LibTiff.Classic.Photometric.RGB);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.COMPRESSION, BitMiracle.LibTiff.Classic.Compression.LZW);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.XRESOLUTION, (double)dpi);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.YRESOLUTION, (double)dpi);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.RESOLUTIONUNIT, BitMiracle.LibTiff.Classic.ResUnit.INCH);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.SUBFILETYPE, BitMiracle.LibTiff.Classic.FileType.PAGE);
+    output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PAGENUMBER, index, count);
+    using var flat = rgb.Reshape(1);
+    flat.GetArray(out byte[] bytes);
+    var stride = rgb.Cols * 3;
+    var row = new byte[stride];
+    for (var y = 0; y < rgb.Rows; y++)
+    {
+        Buffer.BlockCopy(bytes, y * stride, row, 0, stride);
+        output.WriteScanline(row, y);
+    }
+    output.WriteDirectory();
+}
+
+void TestEncoderSupport()
+{
+    Console.WriteLine("\n-- Which output encodings this build can actually produce --");
+    var dir = TempWorkDir();
+    using var sample = new OpenCvSharp.Mat(120, 160, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(30, 120, 200));
+
+    foreach (var ext in new[] { ".jp2", ".bmp", ".tif", ".png", ".jpg" })
+    {
+        var path = Path.Combine(dir, "probe" + ext);
+        var wrote = false;
+        var readBack = false;
+        try
+        {
+            wrote = OpenCvSharp.Cv2.ImWrite(path, sample);
+            // Writing is not proof: OpenCV returns false (or produces an unreadable stub) for a
+            // codec the bundled native build wasn't compiled with, so round-trip it.
+            if (wrote && File.Exists(path))
+            {
+                using var back = OpenCvSharp.Cv2.ImRead(path, OpenCvSharp.ImreadModes.Color);
+                readBack = !back.Empty() && back.Width == sample.Width && back.Height == sample.Height;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [info] {ext} threw {ex.GetType().Name}");
+        }
+        Console.WriteLine($"  [info] {ext,-5} write={wrote,-5} readback={readBack}");
+    }
 }
 
 void TestBatchLockIsAdvisory()

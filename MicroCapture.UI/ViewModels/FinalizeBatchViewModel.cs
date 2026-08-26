@@ -49,7 +49,9 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     private bool _everHadPages;
 
     public ObservableCollection<FinalizePageRow> Pages { get; } = new();
-    public string[] AvailableFormats { get; } = { "PDF", "TIFF", "JPG", "PNG" };
+    // Sourced from the exporter itself rather than restated here, so the list offered can never
+    // drift from the list that can actually be produced.
+    public IReadOnlyList<string> AvailableFormats { get; } = MicroCapture.Processing.ExportFormat.SelectableNames;
     public ObservableCollection<WatermarkPreset> WatermarkPresets { get; } = new();
 
     [ObservableProperty] private string _selectedFormat = "PDF";
