@@ -95,6 +95,98 @@ public partial class MainWindowViewModel : ViewModelBase
             ? MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, batchCode)
             : BatchFolder.ThumbnailsPath(_currentBatchFolder);
 
+    /// <summary>Raised when a page is appended to the cart, so the view can scroll to it. The
+    /// cart is in page order, so the newest capture is at the far end rather than in view.</summary>
+    public event EventHandler? CartAppended;
+
+    /// <summary>Moves a page to a new position in the cart and renumbers the batch to match.
+    ///
+    /// <para><see cref="CaptureJob.PageNumber"/> is the batch's page order, so reordering means
+    /// reassigning it — there is no separate sort field to shuffle instead. That has two
+    /// consequences this has to respect.</para>
+    ///
+    /// <para>First, page number is also recapture identity: a recaptured page keeps the same
+    /// number on both the new job and the retired Superseded one. So every job sharing a page
+    /// number has to move together, or a retired attempt is left pointing at whatever page later
+    /// takes its old number and can resurface in an export.</para>
+    ///
+    /// <para>Second, page-numbered thumbnail files have to be renamed alongside, or the cart shows
+    /// the wrong image for every page after a reorder. The rename runs via temporary names first,
+    /// because renumbering swaps numbers that are still in use and a direct rename would collide.</para></summary>
+    public async Task ReorderCaptureAsync(string draggedJobId, string targetJobId)
+    {
+        if (draggedJobId == targetJobId || _currentBatchId == null) return;
+
+        var from = RecentCaptures.ToList().FindIndex(t => t.JobId == draggedJobId);
+        var to = RecentCaptures.ToList().FindIndex(t => t.JobId == targetJobId);
+        if (from < 0 || to < 0) return;
+
+        RecentCaptures.Move(from, to);
+
+        try
+        {
+            _dbContext.ChangeTracker.Clear();
+            var jobs = await _dbContext.CaptureJobs
+                .Where(j => j.BatchId == _currentBatchId)
+                .ToListAsync();
+
+            // Old page number -> every job on that page, retired attempts included.
+            var byOldPage = jobs.GroupBy(j => j.PageNumber).ToDictionary(g => g.Key, g => g.ToList());
+
+            var renames = new List<(string From, string To)>();
+            var newPage = 1;
+            foreach (var thumbnail in RecentCaptures)
+            {
+                var oldPage = thumbnail.PageNumber;
+                if (!byOldPage.TryGetValue(oldPage, out var pageJobs)) { newPage++; continue; }
+
+                if (oldPage != newPage)
+                {
+                    var oldThumb = ThumbnailFileFor(_activeBatchCode, oldPage);
+                    var newThumb = ThumbnailFileFor(_activeBatchCode, newPage);
+                    if (File.Exists(oldThumb)) renames.Add((oldThumb, newThumb));
+                }
+
+                foreach (var job in pageJobs) job.PageNumber = newPage;
+                thumbnail.PageNumber = newPage;
+                newPage++;
+            }
+
+            await _dbContext.SaveChangesAsync();
+            MoveThumbnailFiles(renames);
+
+            PageCount = RecentCaptures.Count == 0 ? 0 : RecentCaptures.Max(t => t.PageNumber);
+            await PublishManifestAsync();
+            StatusText = $"Moved page to position {to + 1}";
+        }
+        catch (Exception ex)
+        {
+            // Put the cart back rather than leaving the display disagreeing with the database.
+            RecentCaptures.Move(to, from);
+            StatusText = $"Could not reorder pages: {ex.Message}";
+        }
+    }
+
+    /// <summary>Applies thumbnail renames via temporary names. A reorder permutes numbers that are
+    /// all still in use, so renaming straight to the target would overwrite a file another page
+    /// still needs.</summary>
+    private static void MoveThumbnailFiles(List<(string From, string To)> renames)
+    {
+        if (renames.Count == 0) return;
+        var staged = new List<(string Temp, string To)>();
+        foreach (var (from, to) in renames)
+        {
+            var temp = from + ".reorder";
+            try { File.Move(from, temp, overwrite: true); staged.Add((temp, to)); }
+            catch (IOException) { /* A thumbnail is a cache; losing one costs a re-render, not data. */ }
+        }
+        foreach (var (temp, to) in staged)
+        {
+            try { File.Move(temp, to, overwrite: true); }
+            catch (IOException) { }
+        }
+    }
+
     /// <summary>Writes the current batch state back to its manifest. Called after anything the
     /// manifest describes changes, so the folder — not this machine's database — stays the copy
     /// that can be trusted and reopened anywhere.</summary>
@@ -1251,12 +1343,17 @@ public partial class MainWindowViewModel : ViewModelBase
         // CaptureJob with its own PageNumber (see CaptureAsync), so grouping by PageNumber
         // already yields exactly one row per page here; no separate "loop N frames per job"
         // multiplication is needed (or correct) anymore.
+        // Ascending, so the cart reads left-to-right as page 1, 2, 3 — the order the finished
+        // document is in. This is what makes drag-reordering mean what it looks like; with the
+        // newest capture on the left, dragging something leftwards would have moved it LATER in
+        // the page sequence. The view scrolls to the end after a capture so the newest page is
+        // still what you're looking at.
         var latestPerPage = batch.Captures
             .Where(job => job.ProcessingStatus != "Superseded")
             .GroupBy(job => job.PageNumber)
             .Select(group => group.OrderByDescending(job => job.Timestamp).First())
-            .OrderByDescending(job => job.PageNumber)
-            .Take(100);
+            .OrderBy(job => job.PageNumber)
+            .TakeLast(200);
 
         foreach (var job in latestPerPage)
         {
@@ -2165,7 +2262,10 @@ public partial class MainWindowViewModel : ViewModelBase
         // thumbnails that never advance past "Processing"). Inserting the row here, before this
         // method returns, guarantees it already exists by the time any worker callback for this
         // job can possibly run.
-        RecentCaptures.Insert(0, thumbnail);
+        // Appended, not inserted at 0: the cart is in page order, so a new page belongs at the
+        // end. CartChanged tells the view to scroll there so the newest capture stays in sight.
+        RecentCaptures.Add(thumbnail);
+        CartAppended?.Invoke(this, EventArgs.Empty);
         var placeholders = new List<ThumbnailItem> { thumbnail };
 
         // Keep last 100 thumbnails to avoid memory buildup

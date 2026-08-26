@@ -335,7 +335,7 @@
                     </StackPanel>
                 </Border>
 
-            <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ScrollViewer Grid.Row="1" Name="FilmstripScroller" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -344,12 +344,21 @@
                     </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
-                            <Grid Classes="thumb" Width="100">
+                            <!-- Drop lands on the tile, not the inner button: the button's own
+                                 click handling swallows pointer events, and the drop target needs
+                                 to cover the whole tile so a near-miss still reorders. -->
+                            <!-- Drop handlers are attached in code-behind (see MainWindow's
+                                 constructor): DragDrop's events are routed events, which Avalonia
+                                 doesn't let XAML bind as attributes. AllowDrop still has to be set
+                                 here, per item, or the tile never becomes a drop target. -->
+                            <Grid Classes="thumb" Width="100" DragDrop.AllowDrop="True">
                                 <Button Background="{StaticResource Surface2Brush}"
                                         BorderBrush="{Binding BorderColor, TargetNullValue={StaticResource HairlineBrush}}"
                                         BorderThickness="2" CornerRadius="8" Padding="6"
-                                        ToolTip.Tip="Click to open crop review — ctrl/shift-click, or the circle in the corner, to select for batch actions"
+                                        ToolTip.Tip="Click to open crop review — drag to reorder pages — ctrl/shift-click, or the circle in the corner, to select for batch actions"
                                         PointerPressed="OnThumbnailPointerPressed"
+                                        PointerMoved="OnThumbnailPointerMoved"
+                                        PointerReleased="OnThumbnailPointerReleased"
                                         Click="OnThumbnailClick"
                                         Tag="{Binding JobId}">
                                     <StackPanel Spacing="6">

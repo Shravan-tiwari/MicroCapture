@@ -62,6 +62,7 @@ TestLiveViewDetectionIsRobust();
 TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
+await TestCartReorderKeepsRecapturesWithTheirPage();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 TestMultipageTiffHasEveryPage();
@@ -1150,6 +1151,77 @@ void AppendTiffPageForTest(BitMiracle.LibTiff.Classic.Tiff output, string source
         output.WriteScanline(row, y);
     }
     output.WriteDirectory();
+}
+
+async Task TestCartReorderKeepsRecapturesWithTheirPage()
+{
+    Console.WriteLine("\n-- Reordering the cart renumbers pages without orphaning a recapture --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "reorder.db");
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "REORD";
+    vm.BatchCode = "REORD";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    for (var i = 0; i < 3; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+
+    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
+    Check("Three pages are in the cart", vm.RecentCaptures.Count == 3);
+    // Page order, not newest-first: dragging must mean what it looks like.
+    Check("The cart reads left-to-right in page order",
+        vm.RecentCaptures.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2, 3 }));
+
+    // Retire an attempt on page 2 the way a recapture does, so the reorder has a superseded row
+    // sharing a page number with a live one — the case that can orphan a page.
+    using (var db = new AppDbContext(dbPath))
+    {
+        var batchId = db.Batches.Select(b => b.Id).First();
+        db.CaptureJobs.Add(new CaptureJob
+        {
+            Id = "retired-page-2", BatchId = batchId, PageNumber = 2,
+            ProcessingStatus = "Superseded", OriginalFilePath = Path.Combine(workDir, "old2.jpg")
+        });
+        await db.SaveChangesAsync();
+    }
+
+    var firstJobId = vm.RecentCaptures[0].JobId;
+    var lastJobId = vm.RecentCaptures[2].JobId;
+
+    // Drag page 1 onto the last position.
+    await RunPumped(() => vm.ReorderCaptureAsync(firstJobId, lastJobId), timeoutMs: 30000);
+
+    Check("The dragged page moved to the end", vm.RecentCaptures[2].JobId == firstJobId);
+    Check("Pages are renumbered contiguously from 1",
+        vm.RecentCaptures.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2, 3 }));
+
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var moved = verify.CaptureJobs.AsNoTracking().First(j => j.Id == firstJobId);
+        Check("The moved page's database row matches its new position", moved.PageNumber == 3);
+
+        // The retired attempt must have travelled with the page it belongs to. If it stayed on
+        // its old number it would now point at a different page and could resurface in an export.
+        var retired = verify.CaptureJobs.AsNoTracking().First(j => j.Id == "retired-page-2");
+        var liveOwner = vm.RecentCaptures.First(t => t.PageNumber == retired.PageNumber);
+        var stillSuperseded = retired.ProcessingStatus == "Superseded";
+        Check("The retired recapture stays attached to its own page",
+            stillSuperseded && verify.CaptureJobs.AsNoTracking()
+                .Count(j => j.PageNumber == retired.PageNumber && j.ProcessingStatus != "Superseded") == 1);
+        Check("The retired recapture did not end up on an unrelated page", liveOwner != null);
+
+        // Every live page must still hold exactly one non-superseded job, or the export would
+        // either drop a page or emit two for one number.
+        var liveByPage = verify.CaptureJobs.AsNoTracking()
+            .Where(j => j.ProcessingStatus != "Superseded")
+            .GroupBy(j => j.PageNumber)
+            .ToList();
+        Check("Every page still has exactly one live capture", liveByPage.All(g => g.Count() == 1));
+        Check("No page numbers collided after renumbering", liveByPage.Count == 3);
+    }
 }
 
 void TestEncoderSupport()

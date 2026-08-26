@@ -6,6 +6,7 @@ using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
+using Avalonia.VisualTree;
 using System.Windows.Input;
 using MicroCapture.UI.Controls;
 using MicroCapture.UI.ViewModels;
@@ -24,11 +25,38 @@ public partial class MainWindow : Window
         // was last clicked instead of firing Capture. Intercepting during the tunnel phase
         // (root to focused control, before the focused control's own handling runs) fixes it.
         AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDown, RoutingStrategies.Tunnel);
+        // Drag-to-reorder drop targets are the filmstrip tiles, but DragDrop's events are routed
+        // events that Avalonia won't accept as XAML attributes — so they're handled here at the
+        // window and resolved back to whichever tile is under the pointer.
+        AddHandler(DragDrop.DragOverEvent, OnThumbnailDragOver);
+        AddHandler(DragDrop.DropEvent, OnThumbnailDrop);
         DataContextChanged += OnDataContextChanged;
+    }
+
+    /// <summary>Finds the filmstrip tile an event landed on, by walking up from whatever inner
+    /// control actually received it (an Image or TextBlock inside the tile, usually).</summary>
+    private static ThumbnailItem? ThumbnailUnder(object? source)
+    {
+        var current = source as Visual;
+        while (current != null)
+        {
+            if (current is Control { DataContext: ThumbnailItem item }) return item;
+            current = current.GetVisualParent();
+        }
+        return null;
     }
 
     private void OnDataContextChanged(object? sender, EventArgs e)
     {
+        if (DataContext is MainWindowViewModel viewModel)
+        {
+            // The cart is in page order, so a new capture lands at the far end, off screen once
+            // the batch is more than a screenful long. Scroll to it so the operator still sees
+            // what they just shot.
+            viewModel.CartAppended -= OnCartAppended;
+            viewModel.CartAppended += OnCartAppended;
+        }
+
         var editor = this.FindControl<FixedFrameOverlayEditor>("FixedFrameOverlay");
         if (editor == null) return;
 
@@ -39,6 +67,17 @@ public partial class MainWindow : Window
         editor.InteractionChanged -= OnFrameInteractionChanged;
         editor.EditCommitted += OnFrameEditCommitted;
         editor.InteractionChanged += OnFrameInteractionChanged;
+    }
+
+    private void OnCartAppended(object? sender, EventArgs e)
+    {
+        // Deferred: the new item hasn't been laid out yet at the moment it's added, so the
+        // scroller doesn't know its extent has grown until the next layout pass.
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
+            scroller?.ScrollToEnd();
+        }, Avalonia.Threading.DispatcherPriority.Background);
     }
 
     private void OnFrameEditCommitted(object? sender, FrameEditKind kind)
@@ -78,9 +117,84 @@ public partial class MainWindow : Window
     // ctrl/shift-click without RoutedEventArgs carrying modifier state itself.
     private bool _nextThumbnailClickIsSelectToggle;
 
+    // Drag-to-reorder state. A drag only begins once the pointer has actually travelled, so an
+    // ordinary click still opens Crop Review rather than every click becoming a micro-drag.
+    private const double DragStartDistance = 6;
+    private Point? _thumbnailDragOrigin;
+    private string? _thumbnailDragJobId;
+    private bool _thumbnailDragStarted;
+
+    /// <summary>Identifies the dragged page. A private format rather than text/plain so a drag
+    /// from another application can never be mistaken for a page reorder.</summary>
+    private const string ThumbnailDragFormat = "microcapture/page";
+
     private void OnThumbnailPointerPressed(object? sender, PointerPressedEventArgs e)
     {
         _nextThumbnailClickIsSelectToggle = (e.KeyModifiers & (KeyModifiers.Control | KeyModifiers.Meta | KeyModifiers.Shift)) != 0;
+
+        // Modifier-clicks are multi-select, not drags.
+        if (_nextThumbnailClickIsSelectToggle) return;
+        if (sender is not Button button) return;
+
+        _thumbnailDragOrigin = e.GetPosition(this);
+        _thumbnailDragJobId = button.Tag as string ?? (button.DataContext as ThumbnailItem)?.JobId;
+        _thumbnailDragStarted = false;
+    }
+
+    private async void OnThumbnailPointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (_thumbnailDragOrigin is not { } origin || _thumbnailDragJobId == null || _thumbnailDragStarted) return;
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed) return;
+
+        var travelled = e.GetPosition(this) - origin;
+        if (Math.Abs(travelled.X) < DragStartDistance && Math.Abs(travelled.Y) < DragStartDistance) return;
+
+        _thumbnailDragStarted = true;
+        // The button's Click fires on release; without this a completed drag would also open
+        // Crop Review for the page that was dragged.
+        _nextThumbnailClickIsSelectToggle = false;
+
+        try
+        {
+            var data = new DataObject();
+            data.Set(ThumbnailDragFormat, _thumbnailDragJobId);
+            await DragDrop.DoDragDrop(e, data, DragDropEffects.Move);
+        }
+        catch (Exception)
+        {
+            // A failed drag must leave the cart exactly as it was rather than taking the app down.
+        }
+        finally
+        {
+            _thumbnailDragOrigin = null;
+            _thumbnailDragJobId = null;
+        }
+    }
+
+    private void OnThumbnailPointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        _thumbnailDragOrigin = null;
+        _thumbnailDragJobId = null;
+        // Cleared on the next pointer press; leaving it set here would suppress a genuine click.
+        _thumbnailDragStarted = false;
+    }
+
+    private void OnThumbnailDragOver(object? sender, DragEventArgs e)
+    {
+        var overThumbnail = e.Data.Contains(ThumbnailDragFormat) && ThumbnailUnder(e.Source) != null;
+        e.DragEffects = overThumbnail ? DragDropEffects.Move : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private async void OnThumbnailDrop(object? sender, DragEventArgs e)
+    {
+        if (!e.Data.Contains(ThumbnailDragFormat)) return;
+        if (e.Data.Get(ThumbnailDragFormat) is not string draggedJobId) return;
+        if (ThumbnailUnder(e.Source) is not { } target) return;
+        if (DataContext is not MainWindowViewModel vm) return;
+
+        e.Handled = true;
+        await vm.ReorderCaptureAsync(draggedJobId, target.JobId);
     }
 
     private void OnThumbnailClick(object? sender, RoutedEventArgs e)
