@@ -252,23 +252,46 @@
                         </ItemsControl>
 
                         <TextBlock Text="FOCUS" Classes="sectionLabel" Margin="0,4,0,0"/>
-                        <StackPanel Orientation="Horizontal" Spacing="4" HorizontalAlignment="Stretch">
-                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                        <!-- Disabled as a group whenever live view isn't streaming: the camera
+                             rejects EVF focus commands outright in that state, so an enabled-looking
+                             button that silently does nothing is worse than a greyed-out one. All
+                             three step sizes are exposed (the medium steps existed in FocusStep but
+                             were never surfaced), giving coarse-to-fine control without a slider —
+                             the EDSDK offers no continuous focus-distance control to bind one to. -->
+                        <Grid ColumnDefinitions="*,*,*,*,*,*,*"
+                              IsEnabled="{Binding IsLiveViewActive}">
+                            <Button Grid.Column="0" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="FarLarge"
-                                    ToolTip.Tip="Focus farther — large step" Content="◀◀"/>
-                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                                    ToolTip.Tip="Focus farther — large step" Content="⏪"/>
+                            <Button Grid.Column="1" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="FarMedium"
+                                    ToolTip.Tip="Focus farther — medium step" Content="◀◀"/>
+                            <Button Grid.Column="2" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="FarSmall"
                                     ToolTip.Tip="Focus farther — small step" Content="◀"/>
-                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                            <Button Grid.Column="3" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding TriggerAutoFocusCommand}"
                                     ToolTip.Tip="Trigger one autofocus attempt now" Content="AF"/>
-                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                            <Button Grid.Column="4" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="NearSmall"
                                     ToolTip.Tip="Focus nearer — small step" Content="▶"/>
-                            <Button Classes="secondary" Width="44" Padding="0,7" FontSize="12"
+                            <Button Grid.Column="5" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                    Command="{Binding NudgeFocusCommand}" CommandParameter="NearMedium"
+                                    ToolTip.Tip="Focus nearer — medium step" Content="▶▶"/>
+                            <Button Grid.Column="6" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="NearLarge"
-                                    ToolTip.Tip="Focus nearer — large step" Content="▶▶"/>
-                        </StackPanel>
+                                    ToolTip.Tip="Focus nearer — large step" Content="⏩"/>
+                        </Grid>
+                        <TextBlock Text="Live view required for focus" FontSize="10" Opacity="0.6"
+                                   HorizontalAlignment="Center" Margin="0,2,0,0"
+                                   IsVisible="{Binding !IsLiveViewActive}"/>
 
                         <!-- Capture Button -->
                         <Button Classes="primary" Command="{Binding CaptureCommand}" IsEnabled="{Binding !IsCalibrating}"

@@ -28,6 +28,10 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _statusText = "Ready — Connect camera to begin";
     [ObservableProperty] private Bitmap? _liveViewImage;
     [ObservableProperty] private bool _isConnected;
+    // Mirrors ICameraService.IsLiveViewActive. The focus controls bind to this rather than
+    // IsConnected because the camera rejects EVF focus commands whenever live view isn't actually
+    // streaming — which happens for real windows during/after a capture and around setting changes.
+    [ObservableProperty] private bool _isLiveViewActive;
     [ObservableProperty] private bool _isAutoCapture;
     [ObservableProperty] private int _pageCount;
     [ObservableProperty] private string _projectCode = "";
@@ -320,6 +324,11 @@ public partial class MainWindowViewModel : ViewModelBase
                 StatusText = e.StatusMessage;
                 UpdateCaptureReadiness();
             });
+        };
+
+        _cameraService.LiveViewActiveChanged += (s, active) =>
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => IsLiveViewActive = active);
         };
 
         _cameraService.LiveViewFrameReceived += (s, frameBytes) =>
@@ -1130,10 +1139,12 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task NudgeFocusAsync(string step)
     {
         if (!IsConnected) { StatusText = "Connect the camera before adjusting focus."; return; }
+        if (!IsLiveViewActive) { StatusText = "Focus needs live view running. Wait for the preview to appear."; return; }
         try
         {
             var parsed = Enum.Parse<MicroCapture.Core.Interfaces.FocusStep>(step);
             await _cameraService.NudgeFocusAsync(parsed);
+            StatusText = $"Focus nudged {(step.StartsWith("Near") ? "nearer" : "farther")}.";
         }
         catch (Exception ex)
         {
@@ -1145,10 +1156,15 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task TriggerAutoFocusAsync()
     {
         if (!IsConnected) { StatusText = "Connect the camera before triggering autofocus."; return; }
+        if (!IsLiveViewActive) { StatusText = "Autofocus needs live view running. Wait for the preview to appear."; return; }
         try
         {
+            StatusText = "Focusing…";
             await _cameraService.TriggerAutoFocusAsync();
-            StatusText = "Autofocus triggered.";
+            // Only claim success once the drive command actually returned OK. This used to report
+            // "Autofocus triggered." unconditionally while the service was in fact commanding AF
+            // OFF — the false success is what made the bug so hard to spot from the UI.
+            StatusText = "Autofocus complete.";
         }
         catch (Exception ex)
         {

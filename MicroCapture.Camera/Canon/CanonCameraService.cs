@@ -35,6 +35,10 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         new("AFMode", "Focus mode", EDSDK.PropID_AFMode),
         new("ColorSpace", "Color space", EDSDK.PropID_ColorSpace)
     };
+    // How long to hold the AF drive engaged before releasing it. Long enough for the lens to
+    // actually hunt and settle on a low-contrast page (releasing immediately cancels the attempt
+    // it was just asked to make), short enough that the operator isn't left waiting on a button.
+    private const int AutoFocusHuntMilliseconds = 600;
     private static readonly object LogSync = new();
     private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
     private readonly object _sync = new();
@@ -53,6 +57,10 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private bool _isDownloading;
     private CancellationTokenSource? _liveViewCts;
     private Task? _liveViewTask;
+    // Set only when a frame has actually been downloaded, not when live view was merely requested
+    // — see ICameraService.IsLiveViewActive for why the EVF focus commands depend on the real
+    // thing. Written from the live-view loop thread, read from anywhere, hence volatile-via-int.
+    private int _liveViewStreaming;
     private TaskCompletionSource<string>? _captureTcs;
     private bool _captureExpectsRawOnly;
     private string _currentSaveDirectory = string.Empty;
@@ -66,8 +74,19 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     private EDSDK.EdsStateEventHandler? _stateEventHandler;
 
     public bool IsConnected { get { lock (_sync) return _isConnected; } }
+    public bool IsLiveViewActive => Volatile.Read(ref _liveViewStreaming) == 1;
     public event EventHandler<CameraStateEventArgs>? StateChanged;
     public event EventHandler<byte[]>? LiveViewFrameReceived;
+    public event EventHandler<bool>? LiveViewActiveChanged;
+
+    /// <summary>Flips the streaming flag and notifies only on an actual transition, so the UI
+    /// isn't re-notified 30 times a second by the live-view loop.</summary>
+    private void SetLiveViewStreaming(bool streaming)
+    {
+        if (Interlocked.Exchange(ref _liveViewStreaming, streaming ? 1 : 0) == (streaming ? 1 : 0)) return;
+        try { LiveViewActiveChanged?.Invoke(this, streaming); }
+        catch (Exception ex) { Log("SetLiveViewStreaming", ex.ToString()); }
+    }
 
     public Task<IReadOnlyList<CameraSetting>> GetCameraSettingsAsync()
     {
@@ -303,6 +322,18 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                 ? currentDevice | EDSDK.EvfOutputDevice_PC
                 : EDSDK.EvfOutputDevice_TFT | EDSDK.EvfOutputDevice_PC;
 
+            // Engage the EVF state machine BEFORE routing output to the PC. Frames will stream
+            // without this on many bodies — which is why its absence went unnoticed — but the EVF
+            // focus commands (DriveLensEvf/DoEvfAf) are rejected unless Evf_Mode is on, which is
+            // what made both the AF button and the near/far arrows appear dead. Canon's own
+            // startup sequence sets this first, so follow it rather than relying on the body's
+            // tolerance. Not fatal if the body doesn't expose it: log and carry on, since live
+            // view itself demonstrably works without it.
+            var evfModeResult = Call("EdsSetPropertyData(Evf_Mode=1)",
+                () => EDSDK.EdsSetPropertyData(camera, EDSDK.PropID_Evf_Mode, 0, sizeof(uint), (uint)1));
+            if (evfModeResult != EDSDK.EDS_ERR_OK)
+                Log("StartLiveViewAsync", $"Evf_Mode=1 not accepted ({ErrorName(evfModeResult)}); focus commands may be rejected by this body.");
+
             EnsureSuccess(
                 "EdsSetPropertyData(Evf_OutputDevice=PC)",
                 Call("EdsSetPropertyData(Evf_OutputDevice=PC)",
@@ -324,6 +355,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         CancellationTokenSource? cts;
         Task? task;
         lock (_sync) { cts = _liveViewCts; task = _liveViewTask; _liveViewCts = null; _liveViewTask = null; }
+        // Clear up front, not after the loop drains: focus commands must start failing the moment
+        // a stop is requested, not once the in-flight native call happens to return.
+        SetLiveViewStreaming(false);
         if (cts != null) cts.Cancel();
         if (task != null)
         {
@@ -362,6 +396,7 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             lock (_sync)
             {
                 ThrowIfDisconnected();
+                ThrowIfLiveViewInactive("Focus");
                 var param = step switch
                 {
                     FocusStep.NearSmall => EDSDK.EvfDriveLens_Near1,
@@ -378,17 +413,49 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     }
 
     /// <summary>Fires one autofocus attempt on demand during live view, independent of capture —
-    /// lets the operator force a refocus without it happening automatically as part of shooting.</summary>
+    /// lets the operator force a refocus without it happening automatically as part of shooting.
+    /// Requires live view to be actively streaming (see <see cref="IsLiveViewActive"/>).</summary>
     public Task TriggerAutoFocusAsync()
     {
         // See NudgeFocusAsync — AF hunting on a low-contrast page can take real time; this
         // must never run synchronously on the caller's thread.
-        return Task.Run(() =>
+        return Task.Run(async () =>
         {
             lock (_sync)
             {
                 ThrowIfDisconnected();
-                EnsureSuccess("EdsSendCommand(DoEvfAf)", Call("EdsSendCommand(DoEvfAf)", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, 0)));
+                ThrowIfLiveViewInactive("Autofocus");
+                // DoEvfAf's parameter is EvfAf_ON(1)/EvfAf_OFF(0) — it is NOT "run AF once".
+                // This previously passed 0, i.e. it commanded autofocus OFF and then reported
+                // success, since EvfAf_OFF is a perfectly legal command that returns EDS_ERR_OK.
+                // That is why the AF button appeared to do nothing at all. Drive AF on, then
+                // release it, mirroring a shutter half-press and release.
+                EnsureSuccess("EdsSendCommand(DoEvfAf, ON)", Call("EdsSendCommand(DoEvfAf, ON)",
+                    () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, (int)EDSDK.EdsEvfAf.CameraCommand_EvfAf_ON)));
+            }
+            try
+            {
+                // Deliberately OUTSIDE the lock. The live-view loop takes _sync for every frame,
+                // so waiting while holding it would stall the EVF stream for the whole hunt —
+                // and contrast-detect AF needs that stream running to converge. Waiting here lets
+                // frames keep flowing (the operator also sees the lens hunt, which is the point).
+                await Task.Delay(AutoFocusHuntMilliseconds).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Best-effort release. If this fails the AF drive stays engaged, which is
+                // recoverable on the next command — so don't mask a successful focus with an
+                // exception from the teardown half. Re-check state: live view may have stopped
+                // (e.g. a capture started) during the wait.
+                lock (_sync)
+                {
+                    if (_isConnected && _camera != IntPtr.Zero)
+                    {
+                        var release = Call("EdsSendCommand(DoEvfAf, OFF)",
+                            () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, (int)EDSDK.EdsEvfAf.CameraCommand_EvfAf_OFF));
+                        if (release != EDSDK.EDS_ERR_OK) Log("TriggerAutoFocusAsync", $"AF release returned {ErrorName(release)}");
+                    }
+                }
             }
         });
     }
@@ -479,7 +546,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                     }
                 }
 
-                if (frameBytes != null) LiveViewFrameReceived?.Invoke(this, frameBytes);
+                // A downloaded frame is the only trustworthy proof the EVF pipe is genuinely up,
+                // which is the precondition the focus commands need.
+                if (frameBytes != null) { SetLiveViewStreaming(true); LiveViewFrameReceived?.Invoke(this, frameBytes); }
                 if (result != EDSDK.EDS_ERR_OK && result != EDSDK.EDS_ERR_OBJECT_NOTREADY)
                 {
                     PublishState(true, $"Live View error: {ErrorName(result)} (0x{result:X8})");
@@ -490,7 +559,7 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) { Log("LiveViewLoopAsync", ex.ToString()); PublishState(true, "Live View stopped unexpectedly — see EDSDK log."); }
-        finally { Release(image, "EVF image"); Release(stream, "EVF stream"); }
+        finally { SetLiveViewStreaming(false); Release(image, "EVF image"); Release(stream, "EVF stream"); }
     }
 
     private uint ObjectEventHandler(uint inEvent, IntPtr inRef, IntPtr inContext)
@@ -602,6 +671,18 @@ public sealed class CanonCameraService : ICameraService, IDisposable
 
     private void FailCapture(Exception exception) { lock (_sync) _captureTcs?.TrySetException(exception); }
     private void ThrowIfDisconnected() { if (!_isConnected || _camera == IntPtr.Zero) throw new InvalidOperationException("Camera is not connected."); }
+
+    /// <summary>Guards the EVF-only focus commands. The camera rejects DriveLensEvf/DoEvfAf
+    /// whenever live view isn't genuinely streaming, and there are ordinary windows where the
+    /// camera is connected but it isn't: right after Connect (the EVF pipe takes a moment to come
+    /// up), during and just after a capture (CaptureAsync stops live view and restarts it
+    /// fire-and-forget), and around every camera-setting change. Failing here with a plain
+    /// instruction beats surfacing a raw SDK error code the operator can't act on.</summary>
+    private void ThrowIfLiveViewInactive(string action)
+    {
+        if (Volatile.Read(ref _liveViewStreaming) == 1) return;
+        throw new InvalidOperationException($"{action} needs live view running. Wait for the preview to appear, then try again.");
+    }
     private void PublishState(bool connected, string message) => StateChanged?.Invoke(this, new CameraStateEventArgs { IsConnected = connected, StatusMessage = message });
     private static bool IsWindows() => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
     private static bool Succeeded(uint result) => result == EDSDK.EDS_ERR_OK;

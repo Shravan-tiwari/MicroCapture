@@ -22,9 +22,11 @@ public class MockCameraService : ICameraService
     private int _frameCount = 0;
 
     public bool IsConnected => _isConnected;
+    public bool IsLiveViewActive => _isLiveViewRunning;
 
     public event EventHandler<CameraStateEventArgs>? StateChanged;
     public event EventHandler<byte[]>? LiveViewFrameReceived;
+    public event EventHandler<bool>? LiveViewActiveChanged;
 
     public Task<IReadOnlyList<CameraSetting>> GetCameraSettingsAsync() =>
         Task.FromResult<IReadOnlyList<CameraSetting>>(CreateSettings());
@@ -75,6 +77,7 @@ public class MockCameraService : ICameraService
         if (_isLiveViewRunning) return Task.CompletedTask;
 
         _isLiveViewRunning = true;
+        LiveViewActiveChanged?.Invoke(this, true);
         _liveViewCts = new CancellationTokenSource();
         var token = _liveViewCts.Token;
 
@@ -93,25 +96,38 @@ public class MockCameraService : ICameraService
 
     public Task StopLiveViewAsync()
     {
+        var wasRunning = _isLiveViewRunning;
         _isLiveViewRunning = false;
+        if (wasRunning) LiveViewActiveChanged?.Invoke(this, false);
         _liveViewCts?.Cancel();
         _liveViewCts?.Dispose();
         _liveViewCts = null;
         return Task.CompletedTask;
     }
 
-    // No real lens to move — safe no-ops so the UI's focus controls work identically against
-    // the mock camera for dev/testing without a physical body attached.
+    // No real lens to move, but the live-view precondition IS modelled deliberately. These used
+    // to no-op on connection alone, which meant the focus controls always "worked" in dev against
+    // the mock while failing on real hardware — that masked a long-standing bug where the camera
+    // rejected EVF focus commands because live view wasn't up. Keep this guard in step with
+    // CanonCameraService.ThrowIfLiveViewInactive.
     public Task NudgeFocusAsync(FocusStep step)
     {
         if (!_isConnected) throw new InvalidOperationException("Camera not connected.");
+        ThrowIfLiveViewInactive("Focus");
         return Task.CompletedTask;
     }
 
     public Task TriggerAutoFocusAsync()
     {
         if (!_isConnected) throw new InvalidOperationException("Camera not connected.");
+        ThrowIfLiveViewInactive("Autofocus");
         return Task.CompletedTask;
+    }
+
+    private void ThrowIfLiveViewInactive(string action)
+    {
+        if (_isLiveViewRunning) return;
+        throw new InvalidOperationException($"{action} needs live view running. Wait for the preview to appear, then try again.");
     }
 
     public async Task<string> CaptureAsync(string outputDirectory, string fileNamePrefix)
