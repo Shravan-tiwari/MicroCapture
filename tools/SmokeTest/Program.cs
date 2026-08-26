@@ -2411,6 +2411,20 @@ async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()
     var camera = new MicroCapture.Camera.MockCameraService();
     var vm = new MainWindowViewModel(camera, dbPath);
 
+    // Actually build the main window, not just its ViewModel. Compiled bindings and XAML syntax
+    // are checked at build time, but a StaticResource that doesn't resolve only throws when the
+    // window is constructed — which for the main window means the app failing to open at all.
+    try
+    {
+        var mainWindow = new MainWindow { DataContext = vm };
+        Dispatcher.UIThread.RunJobs();
+        Check("Real UI flow: the main window builds without a missing resource or binding", mainWindow.Content != null);
+    }
+    catch (Exception ex)
+    {
+        Check($"Real UI flow: the main window builds ({ex.GetType().Name}: {ex.Message})", false);
+    }
+
     await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
     Check("Real UI flow: camera connects", vm.IsConnected);
 
