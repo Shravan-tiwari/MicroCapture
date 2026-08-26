@@ -17,6 +17,14 @@ public class Batch
     
     public bool SplitBookPages { get; set; } = false;
 
+    // Where this batch's own folder lives — the folder holding batch.mcbatch, thumbnails/, temp/
+    // and output/ (see BatchFolder). That folder, not this database row, is the source of truth
+    // for the batch: this row is local to one machine, while the folder travels with the images
+    // onto a share, a USB stick, or another workstation. Null on batches created before batch
+    // folders existed, which keep using the project's flat output directory until they're
+    // migrated — see BatchManifestService and the backfill in MainWindowViewModel.
+    public string? FolderPath { get; set; }
+
     // NOTE: this batch used to carry a UseAltBoundaryPipeline opt-in toggle, selecting between
     // the original contour/confidence-based pipeline and an alternative ported from
     // tools/phaseA-prototype/boundary_prototype.ipynb. That toggle is gone — the notebook-ported

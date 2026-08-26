@@ -1,0 +1,67 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.OpenBatchDialog"
+        Title="Open Batch"
+        Icon="/Assets/microcapture-icon.png"
+        Width="640" Height="560"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource CanvasBrush}">
+    <Border Classes="panel" Margin="18" Padding="20">
+        <Grid RowDefinitions="Auto, Auto, *, Auto, Auto">
+            <TextBlock Grid.Row="0" Text="OPEN BATCH" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,0,0,14"
+                       Text="Pick a batch to continue it. Batches found on this machine and on any connected drive are listed below — including ones started on another workstation. Use Browse to open a batch from anywhere else."/>
+
+            <ScrollViewer Grid.Row="2">
+                <ItemsControl ItemsSource="{Binding Batches}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <!-- Row buttons dispatch through code-behind rather than a
+                                 $parent[ItemsControl] compiled binding — see the note in
+                                 RecentBatchesDialog.axaml.cs, where that pattern threw at
+                                 runtime on the target machine despite building cleanly. -->
+                            <Button Classes="secondary" HorizontalAlignment="Stretch" Margin="0,0,0,8" Padding="14,10"
+                                    Click="OnBatchRowClick">
+                                <Grid ColumnDefinitions="*, Auto">
+                                    <StackPanel Grid.Column="0" Spacing="3">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding ProjectCode}" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource InkBrush}"/>
+                                            <TextBlock Text="/" Foreground="{StaticResource InkSubtleBrush}"/>
+                                            <TextBlock Text="{Binding BatchCode}" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource InkBrush}"/>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding Subtitle}" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" TextWrapping="Wrap"/>
+                                    </StackPanel>
+                                    <Border Grid.Column="1" Background="{StaticResource Surface2Brush}" CornerRadius="6" Padding="8,3" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="Medium" Foreground="{StaticResource InkMutedBrush}"/>
+                                    </Border>
+                                </Grid>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <TextBlock Grid.Row="2" Text="Looking for batches…" FontSize="13"
+                       Foreground="{StaticResource InkTertiaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       IsVisible="{Binding IsScanning}"/>
+
+            <TextBlock Grid.Row="2" Text="No batches found. Use Browse to open one from another drive or folder." FontSize="13"
+                       Foreground="{StaticResource InkTertiaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       TextWrapping="Wrap" TextAlignment="Center" MaxWidth="360"
+                       IsVisible="{Binding IsEmpty}"/>
+
+            <Border Grid.Row="3" Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12,9" Margin="0,14,0,0"
+                    IsVisible="{Binding HasStatusMessage}">
+                <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" FontSize="12"
+                           Foreground="{StaticResource InkBrush}"/>
+            </Border>
+
+            <Grid Grid.Row="4" ColumnDefinitions="Auto, *, Auto" Margin="0,14,0,0">
+                <Button Grid.Column="0" Content="Browse…" Classes="secondary" Command="{Binding BrowseCommand}"
+                        ToolTip.Tip="Open a batch folder from anywhere — another drive, a USB stick, or a network share"/>
+                <Button Grid.Column="2" Content="Cancel" Classes="secondary" Command="{Binding CloseCommand}"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

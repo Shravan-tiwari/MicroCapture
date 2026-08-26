@@ -1,0 +1,107 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MicroCapture.UI.ViewModels"
+        x:Class="MicroCapture.UI.Views.NewBatchDialog"
+        Title="New Batch"
+        Icon="/Assets/microcapture-icon.png"
+        Width="620" Height="640"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource CanvasBrush}">
+    <Border Classes="panel" Margin="18" Padding="20">
+        <Grid RowDefinitions="Auto, Auto, *, Auto, Auto">
+            <TextBlock Grid.Row="0" Text="NEW BATCH" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,0,0,16"
+                       Text="These settings apply to every page in the batch and are fixed once it's created, so all its pages come out matching. They're saved into the batch folder, so the batch opens with the same settings on any machine."/>
+
+            <ScrollViewer Grid.Row="2">
+                <StackPanel Spacing="14">
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="PROJECT CODE" Classes="sectionLabel"/>
+                        <TextBox Text="{Binding ProjectCode}" Watermark="e.g. QLD-TOURISM"
+                                 Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
+                                 BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="BATCH CODE" Classes="sectionLabel"/>
+                        <TextBox Text="{Binding BatchCode}" Watermark="e.g. CAIRNS-001"
+                                 Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
+                                 BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="BATCH LOCATION ON DRIVE" Classes="sectionLabel"/>
+                        <Grid ColumnDefinitions="*, Auto">
+                            <TextBox Grid.Column="0" Text="{Binding BatchLocation}" Watermark="Choose a folder…"
+                                     Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
+                                     BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                            <Button Grid.Column="1" Content="Browse…" Classes="secondary" Margin="8,0,0,0"
+                                    Command="{Binding BrowseCommand}"/>
+                        </Grid>
+                        <TextBlock Text="{Binding ResolvedBatchFolder}" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"
+                                   TextWrapping="Wrap"/>
+                        <TextBlock FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" TextWrapping="Wrap"
+                                   Text="Saving to a shared drive lets other workstations open this batch. A local folder works too — the batch can still be copied or moved later and will open correctly."/>
+                    </StackPanel>
+
+                    <Grid ColumnDefinitions="*, *" Margin="0,4,0,0">
+                        <StackPanel Grid.Column="0" Spacing="6" Margin="0,0,7,0">
+                            <TextBlock Text="DPI" Classes="sectionLabel"/>
+                            <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
+                                      HorizontalAlignment="Stretch"
+                                      ToolTip.Tip="150 is the rig's native captured size. Lower values downsample, higher values upsample.">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>
+                                    </DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="6" Margin="7,0,0,0">
+                            <TextBlock Text="CAPTURE FORMAT" Classes="sectionLabel"/>
+                            <ComboBox ItemsSource="{Binding AvailableCaptureFormats}" SelectedItem="{Binding SelectedCaptureFormat}"
+                                      HorizontalAlignment="Stretch"
+                                      ToolTip.Tip="Format each captured page is written in. Binarized output is always TIFF regardless of this."/>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="FINAL OUTPUT FORMAT" Classes="sectionLabel"/>
+                        <ComboBox ItemsSource="{Binding AvailableExportFormats}" SelectedItem="{Binding SelectedExportFormat}"
+                                  HorizontalAlignment="Stretch"
+                                  ToolTip.Tip="What Finalize produces for the whole batch. Can still be changed at Finalize time."/>
+                    </StackPanel>
+
+                    <StackPanel Spacing="8" Margin="0,4,0,0">
+                        <TextBlock Text="PROCESSING" Classes="sectionLabel"/>
+                        <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction"
+                                  ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight."
+                                  Foreground="{StaticResource InkMutedBrush}"/>
+                        <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split book pages"
+                                  ToolTip.Tip="Splits a photographed two-page spread into two output pages at the gutter."
+                                  Foreground="{StaticResource InkMutedBrush}"/>
+                        <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (black &amp; white)"
+                                  ToolTip.Tip="Thresholds every page to pure black-and-white as a 1-bit CCITT G4 TIFF — much smaller files and crisper OCR, but loses all colour and greyscale. Not reversible after export."
+                                  Foreground="{StaticResource InkMutedBrush}"/>
+                        <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough suppression"
+                                  ToolTip.Tip="Softens show-through from the reverse side of a thin page. Effective on greyscale and text show-through only, not coloured images."
+                                  Foreground="{StaticResource InkMutedBrush}"/>
+                    </StackPanel>
+
+                </StackPanel>
+            </ScrollViewer>
+
+            <Border Grid.Row="3" Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12,9" Margin="0,14,0,0"
+                    IsVisible="{Binding HasValidationMessage}">
+                <TextBlock Text="{Binding ValidationMessage}" TextWrapping="Wrap" FontSize="12"
+                           Foreground="{StaticResource InkBrush}"/>
+            </Border>
+
+            <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,14,0,0">
+                <Button Content="Cancel" Classes="secondary" Command="{Binding CancelCommand}"/>
+                <Button Content="Create Batch" Classes="primary" Command="{Binding CreateCommand}"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

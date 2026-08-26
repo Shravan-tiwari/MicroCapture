@@ -80,6 +80,9 @@ public class CaptureQueueService
         EnsureColumn("CaptureJobs", "Sharpness", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("CaptureJobs", "WhiteBalance", "REAL NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "BleedthroughEnabled", "INTEGER NOT NULL DEFAULT 0");
+        // Null for every batch created before batch folders existed; those keep resolving against
+        // the project's flat output directory until opened and migrated. See Batch.FolderPath.
+        EnsureColumn("Batches", "FolderPath", "TEXT NULL");
         // Physical-size DPI calibration (see CameraCalibration.cs's own comment on these four
         // fields) — null means "not yet calibrated," so ImageProcessor.MeasuredDpi falls back to
         // BaselineDpi for any rig whose calibration row predates this.
