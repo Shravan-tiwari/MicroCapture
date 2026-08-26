@@ -22,6 +22,103 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ICameraService _cameraService;
     private readonly AppDbContext _dbContext;
     private readonly CaptureQueueService _queueService;
+    private readonly BatchManifestService _manifests;
+    private readonly BatchLockService _batchLocks;
+    private readonly BatchSyncService _batchSync;
+    /// <summary>Folder of the batch currently open, or null for a legacy batch that hasn't been
+    /// given one yet. This is what the manifest is read from and published back to.</summary>
+    private string? _currentBatchFolder;
+    private readonly AppPreferences _preferences = AppPreferences.Load();
+
+    private string? LastBatchLocation
+    {
+        get => _preferences.LastBatchLocation;
+        set { _preferences.LastBatchLocation = value; _preferences.Save(); }
+    }
+
+    private IReadOnlyList<string> RecentBatchFolders => _preferences.RecentBatchFolders;
+
+    // The toolbar no longer offers batch settings to change, so it shows what the open batch IS
+    // instead — otherwise, with the codes and dropdowns gone, nothing on screen would say which
+    // batch is being captured into or how.
+    [ObservableProperty] private bool _hasOpenBatch;
+    [ObservableProperty] private string _openBatchLabel = string.Empty;
+    [ObservableProperty] private string _openBatchSettingsLabel = string.Empty;
+
+    private void UpdateOpenBatchLabels(Batch? batch)
+    {
+        if (batch == null)
+        {
+            HasOpenBatch = false;
+            OpenBatchLabel = string.Empty;
+            OpenBatchSettingsLabel = string.Empty;
+            return;
+        }
+
+        HasOpenBatch = true;
+        OpenBatchLabel = string.IsNullOrWhiteSpace(_activeProjectCode)
+            ? batch.BatchCode
+            : $"{_activeProjectCode} / {batch.BatchCode}";
+
+        var options = new List<string> { $"{batch.Dpi} DPI", SelectedCaptureFormat };
+        if (batch.DewarpEnabled) options.Add("book curve");
+        if (batch.SplitBookPages) options.Add("split pages");
+        if (batch.BinarizeEnabled) options.Add("B&W");
+        if (batch.BleedthroughEnabled) options.Add("bleedthrough");
+        OpenBatchSettingsLabel = string.Join(" · ", options);
+    }
+
+    private IEnumerable<string> BatchSearchRoots() => _preferences.EffectiveSearchRoots();
+
+    /// <summary>Where this batch's captures are written. Inside the batch folder once it has one,
+    /// which is what makes the batch self-contained and therefore portable; otherwise the
+    /// project's flat output directory, as batches behaved before batch folders existed.
+    ///
+    /// <para>Originals and their processed derivatives deliberately share a directory — see
+    /// ProcessedFilePaths, which derives the output directory from the original's own path — so
+    /// pointing captures here places both inside the batch folder without changing the
+    /// pipeline.</para></summary>
+    private string CaptureDirectory => string.IsNullOrWhiteSpace(_currentBatchFolder)
+        ? _outputDirectory
+        : BatchFolder.OutputPath(_currentBatchFolder);
+
+    /// <summary>Where a page's cart thumbnail lives — the batch folder's own thumbnails/ once it
+    /// has one, so thumbnails travel with the batch and the cart renders on another machine
+    /// without re-deriving anything from images that may not be present.</summary>
+    private string ThumbnailFileFor(string batchCode, int pageNumber) =>
+        string.IsNullOrWhiteSpace(_currentBatchFolder)
+            ? MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, batchCode, pageNumber)
+            : Path.Combine(BatchFolder.ThumbnailsPath(_currentBatchFolder), $"{pageNumber:D6}.png");
+
+    private string ThumbnailDirectoryFor(string batchCode) =>
+        string.IsNullOrWhiteSpace(_currentBatchFolder)
+            ? MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, batchCode)
+            : BatchFolder.ThumbnailsPath(_currentBatchFolder);
+
+    /// <summary>Writes the current batch state back to its manifest. Called after anything the
+    /// manifest describes changes, so the folder — not this machine's database — stays the copy
+    /// that can be trusted and reopened anywhere.</summary>
+    private async Task PublishManifestAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_currentBatchFolder) || _currentBatchId == null) return;
+        try
+        {
+            var batch = await _dbContext.Batches.FirstOrDefaultAsync(b => b.Id == _currentBatchId);
+            if (batch != null) await _batchSync.PublishAsync(batch);
+        }
+        catch (Exception ex)
+        {
+            // The database still holds everything; only portability is affected, so this must
+            // never interrupt capture.
+            Console.Error.WriteLine($"Could not update the batch manifest: {ex}");
+        }
+    }
+
+    private void RememberRecentBatchFolder(string folder)
+    {
+        _preferences.RememberBatchFolder(folder);
+        _preferences.Save();
+    }
     private readonly MicroCapture.Processing.BackgroundProcessingWorker? _worker;
 
     // --- State ---
@@ -269,6 +366,9 @@ public partial class MainWindowViewModel : ViewModelBase
         _cameraService = cameraService;
         _dbContext = dbPath == null ? new AppDbContext() : new AppDbContext(dbPath);
         _queueService = new CaptureQueueService(_dbContext);
+        _manifests = new BatchManifestService();
+        _batchLocks = new BatchLockService();
+        _batchSync = new BatchSyncService(_dbContext, _manifests);
 
         _worker = new MicroCapture.Processing.BackgroundProcessingWorker(dbPath);
         _worker.StatusChanged += (s, msg) => {
@@ -777,6 +877,25 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             _suppressPersist = false;
         }
+        // A batch opened by any route resolves its folder here, so capture and the manifest agree
+        // on where this batch lives regardless of which command opened it. A batch predating batch
+        // folders gets one now, describing its files where they already are rather than moving them.
+        _currentBatchFolder = batch.FolderPath;
+        if (string.IsNullOrWhiteSpace(_currentBatchFolder) && !string.IsNullOrWhiteSpace(_outputDirectory))
+        {
+            try
+            {
+                _currentBatchFolder = await _batchSync.BackfillLegacyBatchAsync(batch, _outputDirectory);
+            }
+            catch (Exception ex)
+            {
+                // A batch that can't be given a folder still opens and works exactly as it did
+                // before batch folders existed — it just isn't portable yet.
+                Console.Error.WriteLine($"Could not create a batch folder for '{batch.BatchCode}': {ex}");
+            }
+        }
+
+        UpdateOpenBatchLabels(batch);
         await LoadRecentCapturesFromBatchAsync(batch);
         await RefreshFrameEditPermissionAsync();
     }
@@ -825,6 +944,168 @@ public partial class MainWindowViewModel : ViewModelBase
             StatusText = $"Could not open Recent Batches: {ex.Message}";
         }
     }
+
+    /// <summary>Creates a batch: its folder, its manifest, and the local database rows that track
+    /// it while it's being worked. The folder is the batch — the database row is this machine's
+    /// working copy of it, which is why the manifest is written before anything else.</summary>
+    [RelayCommand]
+    private async Task NewBatchAsync(Avalonia.Controls.Window? owner)
+    {
+        if (owner == null) return;
+        try
+        {
+            var defaultLocation = LastBatchLocation ?? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture");
+
+            var settings = await MicroCapture.UI.Views.NewBatchDialog.ShowAsync(owner, defaultLocation, ProjectCode);
+            if (settings == null) return;
+
+            var projectCode = MicroCapture.Core.FileNaming.Sanitize(settings.ProjectCode);
+            var batchCode = MicroCapture.Core.FileNaming.Sanitize(settings.BatchCode);
+            var folder = settings.ResolvedBatchFolder;
+
+            _dbContext.ChangeTracker.Clear();
+            var project = _dbContext.Projects.FirstOrDefault(p => p.Name == projectCode);
+            if (project == null)
+            {
+                project = new Project
+                {
+                    Name = projectCode,
+                    Customer = "",
+                    Description = "Auto-created from scanning session",
+                    CreatedBy = Environment.UserName,
+                    // Only a fallback for anything that still resolves against the project rather
+                    // than the batch folder; a batch with its own folder keeps everything inside it.
+                    OutputDirectory = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture", projectCode)
+                };
+                _dbContext.Projects.Add(project);
+                await _dbContext.SaveChangesAsync();
+            }
+
+            var activeCalibrationId = await _dbContext.CameraCalibrations
+                .Where(c => c.IsActive).Select(c => c.Id).FirstOrDefaultAsync();
+
+            // Frames drawn before the batch was created are staged in memory and land on the new
+            // row here, so the rig can be set up before committing to a batch code.
+            EnsureFrameReference();
+            var stagedFrameCount = Frames.Count;
+
+            var batch = new Batch
+            {
+                ProjectId = project.Id,
+                Name = batchCode,
+                BatchCode = batchCode,
+                Operator = Environment.UserName,
+                FolderPath = folder,
+                SplitBookPages = settings.SplitBookPages && stagedFrameCount == 0,
+                Dpi = settings.SelectedDpi,
+                PreferredExportFormat = settings.SelectedExportFormat,
+                DewarpEnabled = settings.DewarpEnabled,
+                BinarizeEnabled = settings.BinarizeEnabled,
+                BleedthroughEnabled = settings.BleedthroughEnabled,
+                CameraCalibrationId = activeCalibrationId,
+                UseFixedFrames = stagedFrameCount > 0,
+                FixedFrames = stagedFrameCount > 0 ? MicroCapture.Processing.ImageProcessor.FormatFixedFrames(Frames) : null,
+                FixedFrameImageWidth = stagedFrameCount > 0 ? FrameReferenceWidth : 0,
+                FixedFrameImageHeight = stagedFrameCount > 0 ? FrameReferenceHeight : 0
+            };
+            _dbContext.Batches.Add(batch);
+            await _dbContext.SaveChangesAsync();
+
+            BatchFolder.EnsureLayout(folder);
+            var manifest = settings.ToManifest(batch.Id, project.Id);
+            manifest.Settings.FixedFrames = batch.FixedFrames;
+            manifest.Settings.FixedFrameImageWidth = batch.FixedFrameImageWidth;
+            manifest.Settings.FixedFrameImageHeight = batch.FixedFrameImageHeight;
+            _manifests.Save(folder, manifest);
+
+            SelectedCaptureFormat = NormalizeCaptureFormat(settings.SelectedCaptureFormat);
+            LastBatchLocation = settings.BatchLocation;
+            RememberRecentBatchFolder(folder);
+
+            _currentBatchFolder = folder;
+            _batchLocks.Acquire(folder);
+            ProjectCode = projectCode;
+            BatchCode = batchCode;
+
+            await LoadBatchIntoUiAsync(batch);
+            StatusText = $"Created batch '{batchCode}' in {folder}";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not create the batch: {ex.Message}";
+        }
+    }
+
+    /// <summary>Opens a batch from its folder, wherever it came from — this machine, a share, or a
+    /// USB stick — rebuilding the local rows from the manifest so a batch created elsewhere is
+    /// fully workable rather than merely visible.</summary>
+    [RelayCommand]
+    private async Task OpenBatchAsync(Avalonia.Controls.Window? owner)
+    {
+        if (owner == null) return;
+        try
+        {
+            var roots = BatchSearchRoots();
+            var folder = await MicroCapture.UI.Views.OpenBatchDialog.PickAsync(owner, _manifests, roots, RecentBatchFolders);
+            if (folder == null) return;
+
+            var validation = _manifests.Validate(folder);
+            if (!validation.IsValid)
+            {
+                StatusText = validation.Error ?? "That folder isn't an openable batch.";
+                return;
+            }
+
+            // Advisory only: tell the operator who else has it and let them decide. A hard block
+            // would strand a batch someone left open, and a lock left on an unplugged USB stick
+            // is normal rather than exceptional.
+            if (_batchLocks.IsHeldByAnother(folder, out var holder) && holder != null)
+            {
+                var proceed = await MicroCapture.UI.Views.ConfirmDialog.AskAsync(owner,
+                    $"This batch is currently open by {BatchLockService.DescribeHolder(holder)}.\n\n" +
+                    "You can still open it, but if you both capture into it at the same time your pages can end up with the same page numbers. Continue?",
+                    "Batch is open elsewhere");
+                if (!proceed) return;
+            }
+
+            var batch = await _batchSync.AdoptAsync(folder, validation.Manifest!);
+
+            var missing = _manifests.FindMissingPageFiles(folder, validation.Manifest!);
+            _currentBatchFolder = folder;
+            _batchLocks.Acquire(folder);
+            RememberRecentBatchFolder(folder);
+            LastBatchLocation = Path.GetDirectoryName(folder);
+
+            ProjectCode = validation.Manifest!.ProjectCode;
+            BatchCode = batch.BatchCode;
+            SelectedCaptureFormat = NormalizeCaptureFormat(validation.Manifest.Settings.CaptureFormat);
+
+            await LoadBatchIntoUiAsync(batch);
+
+            // Reported rather than silently ignored, but never fatal — a batch missing some files
+            // is still worth opening to recover the rest.
+            StatusText = missing.Count == 0
+                ? $"Opened batch '{batch.BatchCode}' at page {PageCount}"
+                : $"Opened batch '{batch.BatchCode}' at page {PageCount} — {missing.Count} file(s) listed in the batch are missing from disk";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not open the batch: {ex.Message}";
+        }
+    }
+
+    /// <summary>Capture formats the dialog offers include names the capture pipeline doesn't use
+    /// as-is ("JPEG" vs "JPG"), and formats only the exporter can produce. Map to something the
+    /// capture path understands rather than letting an unknown value reach it.</summary>
+    private string NormalizeCaptureFormat(string format) => format switch
+    {
+        "JPEG" => "JPG",
+        "TIFF LZW" => "TIFF",
+        var f when AvailableCaptureFormats.Contains(f) => f,
+        _ => "TIFF"
+    };
 
     [RelayCommand]
     private async Task StartBatchAsync()
@@ -987,7 +1268,7 @@ public partial class MainWindowViewModel : ViewModelBase
             // over re-decoding the original, which is only reachable for jobs still
             // Pending/InProgress at resume time. Falls back to the original for jobs captured
             // before persisted thumbnails existed (no thumbnail file on disk yet).
-            var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, batch.BatchCode, job.PageNumber);
+            var thumbPath = ThumbnailFileFor(batch.BatchCode, job.PageNumber);
             var sourcePath = File.Exists(thumbPath) ? thumbPath
                 : File.Exists(job.OriginalFilePath) ? job.OriginalFilePath
                 : null;
@@ -1039,8 +1320,9 @@ public partial class MainWindowViewModel : ViewModelBase
         StatusText = $"Capturing page{(frameCount > 0 ? "s" : "")} ...";
         try
         {
-            Directory.CreateDirectory(_outputDirectory);
-            var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
+            var captureDirectory = CaptureDirectory;
+            Directory.CreateDirectory(captureDirectory);
+            var filePath = await _cameraService.CaptureAsync(captureDirectory, prefix);
 
             if (frameCount > 0)
             {
@@ -1078,6 +1360,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
             // A job is now queued under the current geometry — lock frame editing until it lands.
             _ = RefreshFrameEditPermissionAsync();
+
+            // Record the page in the manifest now that it's captured, not when processing
+            // finishes: another machine opening this batch must see the page already exists so it
+            // doesn't hand out the same page number again.
+            await PublishManifestAsync();
 
             // Require the page's content to actually change before auto-capture (or the
             // readiness indicator) can trigger again for this same physical page.
@@ -1121,7 +1408,9 @@ public partial class MainWindowViewModel : ViewModelBase
             for (var p = firstPageInSet; p <= PageCount; p++)
                 await _queueService.SupersedePageAsync(_currentBatchId, p);
 
-            var filePath = await _cameraService.CaptureAsync(_outputDirectory, prefix);
+            var recaptureDirectory = CaptureDirectory;
+            Directory.CreateDirectory(recaptureDirectory);
+            var filePath = await _cameraService.CaptureAsync(recaptureDirectory, prefix);
 
             // Clear out the old thumbnails for this frame set before adding the new ones —
             // same "remove then re-add" shape CaptureAsync uses for a fresh capture.
@@ -1458,7 +1747,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             // Also refresh the persisted on-disk thumbnail (see AddThumbnail),
                             // so a later resume from Recent shows this edit too instead of the
                             // stale pre-edit version.
-                            var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, _activeBatchCode, thumbnail.PageNumber);
+                            var thumbPath = ThumbnailFileFor(_activeBatchCode, thumbnail.PageNumber);
                             using var freshStream = new MemoryStream(bytes);
                             var freshThumb = Bitmap.DecodeToWidth(freshStream, 120);
                             freshThumb.Save(thumbPath);
@@ -1939,8 +2228,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     // a thumbnail for this page on a later resume, even after that deletion.
                     try
                     {
-                        var thumbPath = MicroCapture.Processing.ThumbnailPaths.FileFor(_outputDirectory, _activeBatchCode, pageNumber);
-                        Directory.CreateDirectory(MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, _activeBatchCode));
+                        var thumbPath = ThumbnailFileFor(_activeBatchCode, pageNumber);
+                        Directory.CreateDirectory(ThumbnailDirectoryFor(_activeBatchCode));
                         thumb.Save(thumbPath);
                     }
                     catch (Exception ex)
@@ -1966,6 +2255,9 @@ public partial class MainWindowViewModel : ViewModelBase
     public async Task DeleteCaptureAsync(ThumbnailItem item)
     {
         await _queueService.DeleteCaptureAsync(item.JobId);
+        // Keep the folder's own record in step, so the deletion is what another machine sees too
+        // rather than the page reappearing when the batch is opened elsewhere.
+        await PublishManifestAsync();
 
         // Deleting the most recently captured page is effectively "undo that shot" — the next
         // real capture should reuse its page number, not leave a permanent gap. Deleting an

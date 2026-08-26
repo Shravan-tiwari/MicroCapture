@@ -53,6 +53,18 @@
                           ToolTip.Tip="Embeds a near-invisible OCR text layer so the PDF's text is selectable/searchable. Runs OCR on any page that doesn't have it yet, which can take a while for a large batch."
                           Foreground="{StaticResource InkMutedBrush}"/>
 
+                <!-- OCR otherwise runs as part of the export, which on a large batch means a long
+                     wait at the one moment the operator is trying to finish. This is the old
+                     toolbar "Run OCR" action, kept here where OCR is actually decided: get it out
+                     of the way first, then export quickly. -->
+                <Button Content="Run OCR now" Classes="secondary" HorizontalAlignment="Stretch"
+                        IsVisible="{Binding IsPdfFormat}"
+                        Command="{Binding RunOcrNowCommand}"
+                        ToolTip.Tip="Run OCR on this batch's pages now, so the export itself doesn't have to wait for it"/>
+                <TextBlock Text="{Binding OcrStatusText}" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{StaticResource InkTertiaryBrush}"
+                           IsVisible="{Binding HasOcrStatus}"/>
+
                 <StackPanel Spacing="6" IsVisible="{Binding IsPdfFormat}">
                     <CheckBox IsChecked="{Binding WatermarkEnabled}" Content="Watermark"
                               ToolTip.Tip="Burns the selected watermark preset into every exported PDF page."

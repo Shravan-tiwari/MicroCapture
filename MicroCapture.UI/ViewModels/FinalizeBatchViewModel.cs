@@ -295,6 +295,40 @@ public partial class FinalizeBatchViewModel : ViewModelBase
 
     private bool CanExport() => !IsBusy && Pages.Count > 0;
 
+    [ObservableProperty] private string _ocrStatusText = string.Empty;
+    [ObservableProperty] private bool _hasOcrStatus;
+
+    /// <summary>Runs OCR ahead of the export rather than as part of it. Export already runs OCR
+    /// for any page lacking it, but on a large batch that lands the whole cost at the moment the
+    /// operator is trying to finish; doing it here first makes the export itself quick. This is
+    /// where the old toolbar "Run OCR" button went when the toolbar was cut back to the four
+    /// workflow buttons.</summary>
+    [RelayCommand(CanExecute = nameof(CanExport))]
+    private async Task RunOcrNowAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            OcrStatusText = "Running OCR…";
+            HasOcrStatus = true;
+            var summary = await new BatchOcrService(_dbContext).RunOcrForBatchAsync(_batch.Id);
+            OcrStatusText = summary.CliMissing
+                ? "OCR isn't available — Tesseract wasn't found on this machine."
+                : summary.Failed > 0
+                    ? $"OCR finished with {summary.Failed} page(s) failing — the export will still run."
+                    : "OCR complete — the export won't need to wait for it.";
+        }
+        catch (Exception ex)
+        {
+            OcrStatusText = $"OCR failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
     [RelayCommand(CanExecute = nameof(CanExport))]
     private async Task ExportAsync()
     {

@@ -34,61 +34,42 @@
         <Border Grid.Row="0" Background="{StaticResource Surface1Brush}" Padding="14,10"
                 BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
             <Grid ColumnDefinitions="*, Auto, Auto">
-                <!-- Left: Connection & batch -->
-                <WrapPanel Grid.Column="0" Orientation="Horizontal">
-                <WrapPanel.Styles>
-                    <Style Selector="WrapPanel > :is(Control)">
-                        <Setter Property="Margin" Value="0,0,8,4"/>
-                    </Style>
-                </WrapPanel.Styles>
+                <!-- Only the four buttons the workflow is built around live up here:
+                     Connect/Disconnect, New Batch, Open Batch, Finalize Batch. Everything that
+                     used to sit alongside them — project/batch codes, DPI, format, and the
+                     processing toggles — now belongs to the New Batch dialog, where it is chosen
+                     once for the whole batch instead of being adjustable mid-batch (which
+                     produced batches whose pages didn't match each other). Run OCR moved into
+                     Finalize, which already offers OCR as part of the export. -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
                     <Button Classes="toggle" Classes.active="{Binding IsConnected}"
                             Command="{Binding ConnectCommand}"
-                            Content="{Binding ConnectionStatus}"/>
-                    <TextBox Text="{Binding ProjectCode}" Watermark="Project Code" Width="120"
-                             Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
-                             BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
-                    <TextBox Text="{Binding BatchCode}" Watermark="Batch Code" Width="120"
-                             Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
-                             BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
-                    <Button Content="Recent" Classes="secondary" Command="{Binding OpenRecentBatchesCommand}"
-                            CommandParameter="{Binding $parent[Window]}"
-                            ToolTip.Tip="Reopen a previous batch — including ones already finalized — instead of retyping its Project/Batch Code"/>
-                    <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split Book Pages"
-                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book Curve Correction"
-                              ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight. Runs in the background queue, so it never affects capture speed."
-                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (B&amp;W)"
-                              ToolTip.Tip="Thresholds every processed page to pure black-and-white (Sauvola local threshold) and writes it as a true 1-bit CCITT G4 TIFF — much smaller files and crisper OCR input, but loses all color/grayscale content. Not reversible after export."
-                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough Suppression"
-                              ToolTip.Tip="Softens show-through from text/images printed on the reverse side of a thin page. Not effective on colored-image bleedthrough — grayscale/text show-through only."
-                              Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center"/>
-                    <ComboBox ItemsSource="{Binding AvailableDpiOptions}" SelectedItem="{Binding SelectedDpi}"
-                              Width="90" ToolTip.Tip="DPI stamped on each capture as it's taken — the output is resampled to actually measure this many pixels per inch against the rig's real, measured resolution. Changing this affects only captures taken from now on.">
-                        <ComboBox.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock Text="{Binding StringFormat='{}{0} DPI'}"/>
-                            </DataTemplate>
-                        </ComboBox.ItemTemplate>
-                    </ComboBox>
-                    <ComboBox ItemsSource="{Binding AvailableCaptureFormats}" SelectedItem="{Binding SelectedCaptureFormat}"
-                              Width="90" ToolTip.Tip="Output file format for each capture (TIFF, JPG, or PNG). Sticky per capture — carries over to the next shot and remembers your last choice across app restarts, not tied to the batch's other settings. Binarized (black-and-white) output is always written as TIFF regardless of this setting."/>
-                    <Button Classes="primary" Command="{Binding StartBatchCommand}" Content="Start Batch"
-                            Margin="6,0,0,0"/>
+                            Content="{Binding ConnectionStatus}"
+                            ToolTip.Tip="Connect or disconnect the camera"/>
+                    <Button Classes="primary" Command="{Binding NewBatchCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Content="New Batch"
+                            ToolTip.Tip="Create a batch — choose where it's saved, its DPI, format, and processing options"/>
+                    <Button Classes="secondary" Command="{Binding OpenBatchCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Content="Open Batch"
+                            ToolTip.Tip="Continue an existing batch, including one started on another workstation"/>
+                    <Button Classes="primary" Command="{Binding OpenFinalizeBatchCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Content="Finalize Batch"
+                            ToolTip.Tip="Review, reorder, and export this batch's pages — choose format, OCR, filename and destination"/>
                     <Button Classes="secondary" Command="{Binding CalibrateLensCommand}"
                             Content="Calibrate Lens"
                             ToolTip.Tip="One-time camera lens distortion calibration against a printed ChArUco board — corrects barrel/pincushion distortion before any other geometric correction runs"
                             IsVisible="{Binding IsConnected}"/>
-                    <Button Classes="secondary" Command="{Binding RunOcrCommand}" Content="Run OCR"
-                            ToolTip.Tip="Run OCR now on this batch's finished pages, so searchable text is ready ahead of a PDF export"/>
-                    <Button Classes="primary" Command="{Binding OpenFinalizeBatchCommand}"
-                            CommandParameter="{Binding $parent[Window]}" Content="Finalize"
-                            ToolTip.Tip="Review, reorder, and export this batch's pages — choose format, filename, destination, and whether to embed searchable text"/>
-                </WrapPanel>
+                </StackPanel>
 
-                <!-- Center: Page Count -->
-                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8" VerticalAlignment="Center" Margin="16,0">
+                <!-- Current batch and page count. Read-only: these describe the open batch rather
+                     than offering anything to change, since batch settings are fixed at creation. -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="10" VerticalAlignment="Center" Margin="16,0">
+                    <StackPanel VerticalAlignment="Center" IsVisible="{Binding HasOpenBatch}">
+                        <TextBlock Text="{Binding OpenBatchLabel}" FontSize="13" FontWeight="SemiBold"
+                                   Foreground="{StaticResource InkBrush}"/>
+                        <TextBlock Text="{Binding OpenBatchSettingsLabel}" FontSize="11"
+                                   Foreground="{StaticResource InkTertiaryBrush}"/>
+                    </StackPanel>
                     <TextBlock Text="PAGE" Classes="sectionLabel" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding PageCount}" Foreground="{StaticResource PrimaryHoverBrush}"
                                VerticalAlignment="Center" FontSize="28" FontWeight="SemiBold"/>
