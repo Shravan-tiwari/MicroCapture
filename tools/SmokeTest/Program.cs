@@ -63,6 +63,7 @@ TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 TestBatchLockIsAdvisory();
+await TestBatchAdoptedOnAnotherMachine();
 TestBrightnessPassExcludesHandOverlap();
 TestUniformBrightnessImageStaysUndetected();
 TestBorderTouchingPageIsNotOverPadded();
@@ -1034,6 +1035,98 @@ void TestBatchLockIsAdvisory()
     locks.Acquire(batchFolder);
     locks.Release(batchFolder);
     Check("Releasing clears this machine's own lock", !File.Exists(BatchFolder.LockPath(batchFolder)));
+}
+
+async Task TestBatchAdoptedOnAnotherMachine()
+{
+    Console.WriteLine("\n-- A batch created on one machine opens fully on another --");
+    var workDir = TempWorkDir();
+    var batchFolder = Path.Combine(workDir, "shared", "CAIRNS-001");
+    var manifests = new BatchManifestService();
+
+    // ---- Machine A: create a batch, capture two pages, publish to the folder ----
+    var dbPathA = Path.Combine(workDir, "machine-a.db");
+    using (var dbA = new AppDbContext(dbPathA))
+    {
+        dbA.Database.EnsureCreated();
+        var project = new Project { Name = "QLD", OutputDirectory = Path.Combine(workDir, "pics") };
+        dbA.Projects.Add(project);
+        var batch = new Batch
+        {
+            ProjectId = project.Id, BatchCode = "CAIRNS-001", Name = "CAIRNS-001",
+            FolderPath = batchFolder, Dpi = 300, DewarpEnabled = true, PreferredExportFormat = "PDF"
+        };
+        dbA.Batches.Add(batch);
+        dbA.CaptureJobs.Add(new CaptureJob
+        {
+            Id = "job-a1", BatchId = batch.Id, PageNumber = 1, ProcessingStatus = "Completed",
+            OriginalFilePath = Path.Combine(BatchFolder.TempPath(batchFolder), "P0001.jpg"),
+            ProcessedFilePath = Path.Combine(BatchFolder.OutputPath(batchFolder), "P0001.tif"),
+            HasManualAdjustments = true, Brightness = 0.3, RotationDegrees = 90
+        });
+        // A page still processing must reach the other machine too, or it would reuse page 2.
+        dbA.CaptureJobs.Add(new CaptureJob
+        {
+            Id = "job-a2", BatchId = batch.Id, PageNumber = 2, ProcessingStatus = "Pending",
+            OriginalFilePath = Path.Combine(BatchFolder.TempPath(batchFolder), "P0002.jpg")
+        });
+        await dbA.SaveChangesAsync();
+
+        await new BatchSyncService(dbA, manifests).PublishAsync(batch);
+    }
+
+    Check("Publishing writes a manifest into the batch folder", File.Exists(BatchFolder.ManifestPath(batchFolder)));
+    var published = manifests.Load(batchFolder)!;
+    Check("The manifest records both pages, including the one still processing", published.PageCount == 2);
+    Check("The in-flight page keeps its status", published.Pages.Single(p => p.PageNumber == 2).ProcessingStatus == "Pending");
+    Check("Page file paths are stored relative, not absolute",
+        published.Pages[0].ProcessedFiles[0] == "output/P0001.tif");
+
+    // ---- The batch travels: a different path, as a USB stick or share would appear ----
+    var movedFolder = Path.Combine(workDir, "elsewhere", "CAIRNS-001");
+    Directory.CreateDirectory(Path.GetDirectoryName(movedFolder)!);
+    Directory.Move(batchFolder, movedFolder);
+
+    // ---- Machine B: a completely separate database that has never seen this batch ----
+    var dbPathB = Path.Combine(workDir, "machine-b.db");
+    using (var dbB = new AppDbContext(dbPathB))
+    {
+        dbB.Database.EnsureCreated();
+        Check("Machine B's database starts with no knowledge of the batch", !dbB.Batches.Any());
+
+        var validation = manifests.Validate(movedFolder);
+        Check("Machine B can validate the batch folder", validation.IsValid);
+
+        var sync = new BatchSyncService(dbB, manifests);
+        var adopted = await sync.AdoptAsync(movedFolder, validation.Manifest!);
+
+        Check("Machine B keeps the batch's original identity", adopted.Id == published.BatchId);
+        Check("Machine B restores the batch code", adopted.BatchCode == "CAIRNS-001");
+        Check("Machine B restores DPI", adopted.Dpi == 300);
+        Check("Machine B restores book curve correction", adopted.DewarpEnabled);
+
+        var jobs = dbB.CaptureJobs.Where(j => j.BatchId == adopted.Id).OrderBy(j => j.PageNumber).ToList();
+        Check("Machine B sees both captured pages", jobs.Count == 2);
+        Check("Machine B keeps the original job identities", jobs[0].Id == "job-a1");
+        Check("Machine B restores per-page adjustments so pages stay re-editable",
+            Math.Abs(jobs[0].Brightness - 0.3) < 0.001 && jobs[0].RotationDegrees == 90);
+        Check("Machine B resolves page files against the batch's new location",
+            jobs[0].ProcessedFilePath!.StartsWith(Path.GetFullPath(movedFolder)));
+        Check("Machine B does not point at the old location",
+            !jobs[0].ProcessedFilePath!.Contains("shared"));
+
+        // Continuing the batch must not reuse a page number already claimed elsewhere.
+        Check("The next page number continues from the manifest", manifests.NextPageNumber(movedFolder) == 3);
+
+        // A page deleted on another machine should drop out here rather than reappearing.
+        var trimmed = manifests.Load(movedFolder)!;
+        trimmed.Pages.RemoveAll(p => p.PageNumber == 2);
+        manifests.Save(movedFolder, trimmed);
+        await sync.AdoptAsync(movedFolder, manifests.Load(movedFolder)!);
+        var page2 = dbB.CaptureJobs.AsNoTracking().First(j => j.Id == "job-a2");
+        Check("A page removed elsewhere is retired locally rather than resurrected",
+            page2.ProcessingStatus == "Superseded");
+    }
 }
 
 void TestLowContrastDetection()
