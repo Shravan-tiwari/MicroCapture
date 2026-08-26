@@ -5,6 +5,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
@@ -58,6 +59,10 @@ await TestTwoQuadCropReviewSaveReloadReSaveThenExport();
 TestLowContrastDetection();
 TestShadowedPageDetection();
 TestLiveViewDetectionIsRobust();
+TestBatchManifestRoundTripsAndValidates();
+TestBatchManifestSurvivesRelocation();
+TestBatchManifestSurvivesInterruptedWrite();
+TestBatchLockIsAdvisory();
 TestBrightnessPassExcludesHandOverlap();
 TestUniformBrightnessImageStaysUndetected();
 TestBorderTouchingPageIsNotOverPadded();
@@ -855,6 +860,180 @@ void TestLiveViewDetectionIsRobust()
         Path.Combine(workDir, "live_empty.png"), imageWidth, imageHeight,
         new SKRectI(0, 0, 1, 1), backgroundGray: 40, pageGray: 40));
     Check("An empty frame is not falsely detected as a page", !ImageProcessor.CheckLiveFrame(empty).Detected);
+}
+
+BatchManifest SampleManifest(string batchFolder) => new()
+{
+    BatchId = "batch-abc",
+    BatchCode = "CAIRNS-001",
+    ProjectCode = "QLD",
+    ProjectId = "proj-1",
+    Settings = new BatchManifestSettings { Dpi = 300, CaptureFormat = "TIFF", DewarpEnabled = true },
+    Pages =
+    {
+        new BatchManifestPage
+        {
+            PageNumber = 1, JobId = "job-1", ProcessingStatus = "Completed",
+            OriginalFile = "temp/P0001.jpg",
+            ProcessedFiles = { "output/P0001.tif" },
+            ThumbnailFile = "thumbnails/000001.png",
+            Adjustments = new BatchManifestAdjustments { Brightness = 0.25, RotationDegrees = 90 }
+        },
+        new BatchManifestPage { PageNumber = 2, JobId = "job-2", ProcessingStatus = "Pending" }
+    }
+};
+
+void TestBatchManifestRoundTripsAndValidates()
+{
+    Console.WriteLine("\n-- Batch manifest round-trips, and validation names what's missing --");
+    var service = new BatchManifestService();
+    var batchFolder = Path.Combine(TempWorkDir(), "CAIRNS-001");
+
+    // A folder that isn't a batch at all must say so, rather than failing obscurely later.
+    Directory.CreateDirectory(batchFolder);
+    var notABatch = service.Validate(batchFolder);
+    Check("A folder with no manifest is rejected as not-a-batch", !notABatch.IsValid);
+    Check("The not-a-batch error names the manifest file", notABatch.Error?.Contains(BatchFolder.ManifestFileName) == true);
+
+    service.Save(batchFolder, SampleManifest(batchFolder));
+    Check("Saving creates the manifest", File.Exists(BatchFolder.ManifestPath(batchFolder)));
+    foreach (var required in BatchFolder.RequiredFolders)
+        Check($"Saving creates the {required} folder", Directory.Exists(Path.Combine(batchFolder, required)));
+
+    var validation = service.Validate(batchFolder);
+    Check("A complete batch folder validates", validation.IsValid);
+    var loaded = validation.Manifest!;
+    Check("Batch code round-trips", loaded.BatchCode == "CAIRNS-001");
+    Check("DPI round-trips", loaded.Settings.Dpi == 300);
+    Check("Book curve correction round-trips", loaded.Settings.DewarpEnabled);
+    Check("Page count round-trips", loaded.PageCount == 2);
+    Check("Per-page adjustments round-trip", loaded.Pages[0].Adjustments?.Brightness == 0.25);
+    Check("Pending pages are recorded, not just completed ones", loaded.Pages[1].ProcessingStatus == "Pending");
+
+    // Page numbers come from the shared manifest so a second machine doesn't reuse one.
+    Check("Next page number follows the highest already claimed", service.NextPageNumber(batchFolder) == 3);
+
+    // A missing image is reported but must not make the batch unopenable.
+    var missing = service.FindMissingPageFiles(batchFolder, loaded);
+    Check("Files listed in the manifest but absent on disk are reported", missing.Count > 0);
+    Check("Missing page files do not invalidate the batch", service.Validate(batchFolder).IsValid);
+
+    // Derived subfolders are recreated rather than blocking the open — they hold nothing that
+    // can't be regenerated, and refusing would strand the images.
+    Directory.Delete(BatchFolder.TempPath(batchFolder), recursive: true);
+    Check("A missing derived folder is repaired, not fatal", service.Validate(batchFolder).IsValid);
+    Check("The repaired folder is actually recreated", Directory.Exists(BatchFolder.TempPath(batchFolder)));
+
+    // A manifest from a future build must be refused rather than silently misread.
+    var future = SampleManifest(batchFolder);
+    future.SchemaVersion = BatchManifest.CurrentSchemaVersion + 1;
+    service.Save(batchFolder, future);
+    var futureValidation = service.Validate(batchFolder);
+    Check("A newer-format manifest is refused with a clear message", !futureValidation.IsValid);
+    Check("The newer-format error tells the operator to update", futureValidation.Error?.Contains("newer version") == true);
+}
+
+void TestBatchManifestSurvivesRelocation()
+{
+    Console.WriteLine("\n-- A batch folder still opens after being moved to a different path --");
+    var service = new BatchManifestService();
+    var original = Path.Combine(TempWorkDir(), "batch-here");
+    service.Save(original, SampleManifest(original));
+
+    // Stand in for the real cases: a USB stick mounting under a different drive letter, a mapped
+    // drive, a UNC share. All of them change the absolute path, which is why manifest paths are
+    // stored relative to the batch folder.
+    var moved = Path.Combine(TempWorkDir(), "somewhere", "else", "batch-there");
+    Directory.CreateDirectory(Path.GetDirectoryName(moved)!);
+    Directory.Move(original, moved);
+
+    var validation = service.Validate(moved);
+    Check("The moved batch still validates", validation.IsValid);
+    Check("The moved batch keeps its identity", validation.Manifest?.BatchId == "batch-abc");
+    Check("The moved batch keeps its settings", validation.Manifest?.Settings.Dpi == 300);
+
+    // The real test of relative paths: page files must resolve against the NEW location.
+    var page = validation.Manifest!.Pages[0];
+    var resolved = BatchFolder.ToAbsolute(moved, page.ProcessedFiles[0])!;
+    Check("Page paths resolve against the new location", resolved.StartsWith(Path.GetFullPath(moved)));
+    Check("Page paths do not still point at the old location", !resolved.Contains("batch-here"));
+
+    // And the reverse direction must refuse to record anything outside the batch folder, since
+    // such a path could not survive the next move.
+    Check("A path outside the batch folder is refused rather than recorded absolute",
+        BatchFolder.ToRelative(moved, Path.Combine(TempWorkDir(), "outside.tif")) == null);
+    Check("A path inside the batch folder is stored relative with forward slashes",
+        BatchFolder.ToRelative(moved, Path.Combine(BatchFolder.OutputPath(moved), "P0001.tif")) == "output/P0001.tif");
+}
+
+void TestBatchManifestSurvivesInterruptedWrite()
+{
+    Console.WriteLine("\n-- A manifest damaged mid-write falls back to the backup --");
+    var service = new BatchManifestService();
+    var batchFolder = Path.Combine(TempWorkDir(), "interrupted");
+    service.Save(batchFolder, SampleManifest(batchFolder));
+
+    // Second save leaves the first as the backup.
+    var updated = SampleManifest(batchFolder);
+    updated.Settings.Dpi = 600;
+    service.Save(batchFolder, updated);
+    Check("A backup manifest is kept alongside the current one", File.Exists(BatchFolder.ManifestBackupPath(batchFolder)));
+
+    // Truncated the way a pulled USB stick or a power cut would leave it.
+    File.WriteAllText(BatchFolder.ManifestPath(batchFolder), "{ \"SchemaVersion\": 1, \"Bat");
+    var validation = service.Validate(batchFolder);
+    Check("A truncated manifest still opens via the backup", validation.IsValid);
+    Check("The recovered manifest is the previous good copy", validation.Manifest?.BatchId == "batch-abc");
+
+    // With no backup either, it must fail clearly rather than opening an empty batch.
+    File.Delete(BatchFolder.ManifestBackupPath(batchFolder));
+    var unrecoverable = service.Validate(batchFolder);
+    Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
+    Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+void TestBatchLockIsAdvisory()
+{
+    Console.WriteLine("\n-- Batch locking warns about another machine without blocking --");
+    var locks = new BatchLockService();
+    var batchFolder = Path.Combine(TempWorkDir(), "locked");
+    new BatchManifestService().Save(batchFolder, SampleManifest(batchFolder));
+
+    Check("An unlocked batch reports no holder", !locks.IsHeldByAnother(batchFolder, out _));
+
+    locks.Acquire(batchFolder);
+    Check("Acquiring writes a lock file", File.Exists(BatchFolder.LockPath(batchFolder)));
+    // Reopening a batch this machine already had open must never prompt.
+    Check("This machine's own lock is not treated as a conflict", !locks.IsHeldByAnother(batchFolder, out _));
+
+    // Stand in for another workstation holding the batch right now.
+    File.WriteAllText(BatchFolder.LockPath(batchFolder), JsonSerializer.Serialize(new BatchLockInfo
+    {
+        Machine = "OTHER-PC", User = "someone", HeartbeatUtc = DateTime.UtcNow
+    }));
+    Check("Another machine's live lock is reported", locks.IsHeldByAnother(batchFolder, out var holder));
+    Check("The conflict names who has it", holder != null && BatchLockService.DescribeHolder(holder).Contains("OTHER-PC"));
+
+    // A USB stick unplugged mid-batch leaves its lock behind forever — that must read as routine,
+    // not as a permanent conflict, or the batch becomes unopenable.
+    File.WriteAllText(BatchFolder.LockPath(batchFolder), JsonSerializer.Serialize(new BatchLockInfo
+    {
+        Machine = "OTHER-PC", User = "someone",
+        HeartbeatUtc = DateTime.UtcNow - BatchLockService.StaleAfter - TimeSpan.FromMinutes(1)
+    }));
+    Check("An abandoned lock is not treated as a conflict", !locks.IsHeldByAnother(batchFolder, out _));
+
+    // Releasing must not clear a lock that belongs to someone else.
+    File.WriteAllText(BatchFolder.LockPath(batchFolder), JsonSerializer.Serialize(new BatchLockInfo
+    {
+        Machine = "OTHER-PC", User = "someone", HeartbeatUtc = DateTime.UtcNow
+    }));
+    locks.Release(batchFolder);
+    Check("Releasing leaves another machine's lock alone", File.Exists(BatchFolder.LockPath(batchFolder)));
+
+    locks.Acquire(batchFolder);
+    locks.Release(batchFolder);
+    Check("Releasing clears this machine's own lock", !File.Exists(BatchFolder.LockPath(batchFolder)));
 }
 
 void TestLowContrastDetection()
