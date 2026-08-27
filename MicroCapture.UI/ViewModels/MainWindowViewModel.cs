@@ -720,7 +720,8 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Frames set — hold still…";
-            LogAutoCaptureGate("settling", $"frame mode: content still moving, diff {settleDiff:F1} vs threshold {ContentChangeThreshold}, stable {_stableFrameCount}/{StableFramesRequired}");
+            LogAutoCaptureGate("settling",
+                $"frame mode: {DescribeSettling(settled, settleDiff)}, stable {_stableFrameCount}/{StableFramesRequired}");
             return;
         }
 
@@ -796,7 +797,8 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Boundary detected — hold still…";
-            LogAutoCaptureGate("settling", $"auto-detect: page still moving, stable {_stableFrameCount}/{StableFramesRequired}");
+            LogAutoCaptureGate("settling",
+                $"auto-detect: {(wasStable ? "holding still, counting up" : "page still moving")}, stable {_stableFrameCount}/{StableFramesRequired}");
             return;
         }
 
@@ -816,7 +818,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         DocumentStatus = "✓ Capturing…";
-        LogAutoCaptureGate("firing", $"auto-detect: sharpness {check.Sharpness:F1}, content diff {contentDiff:F1}");
+        LogAutoCaptureGate("firing", $"auto-detect: sharpness {check.Sharpness:F1}, {DescribeDifference(contentDiff)}");
         _lastCapturedSignature = check.ContentSignature;
         _stableFrameCount = 0;
         _ = CaptureAsync();
@@ -875,6 +877,27 @@ public partial class MainWindowViewModel : ViewModelBase
         for (var i = 0; i < current.Length; i++) blended[i] = previous[i] + (current[i] - previous[i]) * t;
         return blended;
     }
+
+    /// <summary>Describes why a check hasn't settled yet, in terms that match the number printed
+    /// beside it. Distinguishes "the page is genuinely still moving" from "the page is holding
+    /// still and we're counting up to the required dwell", which read identically before — and
+    /// avoids reporting the no-reference-yet sentinel, which is double.MaxValue and prints as
+    /// three hundred digits of noise.</summary>
+    private static string DescribeSettling(bool settled, double difference)
+    {
+        if (settled) return "holding still, counting up";
+        if (IsNoReference(difference)) return "first frame — establishing a reference to compare against";
+        return $"content still moving, diff {difference:F1} vs threshold {ContentChangeThreshold}";
+    }
+
+    /// <summary><see cref="ContentDifference"/> and <see cref="SignatureDifference"/> return
+    /// double.MaxValue to mean "nothing to compare against yet", which is right for the
+    /// comparison but prints as three hundred digits of noise in a log.</summary>
+    private static bool IsNoReference(double difference) =>
+        double.IsPositiveInfinity(difference) || difference >= double.MaxValue;
+
+    private static string DescribeDifference(double difference) =>
+        IsNoReference(difference) ? "no previous capture to compare against" : $"diff {difference:F1}";
 
     /// <summary>Records which gate is currently holding auto-capture back, with the numbers behind
     /// it. Auto-capture failing in the field reads as "it just didn't fire" — the on-screen status
