@@ -71,6 +71,7 @@ await TestFinalizeKeepsUnprocessedOriginals();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
+await TestExportReportsProgressAndCanBeCancelled();
 TestMultipageTiffHasEveryPage();
 TestBatchLockIsAdvisory();
 await TestBatchAdoptedOnAnotherMachine();
@@ -1001,6 +1002,107 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+async Task TestExportReportsProgressAndCanBeCancelled()
+{
+    Console.WriteLine("\n-- Export reports progress and can be stopped --");
+    var root = TempWorkDir();
+    var dbPath = Path.Combine(root, "prog.db");
+
+    string batchId;
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "PROG", OutputDirectory = root };
+        db.Projects.Add(project);
+        var batch = new Batch { ProjectId = project.Id, BatchCode = "PROG-1", Name = "PROG-1", Dpi = 300 };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+        // Original and processed are deliberately DIFFERENT files, as they are in a real batch
+        // (originals in temp/, derivatives in output/). Pointing both at one file makes the first
+        // export delete the page it just wrote, which silently empties any later export.
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        Directory.CreateDirectory(Path.Combine(root, "proc"));
+        for (var page = 1; page <= 6; page++)
+        {
+            var processed = Path.Combine(root, "proc", $"p{page}.tif");
+            var original = Path.Combine(root, "src", $"p{page}.jpg");
+            using (var mat = new OpenCvSharp.Mat(400, 300, OpenCvSharp.MatType.CV_8UC3,
+                       new OpenCvSharp.Scalar(30 * page, 100, 180)))
+            {
+                OpenCvSharp.Cv2.ImWrite(processed, mat);
+                OpenCvSharp.Cv2.ImWrite(original, mat);
+            }
+            db.CaptureJobs.Add(new CaptureJob
+            {
+                BatchId = batch.Id, PageNumber = page, ProcessingStatus = "Completed",
+                OriginalFilePath = original, ProcessedFilePath = processed, Dpi = 300
+            });
+        }
+        db.SaveChanges();
+    }
+
+    // Progress must actually be reported, and name the phase in the operator's terms — a bare
+    // percentage with no phase is what made a long export indistinguishable from a hang.
+    var reports = new List<ExportProgress>();
+    using (var db = new AppDbContext(dbPath))
+    {
+        var progress = new InlineProgress<ExportProgress>(p => { lock (reports) reports.Add(p); });
+        await RunPumped(() => new BatchExportService(db).ExportBatchAsync(
+            batchId, Path.Combine(root, "out1"), "PDF", progress: progress), timeoutMs: 60000);
+    }
+
+    Check("Export reports progress at all", reports.Count > 0);
+    Check("Progress names what it is doing", reports.All(r => !string.IsNullOrWhiteSpace(r.Phase)));
+    Check("Progress counts toward a known total", reports.Any(r => r.Total > 0 && r.Current > 0));
+    Check("Progress advances rather than repeating one value",
+        reports.Select(r => r.Current).Distinct().Count() > 1);
+    Check("Progress reaches the last page", reports.Any(r => r.Current == r.Total && r.Total > 0));
+
+    // Cancelling must leave the batch untouched — no half-written output moved into place, and
+    // no originals consumed.
+    using (var db = new AppDbContext(dbPath))
+    {
+        foreach (var job in db.CaptureJobs.Where(j => j.BatchId == batchId)) job.ExportStatus = "Pending";
+        db.Batches.First(b => b.Id == batchId).Status = "Active";
+        db.SaveChanges();
+    }
+
+    var cancelDir = Path.Combine(root, "out2");
+    Directory.CreateDirectory(cancelDir);
+    // The first export consumed the originals; put them back so this run starts from a real batch.
+    for (var page = 1; page <= 6; page++)
+    {
+        var original = Path.Combine(root, "src", $"p{page}.jpg");
+        if (File.Exists(original)) continue;
+        using var mat = new OpenCvSharp.Mat(400, 300, OpenCvSharp.MatType.CV_8UC3,
+            new OpenCvSharp.Scalar(30 * page, 100, 180));
+        OpenCvSharp.Cv2.ImWrite(original, mat);
+    }
+    using (var db = new AppDbContext(dbPath))
+    using (var cts = new CancellationTokenSource())
+    {
+        // Cancel as soon as the first page is reported, mid-export.
+        var progress = new InlineProgress<ExportProgress>(_ => cts.Cancel());
+        var cancelled = false;
+        try
+        {
+            await RunPumped(() => new BatchExportService(db).ExportBatchAsync(
+                batchId, cancelDir, "PDF", progress: progress, token: cts.Token), timeoutMs: 60000);
+        }
+        catch (OperationCanceledException) { cancelled = true; }
+
+        Check("A cancelled export throws OperationCanceledException", cancelled);
+        Check("A cancelled export leaves no finished file behind",
+            !Directory.GetFiles(cancelDir, "*.pdf").Any());
+        Check("A cancelled export does not consume the originals",
+            File.Exists(Path.Combine(root, "src", "p1.jpg")));
+    }
+
+    using (var verify = new AppDbContext(dbPath))
+        Check("A cancelled export leaves the batch un-exported",
+            verify.Batches.AsNoTracking().First(b => b.Id == batchId).Status != "Exported");
 }
 
 async Task TestWatermarkAndQualityAcrossFormats()
@@ -3540,4 +3642,18 @@ void TestAdjustmentPresetsWithinRange()
     var satMean = Cv2.Mean(channels[1]).Val0;
     foreach (var c in channels) c.Dispose();
     Check($"Applying the Grayscale preset produces a near-zero saturation image (mean S {satMean:F0})", satMean < 15);
+}
+
+
+/// <summary>An <see cref="IProgress{T}"/> that invokes its callback on the reporting thread.
+///
+/// <para><see cref="Progress{T}"/> posts to the synchronization context captured when it was
+/// constructed, so under this suite's headless dispatcher its callbacks sit queued until the loop
+/// is pumped — which made a correctly-instrumented export look like it reported nothing at all.
+/// Tests want the report as it happens.</para></summary>
+public sealed class InlineProgress<T> : IProgress<T>
+{
+    private readonly Action<T> _handler;
+    public InlineProgress(Action<T> handler) => _handler = handler;
+    public void Report(T value) => _handler(value);
 }

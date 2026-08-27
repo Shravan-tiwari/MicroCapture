@@ -97,13 +97,39 @@
                 </StackPanel>
             </StackPanel>
 
-            <TextBlock Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding StatusText}"
-                       TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,14,0,0"/>
+            <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,14,0,0" Spacing="6">
+                <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="13"
+                           Foreground="{StaticResource InkMutedBrush}"/>
+
+                <!-- Shown only while an export is running. A large batch is minutes of solid work;
+                     without this the dialog looked frozen and there was no way to tell a healthy
+                     export from a hung one, or to stop one started by mistake. -->
+                <StackPanel Spacing="6" IsVisible="{Binding IsExporting}">
+                    <ProgressBar Minimum="0" Maximum="1" Value="{Binding ProgressFraction}"
+                                 IsIndeterminate="{Binding ProgressIsIndeterminate}"
+                                 Height="6" CornerRadius="3"/>
+                    <Grid ColumnDefinitions="*, Auto">
+                        <TextBlock Grid.Column="0" Text="{Binding ProgressText}" FontSize="12"
+                                   Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis"/>
+                        <TextBlock Grid.Column="1" Text="{Binding ElapsedText}" FontSize="12"
+                                   Foreground="{StaticResource InkTertiaryBrush}"/>
+                    </Grid>
+                    <TextBlock FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" TextWrapping="Wrap"
+                               Text="You can keep this window open — the batch isn't changed until the export finishes."/>
+                </StackPanel>
+            </StackPanel>
 
             <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal"
                         HorizontalAlignment="Right" Margin="0,14,0,0" Spacing="10">
-                <Button Content="Cancel" Classes="secondary" Command="{Binding CancelCommand}"/>
-                <Button Content="Export" Classes="primary" Command="{Binding ExportCommand}"/>
+                <!-- Stops the running export; the plain Cancel closes the dialog. Only one of the
+                     two is ever offered, so the button that is showing always does what it says. -->
+                <Button Content="Stop Export" Classes="secondary" Command="{Binding CancelExportCommand}"
+                        IsVisible="{Binding IsExporting}"
+                        ToolTip.Tip="Stops after the current page. Nothing is written and the batch is left unchanged."/>
+                <Button Content="Cancel" Classes="secondary" Command="{Binding CancelCommand}"
+                        IsVisible="{Binding !IsExporting}"/>
+                <Button Content="Export" Classes="primary" Command="{Binding ExportCommand}"
+                        IsVisible="{Binding !IsExporting}"/>
             </StackPanel>
         </Grid>
     </Border>

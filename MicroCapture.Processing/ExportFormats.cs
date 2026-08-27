@@ -4,6 +4,27 @@ using System.Linq;
 
 namespace MicroCapture.Processing;
 
+/// <summary>A step of an export, reported so the operator can see what the app is doing.
+///
+/// <para>An export of a few hundred full-resolution pages takes minutes of solid CPU work.
+/// Without this the window simply stopped responding, which is indistinguishable from a crash —
+/// operators reasonably concluded the app had hung and killed it mid-write.</para></summary>
+/// <param name="Phase">What is happening now, in the operator's terms ("Running OCR",
+/// "Writing PDF"), not the method's.</param>
+/// <param name="Current">Items finished so far, or 0 when the total isn't known yet.</param>
+/// <param name="Total">Items in this phase, or 0 for work that can't be counted.</param>
+public sealed record ExportProgress(string Phase, int Current, int Total)
+{
+    /// <summary>Work whose length can't be known in advance, so the UI shows motion rather than
+    /// a misleading percentage.</summary>
+    public bool IsIndeterminate => Total <= 0;
+
+    public double Fraction => Total <= 0 ? 0 : Math.Clamp((double)Current / Total, 0, 1);
+
+    public override string ToString() =>
+        Total <= 0 ? Phase : $"{Phase} — {Current} of {Total}";
+}
+
 /// <summary>How a chosen export format is actually produced.</summary>
 public enum ExportKind
 {

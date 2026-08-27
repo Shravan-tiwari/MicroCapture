@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using MicroCapture.Core.Data;
@@ -35,8 +36,14 @@ public class BatchExportService
     /// <param name="customOutputDirectory">Overrides <paramref name="outputDirectory"/> when
     /// provided — lets the Finalize dialog's destination picker route the export somewhere other
     /// than the batch's default project folder.</param>
+    /// <param name="progress">Reports each page as it is written, so a long export can show what
+    /// it is doing instead of appearing to hang.</param>
+    /// <param name="token">Cancels between pages. A cancelled export leaves the batch untouched:
+    /// the output is written to a .partial file that is only moved into place on success, and
+    /// nothing is deleted until after that.</param>
     public async Task<string> ExportBatchAsync(string batchId, string outputDirectory, string format,
-        IReadOnlyList<string>? orderedJobIds = null, string? customFileName = null, string? customOutputDirectory = null)
+        IReadOnlyList<string>? orderedJobIds = null, string? customFileName = null, string? customOutputDirectory = null,
+        IProgress<ExportProgress>? progress = null, CancellationToken token = default)
     {
         var exportFormat = ExportFormat.Resolve(format)
             ?? throw new ArgumentException($"Unsupported export format: {format}", nameof(format));
@@ -84,12 +91,12 @@ public class BatchExportService
 
         if (exportFormat.Kind == ExportKind.TextOnly)
         {
-            return await ExportOcrTextAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName);
+            return await ExportOcrTextAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName, progress, token);
         }
 
         if (exportFormat.Kind == ExportKind.MultipageTiff)
         {
-            return await ExportMultipageTiffAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName);
+            return await ExportMultipageTiffAsync(batch, jobsToExport, outputDirectory, batchPrefix, customFileName, progress, token);
         }
 
         if (exportFormat.Kind == ExportKind.Pdf)
@@ -124,11 +131,14 @@ public class BatchExportService
             using (var stream = new SKFileWStream(temporaryPath))
             using (var document = SKDocument.CreatePdf(stream, pdfMetadata))
             {
+                var pdfPageIndex = 0;
                 foreach (var job in jobsToExport)
                 {
+                    token.ThrowIfCancellationRequested();
                     var files = GetProcessedFilesForJob(job);
                     foreach (var f in files)
                     {
+                        progress?.Report(new ExportProgress("Writing PDF", ++pdfPageIndex, jobsToExport.Count));
                         using var bitmap = DecodeImage(f);
                         if (bitmap == null) continue;
                         using var canvas = document.BeginPage(bitmap.Width, bitmap.Height);
@@ -169,9 +179,11 @@ public class BatchExportService
             int pageIndex = 1;
             foreach (var job in jobsToExport)
             {
+                token.ThrowIfCancellationRequested();
                 var files = GetProcessedFilesForJob(job);
                 foreach (var f in files)
                 {
+                    progress?.Report(new ExportProgress($"Writing {exportFormat.Name}", pageIndex, jobsToExport.Count));
                     string targetExt = exportFormat.Extension;
                     string targetName = $"{batchPrefix}_Page_{pageIndex:D6}{targetExt}";
                     string targetPath = Path.Combine(exportDir, targetName);
@@ -332,7 +344,8 @@ public class BatchExportService
     /// <para>Binarized pages keep 1-bit CCITT Group 4 encoding rather than being re-inflated to
     /// 8-bit grey, preserving the size win that was the point of binarizing.</para></summary>
     private async Task<string> ExportMultipageTiffAsync(Batch batch, List<CaptureJob> jobsToExport,
-        string outputDirectory, string batchPrefix, string? customFileName)
+        string outputDirectory, string batchPrefix, string? customFileName,
+        IProgress<ExportProgress>? progress = null, CancellationToken token = default)
     {
         var fileName = string.IsNullOrWhiteSpace(customFileName)
             ? $"{batchPrefix}_{DateTime.Now:yyyyMMdd_HHmmss}.tif"
@@ -353,6 +366,8 @@ public class BatchExportService
 
             for (var i = 0; i < pages.Count; i++)
             {
+                token.ThrowIfCancellationRequested();
+                progress?.Report(new ExportProgress("Writing multi-page TIFF", i + 1, pages.Count));
                 var (job, file) = pages[i];
                 AppendTiffPage(output, file, job.Dpi, i, pages.Count, batch);
             }
@@ -476,7 +491,8 @@ public class BatchExportService
     /// image output has been produced, so treating a text dump as "the batch has been exported"
     /// and discarding the captures would destroy the actual work.</para></summary>
     private async Task<string> ExportOcrTextAsync(Batch batch, List<CaptureJob> jobsToExport,
-        string outputDirectory, string batchPrefix, string? customFileName)
+        string outputDirectory, string batchPrefix, string? customFileName,
+        IProgress<ExportProgress>? progress = null, CancellationToken token = default)
     {
         var subDirName = string.IsNullOrWhiteSpace(customFileName)
             ? $"{batchPrefix}_OCR_{DateTime.Now:yyyyMMdd_HHmmss}"
@@ -490,6 +506,8 @@ public class BatchExportService
 
         foreach (var job in jobsToExport)
         {
+            token.ThrowIfCancellationRequested();
+            progress?.Report(new ExportProgress("Collecting OCR text", pageIndex, jobsToExport.Count));
             foreach (var file in GetProcessedFilesForJob(job))
             {
                 var sidecar = ProcessedFilePaths.OcrSidecarPath(file, ".txt");

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
@@ -59,6 +60,18 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     [ObservableProperty] private string _fileName = string.Empty;
     [ObservableProperty] private string _destinationDirectory = string.Empty;
     [ObservableProperty] private bool _isBusy;
+
+    // Progress surface for a running export. Kept separate from IsBusy so the dialog can show a
+    // real progress panel rather than only disabling its buttons.
+    [ObservableProperty] private bool _isExporting;
+    [ObservableProperty] private string _progressText = string.Empty;
+    [ObservableProperty] private double _progressFraction;
+    [ObservableProperty] private bool _progressIsIndeterminate;
+    [ObservableProperty] private string _elapsedText = string.Empty;
+
+    private CancellationTokenSource? _exportCancellation;
+    private DispatcherTimer? _elapsedTimer;
+    private DateTime _exportStartedUtc;
     [ObservableProperty] private string _statusText = string.Empty;
     [ObservableProperty] private bool _watermarkEnabled;
     [ObservableProperty] private WatermarkPreset? _selectedWatermarkPreset;
@@ -329,14 +342,26 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         IsBusy = true;
         try
         {
-            OcrStatusText = "Running OCR…";
             HasOcrStatus = true;
-            var summary = await new BatchOcrService(_dbContext).RunOcrForBatchAsync(_batch.Id);
+            _exportCancellation = new CancellationTokenSource();
+            var token = _exportCancellation.Token;
+            BeginProgress("Reading text from pages (OCR)");
+
+            // Same reason the export runs off the UI thread: OCR is a subprocess per page and can
+            // take seconds each, so awaiting it here froze the dialog for the whole run.
+            var ocrProgress = new Progress<(int Done, int Total)>(p =>
+                ReportProgress(new ExportProgress("Reading text from pages (OCR)", p.Done, p.Total)));
+            var summary = await Task.Run(() =>
+                new BatchOcrService(_dbContext).RunOcrForBatchAsync(_batch.Id, ocrProgress, token), token);
             OcrStatusText = summary.CliMissing
                 ? "OCR isn't available — Tesseract wasn't found on this machine."
                 : summary.Failed > 0
                     ? $"OCR finished with {summary.Failed} page(s) failing — the export will still run."
                     : "OCR complete — the export won't need to wait for it.";
+        }
+        catch (OperationCanceledException)
+        {
+            OcrStatusText = "OCR stopped. Pages already read keep their text.";
         }
         catch (Exception ex)
         {
@@ -344,6 +369,9 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         }
         finally
         {
+            EndProgress();
+            _exportCancellation?.Dispose();
+            _exportCancellation = null;
             IsBusy = false;
         }
     }
@@ -353,25 +381,41 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     {
         if (IsBusy) return;
         IsBusy = true;
+        _exportCancellation = new CancellationTokenSource();
+        var token = _exportCancellation.Token;
+        BeginProgress($"Preparing {SelectedFormat} export");
         try
         {
+            var pageCount = Pages.Count;
             var missingOcrText = false;
+
             if (IsPdfFormat && EmbedSearchableText)
             {
-                StatusText = "Preparing searchable text...";
+                // OCR is usually the long half — a page can take seconds — so it reports its own
+                // per-page progress rather than sitting behind one static message.
+                var ocrProgress = new Progress<(int Done, int Total)>(p =>
+                    ReportProgress(new ExportProgress("Reading text from pages (OCR)", p.Done, p.Total)));
                 var ocrService = new BatchOcrService(_dbContext);
-                var summary = await ocrService.RunOcrForBatchAsync(_batch.Id);
+                var summary = await Task.Run(() => ocrService.RunOcrForBatchAsync(_batch.Id, ocrProgress, token), token);
                 missingOcrText = summary is { CliMissing: true } or { Failed: > 0 };
             }
 
-            StatusText = $"Exporting to {SelectedFormat}...";
             var exportService = new BatchExportService(_dbContext);
             var orderedJobIds = Pages.Select(p => p.JobId).ToList();
-            var exportPath = await exportService.ExportBatchAsync(
+            var exportProgress = new Progress<ExportProgress>(ReportProgress);
+
+            // Task.Run is the whole point. ExportBatchAsync is async in signature only — decoding
+            // full-resolution pages, compositing watermarks and writing the document are all
+            // synchronous CPU work, so awaiting it directly ran every bit of that on the UI
+            // thread. The window stopped repainting for the entire export, which is
+            // indistinguishable from a hang; operators killed the app mid-write.
+            var exportPath = await Task.Run(() => exportService.ExportBatchAsync(
                 _batch.Id, _defaultOutputDirectory, SelectedFormat,
                 orderedJobIds: orderedJobIds,
                 customFileName: string.IsNullOrWhiteSpace(FileName) ? null : FileName,
-                customOutputDirectory: string.IsNullOrWhiteSpace(DestinationDirectory) ? null : DestinationDirectory);
+                customOutputDirectory: string.IsNullOrWhiteSpace(DestinationDirectory) ? null : DestinationDirectory,
+                progress: exportProgress,
+                token: token), token);
 
             // Not exported as searchable text when the format isn't PDF or the toggle is off —
             // export path itself always embeds whatever .txt sidecars happen to exist (see
@@ -381,6 +425,12 @@ public partial class FinalizeBatchViewModel : ViewModelBase
             Result = new FinalizeResult(exportPath, missingOcrText && IsPdfFormat);
             _refreshTimer?.Stop();
             CloseRequested?.Invoke(this, EventArgs.Empty);
+        }
+        catch (OperationCanceledException)
+        {
+            // Nothing to undo: the output is written to a .partial file that is only moved into
+            // place on success, and no original is deleted before that.
+            StatusText = "Export cancelled — the batch is unchanged.";
         }
         catch (InvalidOperationException ex) when (ex.Message == "Images are still being processed.")
         {
@@ -392,8 +442,64 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         }
         finally
         {
+            EndProgress();
+            _exportCancellation?.Dispose();
+            _exportCancellation = null;
             IsBusy = false;
         }
+    }
+
+    /// <summary>Asks the running export to stop at the next page boundary.</summary>
+    [RelayCommand]
+    private void CancelExport()
+    {
+        if (_exportCancellation is not { IsCancellationRequested: false }) return;
+        StatusText = "Finishing the current page, then stopping…";
+        _exportCancellation.Cancel();
+    }
+
+    private void BeginProgress(string phase)
+    {
+        IsExporting = true;
+        ProgressIsIndeterminate = true;
+        ProgressFraction = 0;
+        ProgressText = phase;
+        ElapsedText = string.Empty;
+        _exportStartedUtc = DateTime.UtcNow;
+        _elapsedTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _elapsedTimer.Tick -= OnElapsedTick;
+        _elapsedTimer.Tick += OnElapsedTick;
+        _elapsedTimer.Start();
+    }
+
+    private void EndProgress()
+    {
+        _elapsedTimer?.Stop();
+        IsExporting = false;
+        ProgressIsIndeterminate = false;
+        ProgressFraction = 0;
+        ProgressText = string.Empty;
+        ElapsedText = string.Empty;
+    }
+
+    /// <summary>Shows how long the export has been running. On a batch of several hundred pages
+    /// even a healthy export runs for minutes, and a visibly advancing clock is what separates
+    /// "working" from "stuck" when a single page happens to be slow.</summary>
+    private void OnElapsedTick(object? sender, EventArgs e)
+    {
+        var elapsed = DateTime.UtcNow - _exportStartedUtc;
+        ElapsedText = elapsed.TotalMinutes >= 1
+            ? $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s elapsed"
+            : $"{elapsed.Seconds}s elapsed";
+    }
+
+    /// <summary>Progress arrives from a background thread; Progress&lt;T&gt; marshals it back to the
+    /// UI thread for us because it captures the synchronization context at construction.</summary>
+    private void ReportProgress(ExportProgress progress)
+    {
+        ProgressText = progress.ToString();
+        ProgressIsIndeterminate = progress.IsIndeterminate;
+        ProgressFraction = progress.Fraction;
     }
 
     [RelayCommand]
