@@ -64,6 +64,7 @@ TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
 TestPdfEncodingQuality();
+TestEveryCaptureFormatIsDecodableForExport();
 TestCapturesLiveInTempAndOutputsInOutput();
 await TestFinalizeEmptiesTempFolder();
 TestEncoderSupport();
@@ -1422,6 +1423,41 @@ async Task TestFinalizeEmptiesTempFolder()
         !File.Exists(supersededOriginal));
     Check("output/ is untouched by the temp cleanup", File.Exists(page));
     Check("thumbnails/ still exists after finalizing", Directory.Exists(BatchFolder.ThumbnailsPath(batchFolder)));
+}
+
+void TestEveryCaptureFormatIsDecodableForExport()
+{
+    Console.WriteLine("\n-- Every capture format can be decoded again at export time --");
+    var dir = TempWorkDir();
+
+    // A page captured in any offered format has to survive being read back for export. Skia
+    // cannot decode TIFF or JPEG 2000 at all, so handing it raw bytes of either throws
+    // "Value cannot be null. Parameter 'codec'" — which reached the operator as a bare
+    // "Export failed" with nothing naming the format responsible.
+    foreach (var ext in new[] { ".tif", ".jp2", ".bmp", ".png", ".jpg" })
+    {
+        var path = Path.Combine(dir, "page" + ext);
+        using (var mat = new OpenCvSharp.Mat(120, 160, OpenCvSharp.MatType.CV_8UC3,
+                   new OpenCvSharp.Scalar(40, 110, 200)))
+        {
+            if (!OpenCvSharp.Cv2.ImWrite(path, mat))
+            {
+                Console.WriteLine($"  [info] {ext} not writable on this build; skipped");
+                continue;
+            }
+        }
+
+        var bytes = ImageDecodeHelper.GetDisplayBytes(path);
+        Check($"'{ext}' produces decodable bytes for export", bytes != null);
+        if (bytes == null) continue;
+
+        SkiaSharp.SKBitmap? decoded = null;
+        try { decoded = SkiaSharp.SKBitmap.Decode(bytes); }
+        catch (Exception ex) { Check($"'{ext}' decodes without throwing ({ex.Message})", false); continue; }
+
+        Check($"'{ext}' decodes to a real image", decoded != null && decoded.Width == 160 && decoded.Height == 120);
+        decoded?.Dispose();
+    }
 }
 
 void TestCapturesLiveInTempAndOutputsInOutput()

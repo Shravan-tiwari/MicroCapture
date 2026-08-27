@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System;
 using System.IO;
 using OpenCvSharp;
 
@@ -15,12 +17,28 @@ public static class ImageDecodeHelper
     /// <summary>Returns PNG bytes for a TIFF (bridged through OpenCV's own decoder, which does
     /// read these files correctly), or the file's own bytes unchanged for any other format.
     /// Returns null if the file is missing or OpenCV fails to decode it.</summary>
+    /// <summary>Extensions SkiaSharp can decode directly. TIFF and JPEG 2000 are deliberately
+    /// absent — Skia ships no codec for either, so both must go through OpenCV.</summary>
+    private static readonly HashSet<string> SkiaDecodableExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".ico"
+    };
+
     public static byte[]? GetDisplayBytes(string path)
     {
         if (!File.Exists(path)) return null;
 
+        // Anything Skia can decode itself is handed over untouched. Everything else is converted
+        // through OpenCV to PNG first.
+        //
+        // This used to special-case only TIFF, which broke the moment JPEG 2000 became a capture
+        // format: Skia has no JPEG 2000 codec, so SKBitmap.Decode received raw .jp2 bytes,
+        // produced no codec, and threw "Value cannot be null. Parameter 'codec'" — surfacing to
+        // the operator as "Export failed" with nothing naming the format that caused it. Listing
+        // what Skia genuinely supports, rather than naming the one format it doesn't, means a
+        // future capture format can't reintroduce the same failure.
         var extension = Path.GetExtension(path).ToLowerInvariant();
-        if (extension is not (".tif" or ".tiff"))
+        if (SkiaDecodableExtensions.Contains(extension))
             return File.ReadAllBytes(path);
 
         using var mat = Cv2.ImRead(path, ImreadModes.Color);
