@@ -65,6 +65,7 @@ TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
 TestPdfEncodingQuality();
 TestCapturesLiveInTempAndOutputsInOutput();
+await TestFinalizeEmptiesTempFolder();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
@@ -1362,6 +1363,65 @@ void TestPdfEncodingQuality()
     Console.WriteLine("\n-- PDF image encoding quality --");
     Console.WriteLine($"  [info] SKDocumentPdfMetadata.Default.EncodingQuality = {SkiaSharp.SKDocumentPdfMetadata.Default.EncodingQuality}");
     Console.WriteLine($"  [info] new SKDocumentPdfMetadata().EncodingQuality    = {new SkiaSharp.SKDocumentPdfMetadata().EncodingQuality}");
+}
+
+async Task TestFinalizeEmptiesTempFolder()
+{
+    Console.WriteLine("\n-- Finalizing empties temp/ but leaves output/ alone --");
+    var root = TempWorkDir();
+    var batchFolder = Path.Combine(root, "TEMPCLEAN");
+    BatchFolder.EnsureLayout(batchFolder);
+    var dbPath = Path.Combine(root, "tc.db");
+
+    var page = Path.Combine(BatchFolder.OutputPath(batchFolder), "page1.tif");
+    using (var mat = new OpenCvSharp.Mat(400, 300, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(60, 120, 200)))
+        OpenCvSharp.Cv2.ImWrite(page, mat);
+
+    var exportedOriginal = Path.Combine(BatchFolder.TempPath(batchFolder), "cap_000001.jpg");
+    File.WriteAllText(exportedOriginal, "original for the exported page");
+    // The cases DeleteOriginals alone never reached: a retired recapture attempt and a page the
+    // operator dropped from the export. Both keep full-resolution captures in temp/.
+    var supersededOriginal = Path.Combine(BatchFolder.TempPath(batchFolder), "cap_000001_R_old.jpg");
+    File.WriteAllText(supersededOriginal, "retired recapture attempt");
+
+    string batchId;
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "TC", OutputDirectory = root };
+        db.Projects.Add(project);
+        var batch = new Batch
+        {
+            ProjectId = project.Id, BatchCode = "TEMPCLEAN", Name = "TEMPCLEAN",
+            FolderPath = batchFolder, Dpi = 300
+        };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+        db.CaptureJobs.Add(new CaptureJob
+        {
+            BatchId = batch.Id, PageNumber = 1, ProcessingStatus = "Completed",
+            OriginalFilePath = exportedOriginal, ProcessedFilePath = page, Dpi = 300
+        });
+        db.CaptureJobs.Add(new CaptureJob
+        {
+            BatchId = batch.Id, PageNumber = 1, ProcessingStatus = "Superseded",
+            OriginalFilePath = supersededOriginal, Dpi = 300
+        });
+        db.SaveChanges();
+    }
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        await RunPumped(() => new BatchExportService(db).ExportBatchAsync(
+            batchId, Path.Combine(root, "final"), "PDF"), timeoutMs: 60000);
+    }
+
+    var leftInTemp = Directory.GetFiles(BatchFolder.TempPath(batchFolder), "*", SearchOption.AllDirectories);
+    Check("temp/ is empty after finalizing", leftInTemp.Length == 0);
+    Check("the retired recapture's original is gone too, not just the exported page's",
+        !File.Exists(supersededOriginal));
+    Check("output/ is untouched by the temp cleanup", File.Exists(page));
+    Check("thumbnails/ still exists after finalizing", Directory.Exists(BatchFolder.ThumbnailsPath(batchFolder)));
 }
 
 void TestCapturesLiveInTempAndOutputsInOutput()

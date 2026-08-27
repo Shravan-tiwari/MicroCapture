@@ -148,6 +148,7 @@ public class BatchExportService
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
             DeleteOcrSidecars(jobsToExport);
+            ClearBatchTempFolder(batch);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -259,6 +260,7 @@ public class BatchExportService
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
             DeleteOcrSidecars(jobsToExport);
+            ClearBatchTempFolder(batch);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -350,6 +352,7 @@ public class BatchExportService
         batch.Status = "Exported";
         DeleteOriginals(jobsToExport);
         DeleteOcrSidecars(jobsToExport);
+        ClearBatchTempFolder(batch);
         AttachOrUpdateBatch(batch);
         AttachOrUpdateJobs(jobsToExport);
         await _dbContext.SaveChangesAsync();
@@ -501,6 +504,35 @@ public class BatchExportService
         AttachOrUpdateJobs(jobsToExport);
         await _dbContext.SaveChangesAsync();
         return exportDir;
+    }
+
+    /// <summary>Empties the batch's temp/ folder once its final output exists.
+    ///
+    /// <para>Deleting only the exported jobs' originals is not enough to leave temp/ empty:
+    /// retired recapture attempts, pages the operator removed in the Finalize dialog, and failed
+    /// jobs are all excluded from the export set, so their full-resolution captures would sit
+    /// there indefinitely — on a long batch that is gigabytes of working files outliving the
+    /// batch they belong to.</para>
+    ///
+    /// <para>Only ever touches temp/, never output/ or thumbnails/, and only for a batch that
+    /// actually has a batch folder. Runs after the finished file has been written, so a failed
+    /// export leaves every original in place.</para></summary>
+    private static void ClearBatchTempFolder(Batch batch)
+    {
+        if (string.IsNullOrWhiteSpace(batch.FolderPath)) return;
+
+        var temp = Path.Combine(batch.FolderPath!, "temp");
+        if (!Directory.Exists(temp)) return;
+
+        foreach (var file in Directory.EnumerateFiles(temp, "*", SearchOption.AllDirectories))
+        {
+            try { File.Delete(file); }
+            catch (Exception ex)
+            {
+                // A locked or in-use working file is not worth failing a completed export over.
+                Console.Error.WriteLine($"Could not remove temp file '{file}' after export: {ex.Message}");
+            }
+        }
     }
 
     /// <summary>Deletes each exported job's original capture file, now that the batch's final
