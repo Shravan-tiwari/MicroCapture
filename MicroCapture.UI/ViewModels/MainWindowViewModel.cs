@@ -1921,10 +1921,11 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             StatusText = "Focusing…";
             await _cameraService.TriggerAutoFocusAsync();
-            // Only claim success once the drive command actually returned OK. This used to report
-            // "Autofocus triggered." unconditionally while the service was in fact commanding AF
-            // OFF — the false success is what made the bug so hard to spot from the UI.
-            StatusText = "Autofocus complete.";
+            // Deliberately not "Autofocus complete." The camera accepts the command and reports
+            // success even when the lens never moves, so claiming completion contradicts what the
+            // operator can see. Say what was done, and point at the setting that most often
+            // explains nothing happening.
+            StatusText = "Autofocus run. If the image didn't change, check the lens switch is on AF.";
         }
         catch (Exception ex)
         {

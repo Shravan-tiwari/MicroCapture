@@ -35,10 +35,15 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         new("AFMode", "Focus mode", EDSDK.PropID_AFMode),
         new("ColorSpace", "Color space", EDSDK.PropID_ColorSpace)
     };
-    // How long to hold the AF drive engaged before releasing it. Long enough for the lens to
-    // actually hunt and settle on a low-contrast page (releasing immediately cancels the attempt
-    // it was just asked to make), short enough that the operator isn't left waiting on a button.
-    private const int AutoFocusHuntMilliseconds = 600;
+    // How long to hold the AF drive engaged before releasing it. Contrast-detect AF on a
+    // low-contrast page genuinely takes a second or more to converge, and releasing early
+    // cancels the attempt that was just requested — 600ms was short enough to look like AF
+    // doing nothing on exactly the flat, evenly-lit pages this rig photographs.
+    private const int AutoFocusHuntMilliseconds = 1600;
+
+    /// <summary>PropID_AFMode's manual-focus value. A body in this mode accepts focus commands
+    /// and ignores them.</summary>
+    private const uint ManualFocusAfMode = 3;
     private static readonly object LogSync = new();
     private static DateTime _lastLiveSuccessLogUtc = DateTime.MinValue;
     private readonly object _sync = new();
@@ -334,6 +339,31 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             if (evfModeResult != EDSDK.EDS_ERR_OK)
                 Log("StartLiveViewAsync", $"Evf_Mode=1 not accepted ({ErrorName(evfModeResult)}); focus commands may be rejected by this body.");
 
+            // Put live-view AF into a mode that can actually run while live view is up.
+            //
+            // Evf_AFMode defaults to Quick on many bodies, which focuses using the dedicated
+            // phase-detect sensor behind the mirror. In live view the mirror is up and that
+            // sensor sees nothing, so DoEvfAf returns EDS_ERR_OK and focuses nothing at all —
+            // the command "succeeds" while the lens never moves, which is exactly what an
+            // autofocus button that appears to do nothing looks like. Live mode focuses off the
+            // imaging sensor, which is the only thing available during live view.
+            uint currentAfMode = 0;
+            var readAfMode = Call("EdsGetPropertyData(Evf_AFMode)",
+                () => EDSDK.EdsGetPropertyData(camera, EDSDK.PropID_Evf_AFMode, 0, out currentAfMode));
+            Log("StartLiveViewAsync", readAfMode == EDSDK.EDS_ERR_OK
+                ? $"Evf_AFMode reads {currentAfMode} ({DescribeEvfAfMode(currentAfMode)})"
+                : $"Evf_AFMode could not be read ({ErrorName(readAfMode)})");
+
+            if (readAfMode != EDSDK.EDS_ERR_OK || currentAfMode == (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_Quick)
+            {
+                var setAfMode = Call("EdsSetPropertyData(Evf_AFMode=Live)",
+                    () => EDSDK.EdsSetPropertyData(camera, EDSDK.PropID_Evf_AFMode, 0, sizeof(uint),
+                        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_Live));
+                Log("StartLiveViewAsync", setAfMode == EDSDK.EDS_ERR_OK
+                    ? "Evf_AFMode set to Live so autofocus can run during live view."
+                    : $"Could not set Evf_AFMode to Live ({ErrorName(setAfMode)}); autofocus may have no effect on this body.");
+            }
+
             EnsureSuccess(
                 "EdsSetPropertyData(Evf_OutputDevice=PC)",
                 Call("EdsSetPropertyData(Evf_OutputDevice=PC)",
@@ -407,7 +437,10 @@ public sealed class CanonCameraService : ICameraService, IDisposable
                     FocusStep.FarLarge => EDSDK.EvfDriveLens_Far3,
                     _ => EDSDK.EvfDriveLens_Near1
                 };
-                EnsureSuccess("EdsSendCommand(DriveLensEvf)", Call($"EdsSendCommand(DriveLensEvf, {step})", () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DriveLensEvf, unchecked((int)param))));
+                var driveResult = Call($"EdsSendCommand(DriveLensEvf, {step})",
+                    () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DriveLensEvf, unchecked((int)param)));
+                Log("NudgeFocusAsync", $"DriveLensEvf({step}) returned {ErrorName(driveResult)} (0x{driveResult:X8})");
+                EnsureSuccess("EdsSendCommand(DriveLensEvf)", driveResult);
             }
         });
     }
@@ -425,13 +458,31 @@ public sealed class CanonCameraService : ICameraService, IDisposable
             {
                 ThrowIfDisconnected();
                 ThrowIfLiveViewInactive("Autofocus");
+
+                // A body reporting manual focus will accept DoEvfAf and do nothing with it. That
+                // is a switch on the lens or body, not something software can override — so say
+                // which one to change rather than reporting a success the operator can plainly
+                // see didn't happen.
+                uint bodyAfMode = 0;
+                if (Call("EdsGetPropertyData(AFMode)",
+                        () => EDSDK.EdsGetPropertyData(_camera, EDSDK.PropID_AFMode, 0, out bodyAfMode)) == EDSDK.EDS_ERR_OK)
+                {
+                    Log("TriggerAutoFocusAsync", $"Body AFMode reads {bodyAfMode}");
+                    if (bodyAfMode == ManualFocusAfMode)
+                        throw new InvalidOperationException(
+                            "The camera is set to manual focus. Set the lens (or body) switch to AF to use autofocus.");
+                }
                 // DoEvfAf's parameter is EvfAf_ON(1)/EvfAf_OFF(0) — it is NOT "run AF once".
                 // This previously passed 0, i.e. it commanded autofocus OFF and then reported
                 // success, since EvfAf_OFF is a perfectly legal command that returns EDS_ERR_OK.
                 // That is why the AF button appeared to do nothing at all. Drive AF on, then
                 // release it, mirroring a shutter half-press and release.
-                EnsureSuccess("EdsSendCommand(DoEvfAf, ON)", Call("EdsSendCommand(DoEvfAf, ON)",
-                    () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, (int)EDSDK.EdsEvfAf.CameraCommand_EvfAf_ON)));
+                var afResult = Call("EdsSendCommand(DoEvfAf, ON)",
+                    () => EDSDK.EdsSendCommand(_camera, EDSDK.CameraCommand_DoEvfAf, (int)EDSDK.EdsEvfAf.CameraCommand_EvfAf_ON));
+                // Logged before EnsureSuccess so the raw code is on record even when it throws —
+                // "autofocus did nothing" is otherwise impossible to diagnose from a rig.
+                Log("TriggerAutoFocusAsync", $"DoEvfAf(ON) returned {ErrorName(afResult)} (0x{afResult:X8})");
+                EnsureSuccess("EdsSendCommand(DoEvfAf, ON)", afResult);
             }
             try
             {
@@ -670,6 +721,18 @@ public sealed class CanonCameraService : ICameraService, IDisposable
     }
 
     private void FailCapture(Exception exception) { lock (_sync) _captureTcs?.TrySetException(exception); }
+    /// <summary>Names an Evf_AFMode value for the log. Quick is called out because it cannot
+    /// focus during live view at all — see StartLiveViewAsync.</summary>
+    private static string DescribeEvfAfMode(uint mode) => mode switch
+    {
+        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_Quick => "Quick — cannot focus during live view",
+        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_Live => "Live",
+        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_LiveFace => "Live (face detect)",
+        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_LiveMulti => "Live (multi)",
+        (uint)EDSDK.EdsEvfAFMode.Evf_AFMode_LiveZone => "Live (zone)",
+        _ => $"mode {mode}"
+    };
+
     private void ThrowIfDisconnected() { if (!_isConnected || _camera == IntPtr.Zero) throw new InvalidOperationException("Camera is not connected."); }
 
     /// <summary>Guards the EVF-only focus commands. The camera rejects DriveLensEvf/DoEvfAf
