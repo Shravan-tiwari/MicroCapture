@@ -1869,10 +1869,9 @@ public partial class MainWindowViewModel : ViewModelBase
         // itself now polls (see FinalizeBatchViewModel's _refreshTimer) and shows the same
         // "still processing" state live, updating the moment pages complete — so it's always
         // safe to open, even with nothing completed yet.
-        // The batch's own folder, not the project's flat output directory — that's where the
-        // operator chose to put this batch at New Batch time, so it's where they expect its
-        // finished output to land. Falls back to the project directory only for a batch that
-        // predates batch folders.
+        // The batch's own output/ folder — the finished export belongs with the finished pages,
+        // which is where the operator looks for the batch's results. Falls back to the project
+        // directory only for a batch that predates batch folders.
         var finalizeDirectory = !string.IsNullOrWhiteSpace(_currentBatchFolder)
             ? BatchFolder.OutputPath(_currentBatchFolder)
             : _outputDirectory;

@@ -173,7 +173,7 @@ public class BatchExportService
             // Beside output/, not inside it. Writing the export into output/ left that folder
             // holding both the processed pages and a renamed copy of every one of them, doubling
             // the batch on disk and making "the deliverable folder" ambiguous.
-            string exportDir = Path.Combine(ExportParentDirectory(outputDirectory), subDirName);
+            string exportDir = Path.Combine(outputDirectory, subDirName);
             Directory.CreateDirectory(exportDir);
 
             int pageIndex = 1;
@@ -534,20 +534,6 @@ public class BatchExportService
         AttachOrUpdateJobs(jobsToExport);
         await _dbContext.SaveChangesAsync();
         return exportDir;
-    }
-
-    /// <summary>Where an export is written. When the destination is a batch's own output/ folder,
-    /// the export goes alongside it in the batch folder rather than nested inside — otherwise
-    /// output/ ends up containing a second copy of every page it already holds.</summary>
-    private static string ExportParentDirectory(string outputDirectory)
-    {
-        if (string.Equals(Path.GetFileName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar)), "output",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            var parent = Path.GetDirectoryName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar));
-            if (!string.IsNullOrEmpty(parent)) return parent;
-        }
-        return outputDirectory;
     }
 
     /// <summary>Empties the batch's temp/ folder once its final output exists.

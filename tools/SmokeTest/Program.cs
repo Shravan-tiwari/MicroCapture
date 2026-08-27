@@ -68,6 +68,7 @@ TestEveryCaptureFormatIsDecodableForExport();
 TestCapturesLiveInTempAndOutputsInOutput();
 await TestFinalizeEmptiesTempFolder();
 await TestFinalizeKeepsUnprocessedOriginals();
+TestTiffCompressionActuallyDiffers();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
@@ -1855,6 +1856,36 @@ void TestCapturesLiveInTempAndOutputsInOutput()
     Check("A capture outside a batch folder still writes beside itself",
         string.Equals(Path.GetFullPath(ProcessedFilePaths.OutputDirectoryFor(loose)),
             Path.GetFullPath(Path.GetDirectoryName(loose)!), StringComparison.OrdinalIgnoreCase));
+}
+
+void TestTiffCompressionActuallyDiffers()
+{
+    Console.WriteLine("\n-- TIFF compression options produce genuinely different files --");
+    var dir = TempWorkDir();
+    var src = Path.Combine(dir, "src.tif");
+    // Document-like content — text on a light ground, with large flat areas. Random noise would
+    // be the wrong fixture entirely: LZW cannot compress noise and actually EXPANDS it, so an
+    // "uncompressed is bigger" assertion fails against working code. Scanned pages are the
+    // opposite case, which is what this has to represent.
+    using (var mat = new OpenCvSharp.Mat(1200, 1600, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(245, 245, 245)))
+    {
+        for (var line = 0; line < 30; line++)
+            OpenCvSharp.Cv2.PutText(mat, "the quick brown fox jumps over the lazy dog",
+                new OpenCvSharp.Point(40, 50 + line * 38), OpenCvSharp.HersheyFonts.HersheySimplex,
+                0.9, new OpenCvSharp.Scalar(20, 20, 20), 2);
+        OpenCvSharp.Cv2.ImWrite(src, mat);
+    }
+
+    using var img = OpenCvSharp.Cv2.ImRead(src, OpenCvSharp.ImreadModes.Unchanged);
+    var lzwPath = Path.Combine(dir, "lzw.tif");
+    var nonePath = Path.Combine(dir, "none.tif");
+    OpenCvSharp.Cv2.ImWrite(lzwPath, img, new[] { (int)OpenCvSharp.ImwriteFlags.TiffCompression, 5 });
+    OpenCvSharp.Cv2.ImWrite(nonePath, img, new[] { (int)OpenCvSharp.ImwriteFlags.TiffCompression, 1 });
+
+    var lzwKb = new FileInfo(lzwPath).Length / 1024.0;
+    var noneKb = new FileInfo(nonePath).Length / 1024.0;
+    Console.WriteLine($"  [size] LZW {lzwKb:F0} KB vs uncompressed {noneKb:F0} KB");
+    Check($"Uncompressed TIFF is larger than LZW ({noneKb:F0} KB vs {lzwKb:F0} KB)", noneKb > lzwKb * 1.05);
 }
 
 void TestEncoderSupport()

@@ -57,25 +57,38 @@ public sealed record ExportFormat(
     public static readonly IReadOnlyList<ExportFormat> All = new[]
     {
         new ExportFormat("PDF", ExportKind.Pdf, ".pdf"),
-        new ExportFormat("PDF-Multipage", ExportKind.Pdf, ".pdf"),
         new ExportFormat("Searchable PDF", ExportKind.Pdf, ".pdf", EmbedsText: true),
         new ExportFormat("PDF/A", ExportKind.Pdf, ".pdf", EmbedsText: true, RequiresPdfA: true),
         new ExportFormat("TIFF", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
-        new ExportFormat("TIFF LZW", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
         new ExportFormat("TIFF Uncompressed", ExportKind.ImagePerPage, ".tif", Compression: "None"),
         new ExportFormat("TIFF-Multipage", ExportKind.MultipageTiff, ".tif", Compression: "LZW"),
         new ExportFormat("JPEG", ExportKind.ImagePerPage, ".jpg"),
-        new ExportFormat("JPG", ExportKind.ImagePerPage, ".jpg"),
         new ExportFormat("PNG", ExportKind.ImagePerPage, ".png"),
         new ExportFormat("JPEG 2000", ExportKind.ImagePerPage, ".jp2"),
         new ExportFormat("BMP", ExportKind.ImagePerPage, ".bmp"),
-        new ExportFormat("OCR Text", ExportKind.TextOnly, ".txt")
+        new ExportFormat("OCR Text", ExportKind.TextOnly, ".txt"),
+
+        // Accepted when resolving a stored value, but deliberately not offered — see
+        // SelectableNames. "PDF-Multipage" and "TIFF LZW" produced files identical to "PDF" and
+        // "TIFF": a PDF is multi-page by nature, and TIFF here is always LZW. Offering a name
+        // that changes nothing invites the operator to hunt for a difference that doesn't exist.
+        // "JPG" is the short form already persisted on existing jobs.
+        new ExportFormat("PDF-Multipage", ExportKind.Pdf, ".pdf"),
+        new ExportFormat("TIFF LZW", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
+        new ExportFormat("JPG", ExportKind.ImagePerPage, ".jpg")
     };
 
-    /// <summary>Names offered in the UI. "JPG" is accepted for backwards compatibility with
-    /// batches and callers that already store it, but isn't offered alongside "JPEG".</summary>
+    /// <summary>Names hidden from the picker because they duplicate another entry exactly. They
+    /// still resolve, so a batch or manifest that stored one keeps working.</summary>
+    private static readonly HashSet<string> Aliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "PDF-Multipage", "TIFF LZW", "JPG"
+    };
+
+    /// <summary>Names offered in the UI — every format that produces a genuinely different file,
+    /// and only those.</summary>
     public static IReadOnlyList<string> SelectableNames { get; } =
-        All.Where(f => f.Name != "JPG").Select(f => f.Name).ToList();
+        All.Where(f => !Aliases.Contains(f.Name)).Select(f => f.Name).ToList();
 
     /// <summary>Resolves an operator-facing or stored format name, case- and spacing-insensitively.
     /// Returns null for anything unrecognised so the caller can reject it explicitly rather than
