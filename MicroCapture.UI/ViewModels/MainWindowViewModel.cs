@@ -452,6 +452,17 @@ public partial class MainWindowViewModel : ViewModelBase
     private const double LiveSharpnessThreshold = 40.0; // live-view frames are lower detail than a full capture, so a lower bar than the QC BlurThreshold (100)
     private const double StablePositionToleranceFraction = 0.03; // allowed drift between checks, as a fraction of frame size
     private const double ContentChangeThreshold = 18.0; // mean abs pixel difference (0-255) considered a genuinely different page
+
+    // "Has the page stopped moving" and "is this a different page" are different questions and
+    // need very different bars. They shared ContentChangeThreshold, which is deliberately large
+    // so an ordinary page turn counts as new content — far too loose for detecting motion, since
+    // two frames half a second apart mid-turn differ by well under 18. That is what let
+    // auto-capture fire while the page was still being turned.
+    private const double MotionThreshold = 4.0;
+
+    // A capture requires a page turn to have been seen since the last one. Stillness alone is not
+    // evidence of a new page — a page that never moved is also perfectly still.
+    private const double PageTurnMotionThreshold = 10.0;
     private const double PositionSmoothingFactor = 0.35; // weight toward each new detection when updating the smoothed reference
     private int _stableFrameCount;
     // A smoothed (not raw) reference position: comparing each new detection against this
@@ -466,8 +477,14 @@ public partial class MainWindowViewModel : ViewModelBase
     // could exceed ContentChangeThreshold and keep resetting the settle counter — auto-capture
     // would then never fire no matter how still the page was. Kept as doubles because an EMA of
     // byte samples needs sub-integer precision to converge.
-    private double[]? _smoothedSignature;
-    private const double SignatureSmoothingFactor = 0.45;
+    // The previous frame's raw signature. Motion is the difference between consecutive frames;
+    // smoothing this would let the reference chase a moving page and report it as still.
+    private byte[]? _previousFrameSignature;
+
+    /// <summary>Whether a page turn has been observed since the last capture. Auto-capture needs
+    /// move-then-settle, not just settle, or it re-fires on a page that never moved — and worse,
+    /// fires part-way through a turn that briefly looks stable.</summary>
+    private bool _sawPageTurnSinceCapture;
     // Last gate that blocked an auto-capture, so transitions can be logged once rather than
     // twice a second. See LogAutoCaptureGate.
     private string? _lastAutoCaptureGate;
@@ -734,7 +751,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!check.Decoded || check.Regions == null || check.Regions.Length == 0)
         {
             _stableFrameCount = 0;
-            _smoothedSignature = null;
+            _previousFrameSignature = null;
             DocumentStatus = "Frames set — waiting for live view";
             LogAutoCaptureGate("no-live-view", "frame mode: no decodable regions");
             return;
@@ -762,25 +779,38 @@ public partial class MainWindowViewModel : ViewModelBase
         if (minSharpness < LiveSharpnessThreshold)
         {
             _stableFrameCount = 0;
-            _smoothedSignature = SmoothSignature(_smoothedSignature, signature, SignatureSmoothingFactor);
+            _previousFrameSignature = signature;
             DocumentStatus = "✓ Frames set — focusing…";
             LogAutoCaptureGate("sharpness", $"frame mode: weakest region {minSharpness:F1} < {LiveSharpnessThreshold} (per-region: {string.Join(", ", check.Regions.Select(r => r.Sharpness.ToString("F1")))})");
             return;
         }
 
-        // Compare against the smoothed reference from before this update, then blend it toward
-        // the new sample — mirroring how _smoothedRect works in auto-detect mode. Comparing two
-        // consecutive raw signatures let sensor noise on a near-uniform page reset the counter
-        // indefinitely.
-        var settleDiff = SignatureDifference(signature, _smoothedSignature);
-        var settled = _smoothedSignature != null && settleDiff < ContentChangeThreshold;
-        _smoothedSignature = SmoothSignature(_smoothedSignature, signature, SignatureSmoothingFactor);
-        _stableFrameCount = settled ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
+        // Motion is measured between CONSECUTIVE RAW frames. It used to be measured against an
+        // exponentially smoothed reference, which quietly defeated the whole check: the reference
+        // chases the current frame, so a couple of checks into a page turn it had caught up, the
+        // difference collapsed, and a page still visibly moving read as settled.
+        var motion = ContentDifference(signature, _previousFrameSignature);
+        _previousFrameSignature = signature;
+
+        var moving = _previousFrameSignature != null && motion > MotionThreshold;
+        if (moving) _sawPageTurnSinceCapture = true;
+
+        _stableFrameCount = moving ? 0 : Math.Min(_stableFrameCount + 1, StableFramesRequired);
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Frames set — hold still…";
             LogAutoCaptureGate("settling",
-                $"frame mode: {DescribeSettling(settled, settleDiff)}, stable {_stableFrameCount}/{StableFramesRequired}");
+                $"frame mode: {(moving ? $"page still moving, motion {motion:F1} > {MotionThreshold}" : "holding still, counting up")}, stable {_stableFrameCount}/{StableFramesRequired}");
+            return;
+        }
+
+        // Stillness alone is not evidence of a new page — an untouched page is perfectly still
+        // too. Require an actual page turn to have happened since the last capture, so the
+        // sequence must be move-then-settle rather than just settle.
+        if (_lastCapturedSignature != null && !_sawPageTurnSinceCapture)
+        {
+            DocumentStatus = "✓ Captured — turn the page to continue";
+            LogAutoCaptureGate("awaiting-page-turn", "frame mode: still and in focus, but no page turn seen since the last capture");
             return;
         }
 
@@ -802,6 +832,7 @@ public partial class MainWindowViewModel : ViewModelBase
         LogAutoCaptureGate("firing", $"frame mode: {Frames.Count} frame(s), weakest sharpness {minSharpness:F1}");
         _lastCapturedSignature = signature;
         _stableFrameCount = 0;
+        _sawPageTurnSinceCapture = false;
         _ = CaptureAsync();
     }
 
@@ -819,7 +850,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _stableFrameCount = 0;
             _smoothedRect = null;
             _lastDetectedSignature = null;
-            _smoothedSignature = null;
+            _previousFrameSignature = null;
             DocumentStatus = "Waiting for boundary";
             LogAutoCaptureGate("no-boundary", "auto-detect: no page-sized contour found — check lighting/contrast against the backdrop, or draw frames instead");
             return;
@@ -853,11 +884,28 @@ public partial class MainWindowViewModel : ViewModelBase
         _smoothedRect = previousSmoothed.HasValue ? LerpRect(previousSmoothed.Value, rect, PositionSmoothingFactor) : rect;
         _stableFrameCount = wasStable ? Math.Min(_stableFrameCount + 1, StableFramesRequired) : 1;
 
+        // Position stability alone said nothing about the page's CONTENT: a page guide holds every
+        // page in the same spot, so a sheet sliding into place mid-turn sits at a stable rect
+        // while its content is still changing. Gate on content motion as well.
+        var contentMotion = ContentDifference(check.ContentSignature, _previousFrameSignature);
+        _previousFrameSignature = check.ContentSignature;
+        var contentMoving = _previousFrameSignature != null && contentMotion > MotionThreshold;
+        if (contentMoving) _sawPageTurnSinceCapture = true;
+
+        if (!wasStable || contentMoving) _stableFrameCount = 0;
+
         if (_stableFrameCount < StableFramesRequired)
         {
             DocumentStatus = "✓ Boundary detected — hold still…";
             LogAutoCaptureGate("settling",
-                $"auto-detect: {(wasStable ? "holding still, counting up" : "page still moving")}, stable {_stableFrameCount}/{StableFramesRequired}");
+                $"auto-detect: {(contentMoving ? $"page still moving, motion {contentMotion:F1} > {MotionThreshold}" : "holding still, counting up")}, stable {_stableFrameCount}/{StableFramesRequired}");
+            return;
+        }
+
+        if (_lastCapturedSignature != null && !_sawPageTurnSinceCapture)
+        {
+            DocumentStatus = "✓ Captured — turn the page to continue";
+            LogAutoCaptureGate("awaiting-page-turn", "auto-detect: still and in focus, but no page turn seen since the last capture");
             return;
         }
 
@@ -880,12 +928,20 @@ public partial class MainWindowViewModel : ViewModelBase
         LogAutoCaptureGate("firing", $"auto-detect: sharpness {check.Sharpness:F1}, {DescribeDifference(contentDiff)}");
         _lastCapturedSignature = check.ContentSignature;
         _stableFrameCount = 0;
+        _sawPageTurnSinceCapture = false;
         _ = CaptureAsync();
     }
 
     /// <summary>Mean absolute difference between two content signatures (0-255 scale).
     /// Missing or mismatched signatures are treated as "definitely different" so a
     /// comparison failure never blocks a real capture.</summary>
+    /// <summary>Test seam: the thresholds the auto-capture decision turns on. Exposed so a
+    /// simulated page turn can assert the decision rather than re-implementing it.</summary>
+    public static double MotionThresholdForTests => MotionThreshold;
+    public static double ContentChangeThresholdForTests => ContentChangeThreshold;
+    public static int StableFramesRequiredForTests => StableFramesRequired;
+    public static double ContentDifferenceForTests(byte[]? a, byte[]? b) => ContentDifference(a, b);
+
     private static double ContentDifference(byte[]? a, byte[]? b)
     {
         if (a == null || b == null || a.Length != b.Length || a.Length == 0) return double.MaxValue;
@@ -912,30 +968,7 @@ public partial class MainWindowViewModel : ViewModelBase
             from.Width + (to.Width - from.Width) * t,
             from.Height + (to.Height - from.Height) * t);
 
-    /// <summary>Mean absolute difference between a raw signature and the smoothed reference —
-    /// the content counterpart of <see cref="IsRectStable"/>'s comparison against
-    /// <see cref="_smoothedRect"/>.</summary>
-    private static double SignatureDifference(byte[]? current, double[]? smoothed)
-    {
-        if (current == null || smoothed == null || current.Length != smoothed.Length || current.Length == 0) return double.MaxValue;
-        double sum = 0;
-        for (var i = 0; i < current.Length; i++) sum += Math.Abs(current[i] - smoothed[i]);
-        return sum / current.Length;
-    }
 
-    /// <summary>Blends the smoothed signature toward the newest sample, seeding it on first use.</summary>
-    private static double[] SmoothSignature(double[]? previous, byte[] current, double t)
-    {
-        if (previous == null || previous.Length != current.Length)
-        {
-            var seeded = new double[current.Length];
-            for (var i = 0; i < current.Length; i++) seeded[i] = current[i];
-            return seeded;
-        }
-        var blended = new double[current.Length];
-        for (var i = 0; i < current.Length; i++) blended[i] = previous[i] + (current[i] - previous[i]) * t;
-        return blended;
-    }
 
     /// <summary>Describes why a check hasn't settled yet, in terms that match the number printed
     /// beside it. Distinguishes "the page is genuinely still moving" from "the page is holding
@@ -949,7 +982,7 @@ public partial class MainWindowViewModel : ViewModelBase
         return $"content still moving, diff {difference:F1} vs threshold {ContentChangeThreshold}";
     }
 
-    /// <summary><see cref="ContentDifference"/> and <see cref="SignatureDifference"/> return
+    /// <summary><see cref="ContentDifference"/> returns
     /// double.MaxValue to mean "nothing to compare against yet", which is right for the
     /// comparison but prints as three hundred digits of noise in a log.</summary>
     private static bool IsNoReference(double difference) =>
@@ -1566,6 +1599,8 @@ public partial class MainWindowViewModel : ViewModelBase
             // readiness indicator) can trigger again for this same physical page.
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
+            // Arm the next shot only after another page turn is observed.
+            _sawPageTurnSinceCapture = false;
 
             StatusText = $"Page{(frameCount > 0 ? "s" : "")} captured — {Path.GetFileName(filePath)}";
         }
@@ -1647,6 +1682,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
+            // Arm the next shot only after another page turn is observed.
+            _sawPageTurnSinceCapture = false;
 
             // Same reason capture publishes. Without this the manifest still lists the attempt
             // that was just superseded, so reopening the batch resurrects the bad shot and

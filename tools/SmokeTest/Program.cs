@@ -72,6 +72,7 @@ TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
+TestAutoCaptureWaitsForThePageTurnToFinish();
 await TestExportOutputsAreActuallyCorrect();
 TestMultipageTiffHasEveryPage();
 TestBatchLockIsAdvisory();
@@ -1003,6 +1004,82 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+void TestAutoCaptureWaitsForThePageTurnToFinish()
+{
+    Console.WriteLine("\n-- Auto-capture holds off while a page is being turned --");
+
+    var motionBar = MainWindowViewModel.MotionThresholdForTests;
+    var newPageBar = MainWindowViewModel.ContentChangeThresholdForTests;
+    var required = MainWindowViewModel.StableFramesRequiredForTests;
+
+    // The bug: one threshold answered both "has it stopped moving" and "is this a new page".
+    // Motion must be judged far more strictly, or mid-turn frames — which differ by much less
+    // than a whole page change — read as settled and the shutter fires during the turn.
+    Check("Motion is judged on a much tighter bar than a page change", motionBar < newPageBar / 2);
+
+    byte[] Sig(int shade, int noise = 0)
+    {
+        var b = new byte[40 * 40];
+        var rnd = new Random(shade + noise);
+        for (var i = 0; i < b.Length; i++)
+            b[i] = (byte)Math.Clamp(shade + (noise == 0 ? 0 : rnd.Next(-noise, noise + 1)), 0, 255);
+        return b;
+    }
+
+    // A page mid-turn: consecutive frames differ, but by far less than a full page change.
+    var midTurnA = Sig(120);
+    var midTurnB = Sig(130);
+    var midTurnMotion = MainWindowViewModel.ContentDifferenceForTests(midTurnB, midTurnA);
+    Check($"A frame mid-turn counts as moving (motion {midTurnMotion:F1} > {motionBar})", midTurnMotion > motionBar);
+    Check($"...yet is small enough that the old page-change bar called it settled (motion {midTurnMotion:F1} < {newPageBar})",
+        midTurnMotion < newPageBar);
+
+    // A settled page under sensor noise must NOT read as moving, or it never captures at all.
+    var still = Sig(120);
+    var stillNoisy = Sig(120, noise: 2);
+    var noiseMotion = MainWindowViewModel.ContentDifferenceForTests(stillNoisy, still);
+    Check($"Sensor noise on a still page is below the motion bar (motion {noiseMotion:F1} <= {motionBar})",
+        noiseMotion <= motionBar);
+
+    // A finished turn is a genuinely different page.
+    var newPage = Sig(200);
+    var pageChange = MainWindowViewModel.ContentDifferenceForTests(newPage, still);
+    Check($"A completed page turn clears the new-page bar (diff {pageChange:F1} > {newPageBar})", pageChange > newPageBar);
+
+    // Walk the sequence the operator actually produces: turning, turning, then still, still,
+    // still. Capture may only arm once motion has been seen AND stillness has held.
+    var frames = new[] { Sig(120), Sig(140), Sig(170), Sig(200), Sig(200), Sig(200), Sig(200) };
+    byte[]? previous = null;
+    var stable = 0;
+    var sawTurn = false;
+    var firedAt = -1;
+    for (var i = 0; i < frames.Length; i++)
+    {
+        var motion = MainWindowViewModel.ContentDifferenceForTests(frames[i], previous);
+        var moving = previous != null && motion > motionBar;
+        previous = frames[i];
+        if (moving) sawTurn = true;
+        stable = moving ? 0 : Math.Min(stable + 1, required);
+        if (stable >= required && sawTurn && firedAt < 0) firedAt = i;
+    }
+
+    Check("Auto-capture does not fire while the page is still moving", firedAt < 0 || firedAt >= 4);
+    Check("Auto-capture does fire once the page has settled", firedAt >= 0);
+
+    // And a page that never moved must not re-fire, however still it is.
+    previous = null; stable = 0; sawTurn = false; var refired = false;
+    foreach (var f in new[] { Sig(200), Sig(200), Sig(200), Sig(200), Sig(200) })
+    {
+        var motion = MainWindowViewModel.ContentDifferenceForTests(f, previous);
+        var moving = previous != null && motion > motionBar;
+        previous = f;
+        if (moving) sawTurn = true;
+        stable = moving ? 0 : Math.Min(stable + 1, required);
+        if (stable >= required && sawTurn) refired = true;
+    }
+    Check("A page that never moved does not trigger another capture", !refired);
 }
 
 async Task TestExportOutputsAreActuallyCorrect()
