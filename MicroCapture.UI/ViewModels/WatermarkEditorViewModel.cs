@@ -264,6 +264,9 @@ public partial class WatermarkEditorViewModel : ViewModelBase
 
             await _dbContext.SaveChangesAsync();
             Result = preset;
+            // The preview holds a downscaled copy of the sample page; drop it rather than
+            // keeping it alive for the rest of the session.
+            WatermarkPreviewRenderer.ClearSampleCache();
             Saved?.Invoke(this, EventArgs.Empty);
         }
         catch (Exception ex)
@@ -276,6 +279,7 @@ public partial class WatermarkEditorViewModel : ViewModelBase
     private void Cancel()
     {
         Result = null;
+        WatermarkPreviewRenderer.ClearSampleCache();
         Cancelled?.Invoke(this, EventArgs.Empty);
     }
 }

@@ -70,17 +70,17 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private IEnumerable<string> BatchSearchRoots() => _preferences.EffectiveSearchRoots();
 
-    /// <summary>Where this batch's captures are written. Inside the batch folder once it has one,
-    /// which is what makes the batch self-contained and therefore portable; otherwise the
-    /// project's flat output directory, as batches behaved before batch folders existed.
+    /// <summary>Where this batch's captures are written: the batch folder's own temp/, once it
+    /// has one. The full-resolution original is working material — Crop Review re-crops from it
+    /// and it is deleted once the batch is exported — so temp/ is exactly what it is, and the
+    /// folder ends up empty after finalizing. The processed derivative goes to the sibling
+    /// output/ instead; see ProcessedFilePaths.OutputDirectoryFor, which owns that split.
     ///
-    /// <para>Originals and their processed derivatives deliberately share a directory — see
-    /// ProcessedFilePaths, which derives the output directory from the original's own path — so
-    /// pointing captures here places both inside the batch folder without changing the
-    /// pipeline.</para></summary>
+    /// <para>Falls back to the project's flat output directory for a batch predating batch
+    /// folders, which behaves exactly as before.</para></summary>
     private string CaptureDirectory => string.IsNullOrWhiteSpace(_currentBatchFolder)
         ? _outputDirectory
-        : BatchFolder.OutputPath(_currentBatchFolder);
+        : BatchFolder.TempPath(_currentBatchFolder);
 
     /// <summary>Where a page's cart thumbnail lives — the batch folder's own thumbnails/ once it
     /// has one, so thumbnails travel with the batch and the cart renders on another machine
@@ -1748,7 +1748,14 @@ public partial class MainWindowViewModel : ViewModelBase
         // itself now polls (see FinalizeBatchViewModel's _refreshTimer) and shows the same
         // "still processing" state live, updating the moment pages complete — so it's always
         // safe to open, even with nothing completed yet.
-        var result = await MicroCapture.UI.Views.FinalizeBatchDialog.RunAsync(owner, _dbContext, batch, _outputDirectory);
+        // The batch's own folder, not the project's flat output directory — that's where the
+        // operator chose to put this batch at New Batch time, so it's where they expect its
+        // finished output to land. Falls back to the project directory only for a batch that
+        // predates batch folders.
+        var finalizeDirectory = !string.IsNullOrWhiteSpace(_currentBatchFolder)
+            ? BatchFolder.OutputPath(_currentBatchFolder)
+            : _outputDirectory;
+        var result = await MicroCapture.UI.Views.FinalizeBatchDialog.RunAsync(owner, _dbContext, batch, finalizeDirectory);
         if (result == null) return;
 
         StatusText = result.MissingOcrText

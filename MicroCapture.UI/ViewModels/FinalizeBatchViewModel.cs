@@ -63,8 +63,21 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     [ObservableProperty] private bool _watermarkEnabled;
     [ObservableProperty] private WatermarkPreset? _selectedWatermarkPreset;
 
-    public bool IsPdfFormat => SelectedFormat == "PDF";
-    partial void OnSelectedFormatChanged(string value) => OnPropertyChanged(nameof(IsPdfFormat));
+    // Every PDF-producing format, not the literal string "PDF" — otherwise "Searchable PDF" and
+    // "PDF/A" hid the very OCR option that defines them.
+    public bool IsPdfFormat =>
+        MicroCapture.Processing.ExportFormat.Resolve(SelectedFormat)?.Kind == MicroCapture.Processing.ExportKind.Pdf;
+
+    /// <summary>Whether a watermark can be burned into this format. Everything that produces an
+    /// image or a PDF can carry one; only the text-only export can't.</summary>
+    public bool SupportsWatermark =>
+        MicroCapture.Processing.ExportFormat.Resolve(SelectedFormat)?.Kind != MicroCapture.Processing.ExportKind.TextOnly;
+
+    partial void OnSelectedFormatChanged(string value)
+    {
+        OnPropertyChanged(nameof(IsPdfFormat));
+        OnPropertyChanged(nameof(SupportsWatermark));
+    }
 
     // Unlike MainWindowViewModel's PersistBatchSettingAsync (immediate persistence during a
     // live capture session, since the setting must take effect for the very next shutter
@@ -206,7 +219,11 @@ public partial class FinalizeBatchViewModel : ViewModelBase
             Bitmap? thumb = null;
             try
             {
-                var thumbPath = ThumbnailPaths.FileFor(_defaultOutputDirectory, _batch.BatchCode, job.PageNumber);
+                // Thumbnails live inside the batch folder once a batch has one, so they travel
+                // with it; only a batch predating batch folders still uses the project layout.
+                var thumbPath = !string.IsNullOrWhiteSpace(_batch.FolderPath)
+                    ? Path.Combine(MicroCapture.Core.Models.BatchFolder.ThumbnailsPath(_batch.FolderPath!), $"{job.PageNumber:D6}.png")
+                    : ThumbnailPaths.FileFor(_defaultOutputDirectory, _batch.BatchCode, job.PageNumber);
                 if (File.Exists(thumbPath))
                     thumb = new Bitmap(thumbPath);
             }

@@ -108,6 +108,13 @@ public class BatchExportService
                 Producer = "MicroCapture",
                 Creation = DateTime.Now,
                 Modified = DateTime.Now,
+                // MUST be set explicitly. SKDocumentPdfMetadata.Default carries 101 (>100 means
+                // store images losslessly), but a freshly constructed instance defaults this to
+                // 0 — maximum JPEG compression. Passing a metadata object at all therefore
+                // silently swapped lossless pages for heavily degraded ones: a 7MB source page
+                // came out around 295KB. Archival scans must not be re-compressed on the way
+                // into the PDF.
+                EncodingQuality = 101,
                 // PDF/A requires the text layer to be genuinely searchable and the document
                 // tagged; PdfA also makes Skia embed the fonts it draws with, which is the part
                 // an image-only scan plus an invisible OCR layer would otherwise fail on.
@@ -168,9 +175,14 @@ public class BatchExportService
                     var isJpeg = targetExt == ".jpg";
                     var isPng = targetExt == ".png";
 
+                    // Composited once per page and reused by whichever writer runs below. Null
+                    // when the batch has no watermark, which keeps the untouched fast paths
+                    // (notably the byte-for-byte TIFF copy) available.
+                    using var watermarked = RenderWatermarked(f, batch);
+
                     if (isJpeg || isPng)
                     {
-                        using var bitmap = DecodeImage(f);
+                        using var bitmap = watermarked ?? DecodeImage(f);
                         if (bitmap != null)
                         {
                             using var img = SKImage.FromBitmap(bitmap);
@@ -189,6 +201,16 @@ public class BatchExportService
                     }
                     else if (targetExt is ".jp2" or ".bmp")
                     {
+                        if (watermarked != null)
+                        {
+                            if (!WriteWatermarkedWithOpenCv(watermarked, targetPath))
+                                throw new IOException($"Could not write watermarked {exportFormat.Name} export: {targetPath}");
+                            if (!File.Exists(targetPath) || new FileInfo(targetPath).Length == 0)
+                                throw new IOException($"Export output was not created: {targetPath}");
+                            pageIndex++;
+                            continue;
+                        }
+
                         // OpenCV owns both of these. Neither carries a DPI field the way TIFF and
                         // JPEG do — BMP's header pixels-per-metre is widely ignored, and JPEG 2000
                         // resolution boxes aren't written by OpenCV — so unlike the paths above
@@ -200,6 +222,14 @@ public class BatchExportService
                             throw new IOException(
                                 $"Could not write {exportFormat.Name} export: {targetPath}. " +
                                 "This build of OpenCV may not include that encoder.");
+                    }
+                    else if (watermarked != null)
+                    {
+                        // A watermarked TIFF has to be re-encoded rather than copied — the point
+                        // of the copy below is preserving the source bytes, which no longer
+                        // represent what should be exported once a mark is burned in.
+                        if (!WriteWatermarkedWithOpenCv(watermarked, targetPath))
+                            throw new IOException($"Could not write watermarked TIFF export: {targetPath}");
                     }
                     else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff"
                              && exportFormat.Compression != "None")
@@ -236,6 +266,48 @@ public class BatchExportService
         }
     }
 
+    /// <summary>Burns the batch's watermark into a decoded page, returning the composited image.
+    ///
+    /// <para>The watermark used to reach PDF exports only, because PDF was the first format it
+    /// was built for — so a batch exported as TIFF or JPEG came out unmarked with no indication
+    /// anything had been skipped. Since a watermark is usually there for provenance or ownership,
+    /// silently dropping it from some formats is worse than not offering it at all.</para>
+    ///
+    /// <para>Returns null when there is nothing to draw, so callers can use the original file
+    /// untouched (and keep byte-for-byte TIFF copying, which is what preserves bitonal encoding)
+    /// rather than needlessly decoding and re-encoding every page.</para></summary>
+    private static SKBitmap? RenderWatermarked(string sourcePath, Batch batch)
+    {
+        if (!batch.WatermarkEnabled || batch.WatermarkPreset == null) return null;
+
+        var bytes = ImageDecodeHelper.GetDisplayBytes(sourcePath);
+        if (bytes == null) return null;
+        using var source = SKBitmap.Decode(bytes);
+        if (source == null) return null;
+
+        var surface = new SKBitmap(source.Width, source.Height);
+        using (var canvas = new SKCanvas(surface))
+        {
+            canvas.DrawBitmap(source, 0, 0, SKSamplingOptions.Default);
+            WatermarkRenderer.Draw(canvas, source, batch.WatermarkPreset);
+            canvas.Flush();
+        }
+        return surface;
+    }
+
+    /// <summary>Writes a watermarked bitmap out through OpenCV, for the formats OpenCV owns.
+    ///
+    /// <para>Goes via a PNG round-trip rather than copying SKBitmap's raw buffer into a Mat.
+    /// Skia's in-memory channel order is platform-dependent (BGRA on some targets, RGBA on
+    /// others), and assuming one produced silently colour-swapped output — a red watermark came
+    /// out blue, and the mark looked absent to anything checking for red. PNG is lossless, so the
+    /// round-trip costs a little time at export and nothing in fidelity.</para></summary>
+    private static bool WriteWatermarkedWithOpenCv(SKBitmap bitmap, string targetPath)
+    {
+        using var mat = WatermarkedToMat(bitmap);
+        return !mat.Empty() && Cv2.ImWrite(targetPath, mat);
+    }
+
     /// <summary>Writes every page of the batch into one multi-page TIFF.
     ///
     /// <para>Uses LibTiff directly rather than OpenCV, which can only write a single image per
@@ -268,7 +340,7 @@ public class BatchExportService
             for (var i = 0; i < pages.Count; i++)
             {
                 var (job, file) = pages[i];
-                AppendTiffPage(output, file, job.Dpi, i, pages.Count);
+                AppendTiffPage(output, file, job.Dpi, i, pages.Count, batch);
             }
         }
 
@@ -285,9 +357,14 @@ public class BatchExportService
     }
 
     /// <summary>Appends one page to an open multi-page TIFF.</summary>
-    private static void AppendTiffPage(BitMiracle.LibTiff.Classic.Tiff output, string sourcePath, int dpi, int pageIndex, int pageCount)
+    private static void AppendTiffPage(BitMiracle.LibTiff.Classic.Tiff output, string sourcePath, int dpi, int pageIndex, int pageCount, Batch batch)
     {
-        using var image = Cv2.ImRead(sourcePath, ImreadModes.Unchanged);
+        // A watermarked page is composited to RGB first, so it takes the colour path below —
+        // a mark burned into a bitonal page could not survive 1-bit encoding anyway.
+        using var watermarked = RenderWatermarked(sourcePath, batch);
+        using var composited = watermarked != null ? WatermarkedToMat(watermarked) : null;
+        using var read = watermarked == null ? Cv2.ImRead(sourcePath, ImreadModes.Unchanged) : new Mat();
+        var image = composited ?? read;
         if (image.Empty()) throw new IOException($"Could not read page for export: {sourcePath}");
 
         // A genuinely bitonal source stays bitonal. Cv2.ImRead returns it as 8-bit with only 0
@@ -353,6 +430,17 @@ public class BatchExportService
         }
 
         output.WriteDirectory();
+    }
+
+    /// <summary>Converts a composited watermark bitmap into an OpenCV BGR mat, via a lossless PNG
+    /// round-trip so Skia's platform-dependent channel order can't swap the colours — see
+    /// <see cref="WriteWatermarkedWithOpenCv"/>.</summary>
+    private static Mat WatermarkedToMat(SKBitmap bitmap)
+    {
+        using var image = SKImage.FromBitmap(bitmap);
+        using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+        if (data == null) return new Mat();
+        return Cv2.ImDecode(data.ToArray(), ImreadModes.Color);
     }
 
     /// <summary>Whether a single-channel image contains only pure black and white, i.e. it is

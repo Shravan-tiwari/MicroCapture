@@ -16,8 +16,39 @@ namespace MicroCapture.Processing;
 /// exact same path.</summary>
 public static class ProcessedFilePaths
 {
-    public static string OutputDirectoryFor(string originalFilePath) =>
-        Path.GetDirectoryName(originalFilePath) ?? ".";
+    /// <summary>Where a job's processed derivative(s) are written.
+    ///
+    /// <para>A capture taken into a batch folder lands in that folder's <c>temp/</c>, because the
+    /// original is working material that is deleted once the batch is exported. Its processed
+    /// derivative is the actual deliverable, so it belongs in the sibling <c>output/</c> — which
+    /// is what leaves <c>temp/</c> empty after finalizing and <c>output/</c> holding the finished
+    /// pages.</para>
+    ///
+    /// <para>Anything outside that layout keeps the original behaviour of writing the derivative
+    /// beside its source, so batches predating batch folders are unaffected.</para></summary>
+    public static string OutputDirectoryFor(string originalFilePath)
+    {
+        var directory = Path.GetDirectoryName(originalFilePath);
+        if (string.IsNullOrEmpty(directory)) return ".";
+
+        if (string.Equals(Path.GetFileName(directory), TempFolderName, StringComparison.OrdinalIgnoreCase))
+        {
+            var batchFolder = Path.GetDirectoryName(directory);
+            if (!string.IsNullOrEmpty(batchFolder))
+            {
+                var output = Path.Combine(batchFolder, OutputFolderName);
+                if (Directory.Exists(output)) return output;
+            }
+        }
+
+        return directory;
+    }
+
+    // Kept in step with MicroCapture.Core.Models.BatchFolder, which owns the batch layout.
+    // Duplicated as literals rather than referenced because Processing does not depend on Core's
+    // model assembly for path naming.
+    private const string TempFolderName = "temp";
+    private const string OutputFolderName = "output";
 
     // Every legitimate suffix ImageProcessor can append to a job's own base name for a
     // processed derivative — see SinglePageOutputFileName / the split-page / fixed-frame /

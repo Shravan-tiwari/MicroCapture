@@ -63,8 +63,11 @@ TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
+TestPdfEncodingQuality();
+TestCapturesLiveInTempAndOutputsInOutput();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
+await TestWatermarkAndQualityAcrossFormats();
 TestMultipageTiffHasEveryPage();
 TestBatchLockIsAdvisory();
 await TestBatchAdoptedOnAnotherMachine();
@@ -997,6 +1000,114 @@ void TestBatchManifestSurvivesInterruptedWrite()
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
 }
 
+async Task TestWatermarkAndQualityAcrossFormats()
+{
+    Console.WriteLine("\n-- Watermark reaches every format, and no format silently degrades quality --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "wm.db");
+
+    void SeedPage()
+    {
+        var processed = Path.Combine(workDir, "page1.tif");
+        if (File.Exists(processed)) return;
+        using var mat = new OpenCvSharp.Mat(1200, 1600, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(255, 255, 255));
+        for (var line = 0; line < 30; line++)
+            OpenCvSharp.Cv2.PutText(mat, "the quick brown fox jumps over the lazy dog",
+                new OpenCvSharp.Point(20, 40 + line * 38), OpenCvSharp.HersheyFonts.HersheySimplex,
+                0.9, new OpenCvSharp.Scalar(0, 0, 0), 2);
+        OpenCvSharp.Cv2.ImWrite(processed, mat);
+        File.WriteAllText(Path.ChangeExtension(processed, ".txt"), "page text");
+    }
+
+    string batchId;
+    SeedPage();
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "WM", OutputDirectory = workDir };
+        db.Projects.Add(project);
+        // A large, opaque, centred mark so its presence is unmistakable in the output pixels.
+        var preset = new WatermarkPreset
+        {
+            Name = "Test", WatermarkType = "Text", TextContent = "CONFIDENTIAL",
+            TextColor = "#FF0000", Opacity = 1.0, FontSize = 120,
+            X = 0.05, Y = 0.35, Width = 0.9, Height = 0.3
+        };
+        db.WatermarkPresets.Add(preset);
+        var batch = new Batch
+        {
+            ProjectId = project.Id, BatchCode = "WM-1", Name = "WM-1", Dpi = 300,
+            WatermarkEnabled = true, WatermarkPresetId = preset.Id
+        };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+        db.CaptureJobs.Add(new CaptureJob
+        {
+            BatchId = batch.Id, PageNumber = 1, ProcessingStatus = "Completed",
+            OriginalFilePath = Path.Combine(workDir, "page1.tif"),
+            ProcessedFilePath = Path.Combine(workDir, "page1.tif"), Dpi = 300
+        });
+        db.SaveChanges();
+    }
+
+    var sourceKb = new FileInfo(Path.Combine(workDir, "page1.tif")).Length / 1024.0;
+
+    foreach (var format in MicroCapture.Processing.ExportFormat.SelectableNames)
+    {
+        var fmt = MicroCapture.Processing.ExportFormat.Resolve(format)!;
+        if (fmt.Kind == MicroCapture.Processing.ExportKind.TextOnly) continue;
+
+        var destination = Path.Combine(workDir, "o_" + new string(format.Where(char.IsLetterOrDigit).ToArray()));
+        Directory.CreateDirectory(destination);
+        SeedPage();
+
+        using var db = new AppDbContext(dbPath);
+        foreach (var job in db.CaptureJobs.Where(j => j.BatchId == batchId)) job.ExportStatus = "Pending";
+        db.Batches.First(b => b.Id == batchId).Status = "Active";
+        db.SaveChanges();
+
+        string resultPath = string.Empty;
+        await RunPumped(async () =>
+            resultPath = await new BatchExportService(db).ExportBatchAsync(batchId, destination, format),
+            timeoutMs: 60000);
+
+        var files = Directory.Exists(resultPath)
+            ? Directory.GetFiles(resultPath, "*", SearchOption.AllDirectories)
+            : new[] { resultPath };
+        var page = files.FirstOrDefault(f => Path.GetExtension(f) != ".txt");
+        if (page == null) { Check($"'{format}' produced a page", false); continue; }
+
+        var kb = new FileInfo(page).Length / 1024.0;
+
+        if (fmt.Kind == MicroCapture.Processing.ExportKind.Pdf)
+        {
+            // A lossless page cannot be a small fraction of its source. This is what caught the
+            // regression where constructing SKDocumentPdfMetadata defaulted EncodingQuality to 0.
+            Check($"'{format}' keeps image quality (>=20% of the {sourceKb:F0}KB source, got {kb:F0}KB)",
+                kb >= sourceKb * 0.20);
+        }
+        else
+        {
+            // Red is only present because the watermark drew it — the page itself is black text
+            // on white, so any red pixel proves the mark was burned in.
+            using var img = OpenCvSharp.Cv2.ImRead(page, OpenCvSharp.ImreadModes.Color);
+            var hasRed = false;
+            if (!img.Empty())
+            {
+                using var channels = new OpenCvSharp.Mat();
+                var planes = OpenCvSharp.Cv2.Split(img);
+                using var redOnly = new OpenCvSharp.Mat();
+                OpenCvSharp.Cv2.Subtract(planes[2], planes[1], redOnly);
+                OpenCvSharp.Cv2.MinMaxLoc(redOnly, out _, out double maxRed);
+                hasRed = maxRed > 80;
+                foreach (var pl in planes) pl.Dispose();
+            }
+            Check($"'{format}' has the watermark burned in", hasRed);
+        }
+        Console.WriteLine($"  [size] {format,-18} {kb,9:F1} KB (source {sourceKb:F0} KB)");
+    }
+}
+
 async Task TestEveryExportFormatProducesOutput()
 {
     Console.WriteLine("\n-- Every offered export format actually produces a valid file --");
@@ -1011,9 +1122,17 @@ async Task TestEveryExportFormatProducesOutput()
             var processed = Path.Combine(workDir, $"page{page}.tif");
             if (!File.Exists(processed))
             {
-                using var mat = new OpenCvSharp.Mat(200, 150, OpenCvSharp.MatType.CV_8UC3,
-                    new OpenCvSharp.Scalar(40 * page, 90, 200));
-                OpenCvSharp.Cv2.ImWrite(processed, mat);
+                // Detailed, capture-sized content: a flat colour block compresses to almost
+                // nothing in every format, which would hide exactly the quality differences
+                // this is meant to measure.
+                using var mat = new OpenCvSharp.Mat(1200, 1600, OpenCvSharp.MatType.CV_8UC3);
+                OpenCvSharp.Cv2.Randu(mat, new OpenCvSharp.Scalar(0, 0, 0), new OpenCvSharp.Scalar(255, 255, 255));
+                using var text = mat.Clone();
+                for (var line = 0; line < 40; line++)
+                    OpenCvSharp.Cv2.PutText(text, $"page {page} line {line} the quick brown fox",
+                        new OpenCvSharp.Point(20, 30 + line * 28), OpenCvSharp.HersheyFonts.HersheySimplex,
+                        0.8, new OpenCvSharp.Scalar(0, 0, 0), 2);
+                OpenCvSharp.Cv2.ImWrite(processed, text);
             }
             var sidecar = Path.ChangeExtension(processed, ".txt");
             if (!File.Exists(sidecar)) File.WriteAllText(sidecar, $"text of page {page}");
@@ -1075,6 +1194,20 @@ async Task TestEveryExportFormatProducesOutput()
                 : File.Exists(resultPath) ? new[] { resultPath } : Array.Empty<string>();
             var nonEmpty = produced.Where(f => new FileInfo(f).Length > 0).ToArray();
             Check($"Export '{format}' produces a non-empty output", nonEmpty.Length > 0);
+
+            // Report size and pixel dimensions per page. A format that silently downsamples or
+            // over-compresses shows up here as a fraction of the others rather than as a failure.
+            foreach (var f in nonEmpty.Where(f => Path.GetExtension(f) is not (".txt")).Take(1))
+            {
+                var kb = new FileInfo(f).Length / 1024.0;
+                var dims = "n/a";
+                if (Path.GetExtension(f) is not ".pdf")
+                {
+                    using var probe = OpenCvSharp.Cv2.ImRead(f, OpenCvSharp.ImreadModes.Unchanged);
+                    dims = probe.Empty() ? "UNREADABLE" : $"{probe.Width}x{probe.Height}";
+                }
+                Console.WriteLine($"  [size] {format,-18} {kb,9:F1} KB  {dims}");
+            }
         }
         catch (Exception ex)
         {
@@ -1222,6 +1355,38 @@ async Task TestCartReorderKeepsRecapturesWithTheirPage()
         Check("Every page still has exactly one live capture", liveByPage.All(g => g.Count() == 1));
         Check("No page numbers collided after renumbering", liveByPage.Count == 3);
     }
+}
+
+void TestPdfEncodingQuality()
+{
+    Console.WriteLine("\n-- PDF image encoding quality --");
+    Console.WriteLine($"  [info] SKDocumentPdfMetadata.Default.EncodingQuality = {SkiaSharp.SKDocumentPdfMetadata.Default.EncodingQuality}");
+    Console.WriteLine($"  [info] new SKDocumentPdfMetadata().EncodingQuality    = {new SkiaSharp.SKDocumentPdfMetadata().EncodingQuality}");
+}
+
+void TestCapturesLiveInTempAndOutputsInOutput()
+{
+    Console.WriteLine("\n-- Originals go to temp/, derivatives to output/ --");
+    var batchFolder = Path.Combine(TempWorkDir(), "BATCH-1");
+    BatchFolder.EnsureLayout(batchFolder);
+
+    var original = Path.Combine(BatchFolder.TempPath(batchFolder), "cap_000001.jpg");
+    File.WriteAllText(original, "x");
+
+    // The derivative of a capture sitting in temp/ belongs in the sibling output/, which is what
+    // leaves temp/ empty once originals are cleaned up at finalize.
+    var derived = ProcessedFilePaths.OutputDirectoryFor(original);
+    Check("A capture in temp/ writes its derivative to output/",
+        string.Equals(Path.GetFullPath(derived), Path.GetFullPath(BatchFolder.OutputPath(batchFolder)),
+            StringComparison.OrdinalIgnoreCase));
+
+    // Anything outside the batch layout keeps writing beside its source, so legacy batches are
+    // unaffected.
+    var loose = Path.Combine(TempWorkDir(), "loose.jpg");
+    File.WriteAllText(loose, "x");
+    Check("A capture outside a batch folder still writes beside itself",
+        string.Equals(Path.GetFullPath(ProcessedFilePaths.OutputDirectoryFor(loose)),
+            Path.GetFullPath(Path.GetDirectoryName(loose)!), StringComparison.OrdinalIgnoreCase));
 }
 
 void TestEncoderSupport()

@@ -65,9 +65,9 @@
                            Foreground="{StaticResource InkTertiaryBrush}"
                            IsVisible="{Binding HasOcrStatus}"/>
 
-                <StackPanel Spacing="6" IsVisible="{Binding IsPdfFormat}">
+                <StackPanel Spacing="6" IsVisible="{Binding SupportsWatermark}">
                     <CheckBox IsChecked="{Binding WatermarkEnabled}" Content="Watermark"
-                              ToolTip.Tip="Burns the selected watermark preset into every exported PDF page."
+                              ToolTip.Tip="Burns the selected watermark preset into every exported page, whichever format you choose."
                               Foreground="{StaticResource InkMutedBrush}"/>
                     <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding WatermarkEnabled}">
                         <ComboBox ItemsSource="{Binding WatermarkPresets}" SelectedItem="{Binding SelectedWatermarkPreset}" Width="160">
