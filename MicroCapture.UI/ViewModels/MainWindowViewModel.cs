@@ -1366,13 +1366,29 @@ public partial class MainWindowViewModel : ViewModelBase
                     FixedFrameImageWidth = stagedFrameCount > 0 ? FrameReferenceWidth : 0,
                     FixedFrameImageHeight = stagedFrameCount > 0 ? FrameReferenceHeight : 0
                 };
+
+                // Give it a real batch folder, the same as the New Batch dialog does. Without
+                // this the batch had no folder at all, so _currentBatchFolder kept pointing at
+                // whichever batch was open before — captures and thumbnails for the new batch
+                // landed inside the previous one's folder.
+                var startFolder = Path.Combine(project.OutputDirectory, batchCode);
+                BatchFolder.EnsureLayout(startFolder);
+                batch.FolderPath = startFolder;
+
                 _dbContext.Batches.Add(batch);
                 await _dbContext.SaveChangesAsync();
+
+                ReleaseCurrentBatchLock();
+                _currentBatchFolder = startFolder;
+                _batchLocks.Acquire(startFolder);
+                StartBatchLockHeartbeat();
 
                 _currentBatchId = batch.Id;
                 PageCount = 0;
                 RecentCaptures.Clear();
                 AreFrameEditsAllowed = true;
+                UpdateOpenBatchLabels(batch);
+                await _batchSync.PublishAsync(batch);
                 StatusText = stagedFrameCount > 0
                     ? $"Batch '{batchCode}' started with {stagedFrameCount} frame(s) for project '{projectCode}'"
                     : $"Batch '{batchCode}' started for project '{projectCode}'";

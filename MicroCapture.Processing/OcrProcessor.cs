@@ -77,7 +77,7 @@ public class OcrProcessor
             throw new FileNotFoundException($"Image file not found: {imagePath}");
         }
 
-        string txtFileName = Path.ChangeExtension(imagePath, ".txt");
+        string txtFileName = ProcessedFilePaths.OcrSidecarPath(imagePath, ".txt");
 
         // If the tesseract CLI is available, use it. This avoids loading native libs in-process which
         // have been observed to crash some runtimes.
@@ -262,7 +262,7 @@ public class OcrProcessor
                 // expects — best-effort: a missing/unparseable tsv just means DrawSearchText
                 // falls back to its old single-blob behavior for this page, not a hard failure.
                 var tempTsv = tempBase + ".tsv";
-                var tsvFileName = Path.ChangeExtension(imagePath, ".tsv");
+                var tsvFileName = ProcessedFilePaths.OcrSidecarPath(imagePath, ".tsv");
                 if (File.Exists(tempTsv))
                 {
                     try
@@ -286,7 +286,7 @@ public class OcrProcessor
                 }
 
                 // Fallback: if the default txt isn't present, try a base-name path near the image
-                var alt = Path.ChangeExtension(imagePath, ".txt");
+                var alt = ProcessedFilePaths.OcrSidecarPath(imagePath, ".txt");
                 if (File.Exists(alt)) return alt;
 
                 if (!allowManaged)

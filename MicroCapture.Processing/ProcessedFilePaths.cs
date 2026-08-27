@@ -44,6 +44,36 @@ public static class ProcessedFilePaths
         return directory;
     }
 
+    /// <summary>Where an OCR sidecar (.txt / .tsv) for a page lives.
+    ///
+    /// <para>Sidecars are intermediate: they exist so the searchable-PDF text layer can be placed
+    /// per word, and they are discarded once the batch is exported. They were written beside the
+    /// processed image, which put them in the batch's <c>output/</c> — the folder the operator
+    /// treats as the deliverable — so a finished batch was littered with two extra files per
+    /// page. They belong in <c>temp/</c> with the other working files, where the finalize sweep
+    /// already clears them.</para>
+    ///
+    /// <para>Falls back to sitting beside the image for any layout without a batch folder, which
+    /// is what pre-batch-folder batches and the standalone tools rely on.</para></summary>
+    public static string OcrSidecarPath(string imagePath, string extension)
+    {
+        var name = Path.GetFileNameWithoutExtension(imagePath) + extension;
+        var directory = Path.GetDirectoryName(imagePath);
+        if (string.IsNullOrEmpty(directory)) return name;
+
+        if (string.Equals(Path.GetFileName(directory), OutputFolderName, StringComparison.OrdinalIgnoreCase))
+        {
+            var batchFolder = Path.GetDirectoryName(directory);
+            if (!string.IsNullOrEmpty(batchFolder))
+            {
+                var temp = Path.Combine(batchFolder, TempFolderName);
+                if (Directory.Exists(temp)) return Path.Combine(temp, name);
+            }
+        }
+
+        return Path.Combine(directory, name);
+    }
+
     // Kept in step with MicroCapture.Core.Models.BatchFolder, which owns the batch layout.
     // Duplicated as literals rather than referenced because Processing does not depend on Core's
     // model assembly for path naming.

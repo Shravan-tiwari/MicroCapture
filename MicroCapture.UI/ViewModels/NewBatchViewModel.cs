@@ -41,7 +41,11 @@ public partial class NewBatchViewModel : ObservableObject
 
     public IReadOnlyList<string> AvailableCaptureFormats { get; } = new[] { "TIFF", "TIFF LZW", "JPEG", "PNG", "JPEG 2000", "BMP" };
 
-    public IReadOnlyList<string> AvailableExportFormats { get; } = new[] { "PDF", "PDF-Multipage", "Searchable PDF", "PDF/A", "TIFF-Multipage", "OCR Text" };
+    // Taken from the exporter so the batch's preferred format can be any format Finalize can
+    // actually produce. This used to list only the PDF-style outputs, so TIFF, JPEG, PNG,
+    // JPEG 2000 and BMP could never be a batch's default.
+    public IReadOnlyList<string> AvailableExportFormats { get; } =
+        MicroCapture.Processing.ExportFormat.SelectableNames;
 
     /// <summary>The folder the batch will be created in — the location the operator picked, with
     /// the batch code as its own subfolder so several batches can share one parent.</summary>

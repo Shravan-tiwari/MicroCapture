@@ -52,7 +52,10 @@ public class BatchSyncService
         batch.BatchCode = manifest.BatchCode;
         batch.Name = manifest.BatchCode;
         batch.FolderPath = batchFolder;
-        batch.Status = manifest.Status == "Active" ? "Active" : manifest.Status;
+        // Opening a batch makes it workable again. The previous expression was a tautology that
+        // always kept the manifest's status, so reopening an exported batch left it labelled
+        // "Exported" while the operator captured new pages into it.
+        batch.Status = "Active";
         batch.StartTime = manifest.CreatedUtc;
 
         ApplySettings(batch, manifest.Settings);
@@ -125,10 +128,20 @@ public class BatchSyncService
 
             // Manifest paths are relative to the batch folder, so they resolve against wherever
             // it lives now — the whole reason a batch survives moving between drives and shares.
-            job.OriginalFilePath = BatchFolder.ToAbsolute(batchFolder, page.OriginalFile) ?? string.Empty;
-            job.ProcessedFilePath = page.ProcessedFiles.Count > 0
-                ? string.Join(";", page.ProcessedFiles.Select(p => BatchFolder.ToAbsolute(batchFolder, p)).Where(p => p != null))
-                : null;
+            // Only overwrite when the manifest actually carries a path. A manifest that lists a
+            // page without file references describes where the files are NOT, and blanking a
+            // working local path against it loses the only pointer this machine had to the image.
+            var resolvedOriginal = BatchFolder.ToAbsolute(batchFolder, page.OriginalFile);
+            if (!string.IsNullOrWhiteSpace(resolvedOriginal)) job.OriginalFilePath = resolvedOriginal!;
+
+            if (page.ProcessedFiles.Count > 0)
+            {
+                var resolved = page.ProcessedFiles
+                    .Select(p => BatchFolder.ToAbsolute(batchFolder, p))
+                    .Where(p => p != null)
+                    .ToList();
+                if (resolved.Count > 0) job.ProcessedFilePath = string.Join(";", resolved);
+            }
 
             if (page.Adjustments is { } adjustments)
             {
@@ -229,15 +242,43 @@ public class BatchSyncService
             : null
     };
 
-    /// <summary>Creates a manifest for a batch that predates batch folders, so it becomes portable
-    /// like any other. The folder is derived from the project's output directory, which is where
-    /// that batch's files already live — nothing is moved, only described.</summary>
+    /// <summary>Adopts a batch that predates batch folders, but ONLY when its files genuinely sit
+    /// inside the folder being claimed.
+    ///
+    /// <para>This used to claim <c>&lt;projectOutputDir&gt;/&lt;batchCode&gt;/</c> unconditionally and
+    /// publish a manifest for it. A legacy batch's images live flat in
+    /// <c>&lt;projectOutputDir&gt;/</c> itself — outside that new folder — and
+    /// <see cref="BatchFolder.ToRelative"/> refuses to record a path outside the batch folder, so
+    /// every page was written with no file references at all. Opening the batch a second time
+    /// then read that manifest back and blanked <c>OriginalFilePath</c> and
+    /// <c>ProcessedFilePath</c> on every job, breaking Crop Review, thumbnails and export for a
+    /// batch that had been perfectly intact.</para>
+    ///
+    /// <para>A legacy batch is therefore left alone: no folder, no manifest, and it keeps working
+    /// exactly as it did before batch folders existed. It gains portability only if its files
+    /// are actually moved into a batch folder, which is a deliberate migration rather than
+    /// something to do silently behind an operator opening a batch.</para></summary>
     public async Task<string?> BackfillLegacyBatchAsync(Batch batch, string projectOutputDirectory)
     {
         if (!string.IsNullOrWhiteSpace(batch.FolderPath)) return batch.FolderPath;
         if (string.IsNullOrWhiteSpace(projectOutputDirectory)) return null;
 
         var folder = Path.Combine(projectOutputDirectory, batch.BatchCode);
+        if (!Directory.Exists(folder)) return null;
+
+        // Only adopt if this batch's pages really are inside that folder. Anything else would
+        // produce a manifest that describes none of them.
+        var jobs = await _dbContext.CaptureJobs.AsNoTracking()
+            .Where(j => j.BatchId == batch.Id)
+            .ToListAsync();
+        var referenced = jobs
+            .SelectMany(j => new[] { j.OriginalFilePath, j.ProcessedFilePath })
+            .Where(pth => !string.IsNullOrWhiteSpace(pth))
+            .SelectMany(pth => pth!.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            .ToList();
+        if (referenced.Count > 0 && !referenced.Any(pth => BatchFolder.ToRelative(folder, pth) != null))
+            return null;
+
         BatchFolder.EnsureLayout(folder);
         batch.FolderPath = folder;
         await _dbContext.SaveChangesAsync();

@@ -160,7 +160,10 @@ public class BatchExportService
             string subDirName = string.IsNullOrWhiteSpace(customFileName)
                 ? $"{batchPrefix}_{normalizedFormat}_{DateTime.Now:yyyyMMdd_HHmmss}"
                 : SanitizeFileName(customFileName);
-            string exportDir = Path.Combine(outputDirectory, subDirName);
+            // Beside output/, not inside it. Writing the export into output/ left that folder
+            // holding both the processed pages and a renamed copy of every one of them, doubling
+            // the batch on disk and making "the deliverable folder" ambiguous.
+            string exportDir = Path.Combine(ExportParentDirectory(outputDirectory), subDirName);
             Directory.CreateDirectory(exportDir);
 
             int pageIndex = 1;
@@ -248,7 +251,16 @@ public class BatchExportService
                         // Non-TIFF processed source (e.g. the SkiaSharp fallback path's .jpg) —
                         // OpenCV writes a real TIFF rather than mislabelling a PNG.
                         using var image = Cv2.ImRead(f, ImreadModes.Unchanged);
-                        if (image.Empty() || !Cv2.ImWrite(targetPath, image))
+                        if (image.Empty())
+                            throw new IOException($"Could not read page for export: {f}");
+
+                        // Honour the chosen compression. This is the only place it can be applied
+                        // — previously it was read solely as a guard and never handed to a writer,
+                        // so "TIFF Uncompressed" produced an LZW file like every other TIFF.
+                        var tiffParams = exportFormat.Compression == "None"
+                            ? new[] { (int)ImwriteFlags.TiffCompression, 1 }   // 1 = no compression
+                            : new[] { (int)ImwriteFlags.TiffCompression, 5 };  // 5 = LZW
+                        if (!Cv2.ImWrite(targetPath, image, tiffParams))
                             throw new IOException($"Could not write TIFF export: {targetPath}");
                     }
                     if (!File.Exists(targetPath) || new FileInfo(targetPath).Length == 0)
@@ -480,7 +492,7 @@ public class BatchExportService
         {
             foreach (var file in GetProcessedFilesForJob(job))
             {
-                var sidecar = Path.ChangeExtension(file, ".txt");
+                var sidecar = ProcessedFilePaths.OcrSidecarPath(file, ".txt");
                 var text = File.Exists(sidecar) ? await File.ReadAllTextAsync(sidecar) : string.Empty;
                 if (!string.IsNullOrWhiteSpace(text)) pagesWithText++;
 
@@ -504,6 +516,20 @@ public class BatchExportService
         AttachOrUpdateJobs(jobsToExport);
         await _dbContext.SaveChangesAsync();
         return exportDir;
+    }
+
+    /// <summary>Where an export is written. When the destination is a batch's own output/ folder,
+    /// the export goes alongside it in the batch folder rather than nested inside — otherwise
+    /// output/ ends up containing a second copy of every page it already holds.</summary>
+    private static string ExportParentDirectory(string outputDirectory)
+    {
+        if (string.Equals(Path.GetFileName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar)), "output",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var parent = Path.GetDirectoryName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar));
+            if (!string.IsNullOrEmpty(parent)) return parent;
+        }
+        return outputDirectory;
     }
 
     /// <summary>Empties the batch's temp/ folder once its final output exists.
@@ -590,15 +616,23 @@ public class BatchExportService
             {
                 foreach (var ext in new[] { ".txt", ".tsv" })
                 {
-                    var sidecarPath = Path.ChangeExtension(processedFile, ext);
-                    try
+                    // Both the current temp/ location and the legacy beside-the-image one, so
+                    // sidecars written before they moved are still cleaned up.
+                    foreach (var sidecarPath in new[]
+                             {
+                                 ProcessedFilePaths.OcrSidecarPath(processedFile, ext),
+                                 Path.ChangeExtension(processedFile, ext)
+                             }.Distinct())
                     {
-                        if (File.Exists(sidecarPath))
-                            File.Delete(sidecarPath);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine($"Could not delete OCR sidecar '{sidecarPath}' after export: {ex.Message}");
+                        try
+                        {
+                            if (File.Exists(sidecarPath))
+                                File.Delete(sidecarPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"Could not delete OCR sidecar '{sidecarPath}' after export: {ex.Message}");
+                        }
                     }
                 }
             }
@@ -722,7 +756,7 @@ public class BatchExportService
         // don't"). BeginPage(bitmap.Width, bitmap.Height) means this canvas's coordinate space
         // is 1 unit = 1 pixel of the same decoded image OCR ran against, so tsv pixel
         // coordinates need no scaling.
-        var tsvPath = Path.ChangeExtension(imagePath, ".tsv");
+        var tsvPath = ProcessedFilePaths.OcrSidecarPath(imagePath, ".tsv");
         var words = OcrProcessor.ReadWordBoxes(tsvPath);
         if (words.Count > 0)
         {
@@ -741,7 +775,7 @@ public class BatchExportService
 
         // Fallback for a page with no tsv (OCR ran with an older build, or the tsv failed to
         // parse/persist) — old single-blob behavior, still searchable even if not clickable.
-        var textPath = Path.ChangeExtension(imagePath, ".txt");
+        var textPath = ProcessedFilePaths.OcrSidecarPath(imagePath, ".txt");
         if (!File.Exists(textPath)) return;
         var text = File.ReadAllText(textPath);
         if (string.IsNullOrWhiteSpace(text)) return;
