@@ -323,19 +323,53 @@
                 <!-- Batch action bar: appears only while at least one thumbnail is selected
                      (ctrl/shift-click). Kept inside the same fixed-height row as the filmstrip
                      itself, not a new row, so it doesn't grow/shrink the overall layout. -->
-                <Border Grid.Row="0" IsVisible="{Binding HasSelection}" Margin="0,0,0,6"
+                <Border Grid.Row="0" Margin="0,0,0,6"
                         Background="{StaticResource Surface2Brush}" CornerRadius="6" Padding="10,6">
-                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
-                        <TextBlock Text="{Binding SelectedCount, StringFormat='{}{0} selected'}"
-                                   Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="12"/>
-                        <Button Content="Apply Adjustments…" Command="{Binding ApplyAdjustmentsToSelectedCommand}" Classes="accentGhost"/>
-                        <Button Content="Delete Selected" Command="{Binding DeleteSelectedCommand}"
-                                CommandParameter="{Binding $parent[Window]}" Classes="iconDanger"/>
-                        <Button Content="Clear Selection" Click="OnClearSelectionClick" Classes="secondary"/>
-                    </StackPanel>
+                    <Grid ColumnDefinitions="Auto,*,Auto">
+                        <!-- Selection actions. Only shown when something is selected, so the bar
+                             never offers an action that would do nothing. -->
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center"
+                                    IsVisible="{Binding HasSelection}">
+                            <TextBlock Text="{Binding SelectedCount, StringFormat='{}{0} selected'}"
+                                       Foreground="{StaticResource InkBrush}" VerticalAlignment="Center"
+                                       FontSize="12" FontWeight="SemiBold"/>
+                            <Button Content="Adjust Selected…" Classes="accentGhost"
+                                    Command="{Binding ApplyAdjustmentsToSelectedCommand}"
+                                    CommandParameter="{Binding $parent[Window]}"
+                                    ToolTip.Tip="Set adjustments on one page and apply them to every selected page"/>
+                            <Button Content="Delete Selected" Command="{Binding DeleteSelectedCommand}"
+                                    CommandParameter="{Binding $parent[Window]}" Classes="iconDanger"/>
+                            <Button Content="Clear Selection" Click="OnClearSelectionClick" Classes="secondary"/>
+                        </StackPanel>
+
+                        <!-- Hint shown in place of the actions when nothing is selected, so the
+                             bar teaches the interaction instead of sitting empty. -->
+                        <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="12"
+                                   Foreground="{StaticResource InkTertiaryBrush}"
+                                   IsVisible="{Binding !HasSelection}"
+                                   Text="Click a page to adjust it · drag to reorder · ctrl-click to select several"/>
+
+                        <!-- Undo/redo apply to adjustments, which are reprocessed from the
+                             preserved original — so stepping back costs only the reprocessing
+                             time and never the image. -->
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <Button Classes="secondary" Content="↶ Undo"
+                                    Command="{Binding UndoAdjustmentCommand}"
+                                    ToolTip.Tip="{Binding UndoLabel}"/>
+                            <Button Classes="secondary" Content="↷ Redo"
+                                    Command="{Binding RedoAdjustmentCommand}"
+                                    ToolTip.Tip="{Binding RedoLabel}"/>
+                        </StackPanel>
+                    </Grid>
                 </Border>
 
-            <ScrollViewer Grid.Row="1" Name="FilmstripScroller" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <!-- AllowDrop belongs on the scroller, not the individual tiles. Avalonia hit-tests
+                 the topmost element, and each tile's Button covers its Grid completely — so with
+                 AllowDrop only on the Grid the drop was rejected before it could reach a target,
+                 which is why dragging appeared to do nothing. One drop zone over the whole strip
+                 also means a drop between two tiles still lands somewhere sensible. -->
+            <ScrollViewer Grid.Row="1" Name="FilmstripScroller" DragDrop.AllowDrop="True"
+                          HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -344,50 +378,60 @@
                     </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
-                            <!-- Drop lands on the tile, not the inner button: the button's own
-                                 click handling swallows pointer events, and the drop target needs
-                                 to cover the whole tile so a near-miss still reorders. -->
-                            <!-- Drop handlers are attached in code-behind (see MainWindow's
-                                 constructor): DragDrop's events are routed events, which Avalonia
-                                 doesn't let XAML bind as attributes. AllowDrop still has to be set
-                                 here, per item, or the tile never becomes a drop target. -->
-                            <Grid Classes="thumb" Width="100" DragDrop.AllowDrop="True">
-                                <Button Background="{StaticResource Surface2Brush}"
+                            <Grid Classes="thumb" Width="104" DragDrop.AllowDrop="True">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+
+                                <Button Classes="tile"
+                                        Background="{StaticResource Surface2Brush}"
                                         BorderBrush="{Binding BorderColor, TargetNullValue={StaticResource HairlineBrush}}"
-                                        BorderThickness="2" CornerRadius="8" Padding="6"
-                                        ToolTip.Tip="Click to open crop review — drag to reorder pages — ctrl/shift-click, or the circle in the corner, to select for batch actions"
+                                        BorderThickness="2" CornerRadius="8" Padding="6,6,6,5"
+                                        HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                                        ToolTip.Tip="Click to adjust this page · drag to reorder · ctrl-click to select"
                                         PointerPressed="OnThumbnailPointerPressed"
                                         PointerMoved="OnThumbnailPointerMoved"
                                         PointerReleased="OnThumbnailPointerReleased"
                                         Click="OnThumbnailClick"
                                         Tag="{Binding JobId}">
-                                    <StackPanel Spacing="6">
-                                        <Border CornerRadius="6" ClipToBounds="True" Background="{StaticResource Surface1Brush}">
-                                            <Image Source="{Binding Thumbnail}" Height="62" Stretch="Uniform" />
+                                    <StackPanel Spacing="5">
+                                        <Border CornerRadius="5" ClipToBounds="True" Background="{StaticResource Surface1Brush}">
+                                            <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform"/>
                                         </Border>
-                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="5">
+                                        <TextBlock Text="{Binding PageNumber, StringFormat='PAGE {0}'}"
+                                                   HorizontalAlignment="Center" FontSize="10" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource InkMutedBrush}"/>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="4">
                                             <Ellipse Width="6" Height="6" VerticalAlignment="Center"
                                                      Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
-                                            <TextBlock Text="{Binding PageNumber, StringFormat='P{0:D4}'}"
-                                                       Foreground="{StaticResource InkMutedBrush}" FontSize="11"/>
+                                            <TextBlock Text="{Binding Status}" FontSize="9.5"
+                                                       Foreground="{StaticResource InkSubtleBrush}"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="66"/>
                                         </StackPanel>
-                                        <TextBlock Text="{Binding Status}"
-                                                   Foreground="{StaticResource InkSubtleBrush}" FontSize="10"
-                                                   HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                                     </StackPanel>
                                 </Button>
-                                <Border IsVisible="{Binding IsSelected}" CornerRadius="8" BorderBrush="{StaticResource PrimaryHoverBrush}"
-                                        BorderThickness="3" IsHitTestVisible="False"/>
-                                <Button Width="20" Height="20" Padding="0" CornerRadius="10"
-                                        HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-4,-4,0,0"
-                                        Background="{Binding IsSelected, Converter={x:Static conv:BoolToSelectBrushConverter.Instance}}"
-                                        BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1.5"
-                                        ToolTip.Tip="Select for batch actions"
-                                        Click="OnThumbnailSelectClick"/>
-                                <Button Content="✕" Width="20" Height="20" Padding="0" FontSize="10" Classes="iconDanger"
-                                        HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-4,-4,0"
-                                        ToolTip.Tip="Delete this capture (excludes it from processing and export)"
-                                        Click="OnDeleteThumbnailClick" />
+
+                                <!-- Selection ring. Non-hit-testable so it never steals a click
+                                     from the tile underneath it. -->
+                                <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
+                                        BorderBrush="{StaticResource PrimaryHoverBrush}"
+                                        BorderThickness="2.5" IsHitTestVisible="False"/>
+
+                                <!-- Select and delete sit in a top strip that appears on hover, or
+                                     stays put while selected. They used to be two 20px circles
+                                     pinned outside the tile's corners on negative margins, which
+                                     overlapped the neighbouring tile and were easy to hit by
+                                     accident. Real labels and full-height targets are far harder
+                                     to mis-click. -->
+                                <Grid Classes="tileActions" VerticalAlignment="Top" ColumnDefinitions="Auto,*,Auto"
+                                      Margin="3,3,3,0">
+                                    <Button Grid.Column="0" Classes="tileAction" Click="OnThumbnailSelectClick"
+                                            ToolTip.Tip="Select this page for batch actions"
+                                            Content="{Binding IsSelected, Converter={x:Static conv:BoolToSelectGlyphConverter.Instance}}"/>
+                                    <Button Grid.Column="2" Classes="tileAction danger" Click="OnDeleteThumbnailClick"
+                                            ToolTip.Tip="Delete this page from the batch"
+                                            Content="✕"/>
+                                </Grid>
                             </Grid>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>

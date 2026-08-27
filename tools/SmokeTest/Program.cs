@@ -73,6 +73,7 @@ TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
+await TestCartAdjustmentUndoRedo();
 TestAutoCaptureWaitsForThePageTurnToFinish();
 await TestExportOutputsAreActuallyCorrect();
 TestMultipageTiffHasEveryPage();
@@ -1005,6 +1006,76 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+async Task TestCartAdjustmentUndoRedo()
+{
+    Console.WriteLine("\n-- Cart adjustments can be undone and redone --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "undo.db");
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "UNDO";
+    vm.BatchCode = "UNDO";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+    await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 1, timeoutMs: 30000);
+
+    var jobId = vm.RecentCaptures[0].JobId;
+
+    Check("Nothing to undo before any adjustment", !vm.CanUndoAdjustment);
+    Check("Nothing to redo before any adjustment", !vm.CanRedoAdjustment);
+
+    // Snapshot, change, record — the sequence OpenCropReview performs around a save.
+    var before = vm.CaptureAdjustmentSnapshots(new[] { jobId });
+    Check("A snapshot is captured for the page", before.Count == 1);
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var job = db.CaptureJobs.First(j => j.Id == jobId);
+        job.HasManualAdjustments = true;
+        job.Brightness = 0.5;
+        job.RotationDegrees = 90;
+        await db.SaveChangesAsync();
+    }
+    await RunPumped(() => vm.RecordAdjustmentEditAsync("page adjustment", new[] { jobId }, before), timeoutMs: 20000);
+
+    Check("The edit is now undoable", vm.CanUndoAdjustment);
+    Check("Undo names what it will undo", vm.UndoLabel.Contains("adjustment"));
+
+    await RunPumped(() => vm.UndoAdjustmentCommand.ExecuteAsync(null), timeoutMs: 20000);
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var job = verify.CaptureJobs.AsNoTracking().First(j => j.Id == jobId);
+        Check("Undo restores the previous brightness", Math.Abs(job.Brightness) < 0.001);
+        Check("Undo restores the previous rotation", job.RotationDegrees == 0);
+        Check("Undo re-queues the page for reprocessing", job.ProcessingStatus == "Pending");
+    }
+    Check("Undo makes the edit redoable", vm.CanRedoAdjustment);
+
+    await RunPumped(() => vm.RedoAdjustmentCommand.ExecuteAsync(null), timeoutMs: 20000);
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var job = verify.CaptureJobs.AsNoTracking().First(j => j.Id == jobId);
+        Check("Redo puts the adjustment back", Math.Abs(job.Brightness - 0.5) < 0.001 && job.RotationDegrees == 90);
+    }
+    Check("Redo empties the redo stack", !vm.CanRedoAdjustment);
+    Check("Redo leaves the edit undoable again", vm.CanUndoAdjustment);
+
+    // A fresh edit must discard the redo branch, as in any editor.
+    await RunPumped(() => vm.UndoAdjustmentCommand.ExecuteAsync(null), timeoutMs: 20000);
+    Check("Redo is available after undoing", vm.CanRedoAdjustment);
+    var before2 = vm.CaptureAdjustmentSnapshots(new[] { jobId });
+    using (var db = new AppDbContext(dbPath))
+    {
+        var job = db.CaptureJobs.First(j => j.Id == jobId);
+        job.Contrast = 0.3;
+        await db.SaveChangesAsync();
+    }
+    await RunPumped(() => vm.RecordAdjustmentEditAsync("page adjustment", new[] { jobId }, before2), timeoutMs: 20000);
+    Check("A new edit discards the redo branch", !vm.CanRedoAdjustment);
 }
 
 void TestAutoCaptureWaitsForThePageTurnToFinish()

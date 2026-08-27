@@ -150,6 +150,51 @@
     <Setter Property="Opacity" Value="1"/>
   </Style>
 
+  <!-- ───────────── Cart tile actions ─────────────
+       Select and delete used to be two 20px circles pinned outside the tile on negative margins,
+       overlapping the neighbouring tile and easy to hit by mistake. They now sit inside the tile
+       in a strip that fades in on hover, with real hit targets. The strip stays visible while a
+       page is selected, so the selection is legible without hovering every tile to find it. -->
+  <Style Selector="Grid.tileActions">
+    <Setter Property="Opacity" Value="0"/>
+    <Setter Property="Transitions">
+      <Transitions>
+        <DoubleTransition Property="Opacity" Duration="0:0:0.12"/>
+      </Transitions>
+    </Setter>
+  </Style>
+  <Style Selector="Grid.thumb:pointerover Grid.tileActions">
+    <Setter Property="Opacity" Value="1"/>
+  </Style>
+
+  <Style Selector="Button.tileAction">
+    <Setter Property="Width" Value="24"/>
+    <Setter Property="Height" Value="22"/>
+    <Setter Property="Padding" Value="0"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="CornerRadius" Value="5"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Background" Value="{StaticResource Surface1Brush}"/>
+    <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
+    <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+  </Style>
+  <Style Selector="Button.tileAction:pointerover">
+    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
+    <Setter Property="BorderBrush" Value="{StaticResource PrimaryHoverBrush}"/>
+  </Style>
+  <Style Selector="Button.tileAction.danger:pointerover">
+    <Setter Property="Background" Value="{StaticResource FailBrush}"/>
+    <Setter Property="BorderBrush" Value="{StaticResource FailBrush}"/>
+    <Setter Property="Foreground" Value="White"/>
+  </Style>
+
+  <!-- A selected page keeps its controls on screen rather than hiding them again on mouse-out. -->
+  <Style Selector="Grid.thumb Button.tile">
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+  </Style>
+
   <!-- Every button gets a visible focus ring for keyboard-first operation — the app leans on
        Space/R/A shortcuts already, but nothing previously showed which control had focus. -->
   <Style Selector="Button:focus-visible">

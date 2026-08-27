@@ -1010,6 +1010,166 @@ public partial class MainWindowViewModel : ViewModelBase
         catch { /* Diagnostics are best-effort. */ }
     }
 
+    // ---------- Adjustment history ----------
+
+    /// <summary>One page's adjustment stack, captured so a change can be undone.</summary>
+    private sealed record AdjustmentSnapshot(
+        string JobId, bool HasManualAdjustments, int RotationDegrees, bool FlipHorizontal,
+        bool FlipVertical, double Brightness, double Contrast, double Saturation,
+        double Sharpness, double WhiteBalance)
+    {
+        public static AdjustmentSnapshot From(CaptureJob job) => new(
+            job.Id, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal,
+            job.FlipVertical, job.Brightness, job.Contrast, job.Saturation,
+            job.Sharpness, job.WhiteBalance);
+
+        public void ApplyTo(CaptureJob job)
+        {
+            job.HasManualAdjustments = HasManualAdjustments;
+            job.RotationDegrees = RotationDegrees;
+            job.FlipHorizontal = FlipHorizontal;
+            job.FlipVertical = FlipVertical;
+            job.Brightness = Brightness;
+            job.Contrast = Contrast;
+            job.Saturation = Saturation;
+            job.Sharpness = Sharpness;
+            job.WhiteBalance = WhiteBalance;
+        }
+    }
+
+    /// <summary>One undoable adjustment change: what the affected pages looked like before, and
+    /// what they look like after. Both directions are stored because redo needs the "after" just
+    /// as much as undo needs the "before".</summary>
+    private sealed record AdjustmentEdit(string Description, List<AdjustmentSnapshot> Before, List<AdjustmentSnapshot> After);
+
+    private readonly List<AdjustmentEdit> _undoStack = new();
+    private readonly List<AdjustmentEdit> _redoStack = new();
+
+    [ObservableProperty] private string _undoLabel = "Undo";
+    [ObservableProperty] private string _redoLabel = "Redo";
+
+    public bool CanUndoAdjustment => _undoStack.Count > 0;
+    public bool CanRedoAdjustment => _redoStack.Count > 0;
+
+    private void RefreshHistoryState()
+    {
+        UndoLabel = _undoStack.Count > 0 ? $"Undo {_undoStack[^1].Description}" : "Undo";
+        RedoLabel = _redoStack.Count > 0 ? $"Redo {_redoStack[^1].Description}" : "Redo";
+        OnPropertyChanged(nameof(CanUndoAdjustment));
+        OnPropertyChanged(nameof(CanRedoAdjustment));
+        UndoAdjustmentCommand.NotifyCanExecuteChanged();
+        RedoAdjustmentCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>Records an adjustment change so it can be undone. Called after the change has been
+    /// saved, with the snapshots taken before it.</summary>
+    public async Task RecordAdjustmentEditAsync(string description, IEnumerable<string> jobIds, List<object> beforeSnapshots)
+    {
+        var before = beforeSnapshots.OfType<AdjustmentSnapshot>().ToList();
+        if (before.Count == 0) return;
+        try
+        {
+            _dbContext.ChangeTracker.Clear();
+            var ids = jobIds.ToHashSet();
+            var after = await _dbContext.CaptureJobs.AsNoTracking()
+                .Where(j => ids.Contains(j.Id))
+                .Select(j => AdjustmentSnapshot.From(j))
+                .ToListAsync();
+
+            _undoStack.Add(new AdjustmentEdit(description, before, after));
+            // A new edit invalidates the redo branch, the same as any editor.
+            _redoStack.Clear();
+            RefreshHistoryState();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Could not record adjustment history: {ex}");
+        }
+    }
+
+    /// <summary>Captures the current adjustment state of the given pages, for the caller to hand
+    /// back to <see cref="RecordAdjustmentEditAsync"/> once its change has been saved.</summary>
+    public List<object> CaptureAdjustmentSnapshots(IEnumerable<string> jobIds)
+    {
+        try
+        {
+            var ids = jobIds.ToHashSet();
+            return _dbContext.CaptureJobs.AsNoTracking()
+                .Where(j => ids.Contains(j.Id))
+                .ToList()
+                .Select(j => (object)AdjustmentSnapshot.From(j))
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Could not snapshot adjustments: {ex}");
+            return new List<object>();
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanUndoAdjustment))]
+    private async Task UndoAdjustmentAsync()
+    {
+        if (_undoStack.Count == 0) return;
+        var edit = _undoStack[^1];
+        _undoStack.RemoveAt(_undoStack.Count - 1);
+        if (await ApplySnapshotsAsync(edit.Before, $"Undid {edit.Description}"))
+        {
+            _redoStack.Add(edit);
+        }
+        RefreshHistoryState();
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRedoAdjustment))]
+    private async Task RedoAdjustmentAsync()
+    {
+        if (_redoStack.Count == 0) return;
+        var edit = _redoStack[^1];
+        _redoStack.RemoveAt(_redoStack.Count - 1);
+        if (await ApplySnapshotsAsync(edit.After, $"Redid {edit.Description}"))
+        {
+            _undoStack.Add(edit);
+        }
+        RefreshHistoryState();
+    }
+
+    /// <summary>Restores a set of adjustment snapshots and re-queues those pages, which is the
+    /// same mechanism Crop Review uses to apply an edit — the page is reprocessed from its
+    /// preserved original, so undo costs nothing but the reprocessing time.</summary>
+    private async Task<bool> ApplySnapshotsAsync(List<AdjustmentSnapshot> snapshots, string statusMessage)
+    {
+        try
+        {
+            _dbContext.ChangeTracker.Clear();
+            var ids = snapshots.Select(s => s.JobId).ToHashSet();
+            var jobs = await _dbContext.CaptureJobs.Where(j => ids.Contains(j.Id)).ToListAsync();
+            var byId = snapshots.ToDictionary(s => s.JobId);
+
+            foreach (var job in jobs)
+            {
+                if (!byId.TryGetValue(job.Id, out var snapshot)) continue;
+                snapshot.ApplyTo(job);
+                job.ProcessingStatus = "Pending";
+                job.QcStatus = "Pending";
+                job.OcrStatus = "Pending";
+                job.ExportStatus = "Pending";
+            }
+            await _dbContext.SaveChangesAsync();
+
+            foreach (var thumbnail in RecentCaptures.Where(t => ids.Contains(t.JobId)))
+                thumbnail.Status = "Reprocessing…";
+
+            await PublishManifestAsync();
+            StatusText = $"{statusMessage} — {jobs.Count} page(s) reprocessing.";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not change adjustments: {ex.Message}";
+            return false;
+        }
+    }
+
     // ---------- Commands ----------
 
     [RelayCommand]
@@ -1917,10 +2077,28 @@ public partial class MainWindowViewModel : ViewModelBase
     /// single-page adjust UI (with its live preview) to define the values, rather than a second
     /// "pick values blind" surface.</summary>
     [RelayCommand]
-    private void ApplyAdjustmentsToSelected()
+    private async Task ApplyAdjustmentsToSelectedAsync(Avalonia.Controls.Window? owner)
     {
         var selectedIds = RecentCaptures.Where(t => t.IsSelected).Select(t => t.JobId).Distinct().ToList();
-        if (selectedIds.Count == 0) return;
+        if (selectedIds.Count == 0)
+        {
+            StatusText = "Select the pages you want to adjust first.";
+            return;
+        }
+
+        // Applying one page's settings across a selection overwrites whatever adjustments those
+        // pages already had, and reprocesses every one of them. That is a lot to set in motion
+        // from a single click, so say what will happen and to how many pages.
+        if (owner != null)
+        {
+            var proceed = await MicroCapture.UI.Views.ConfirmDialog.AskAsync(owner,
+                $"Adjustments you make will be applied to all {selectedIds.Count} selected page(s), " +
+                "replacing any adjustments they already have. Every one of them will be reprocessed.\n\n" +
+                "You can undo this afterwards from the cart.",
+                "Adjust selected pages");
+            if (!proceed) return;
+        }
+
         OpenCropReview(selectedIds[0], selectionForBulkApply: selectedIds, openInAdjustMode: true);
     }
 
@@ -1968,8 +2146,22 @@ public partial class MainWindowViewModel : ViewModelBase
         // This window only ever offers Adjust mode now (manual crop-quad/split-line/dewarp-curve
         // editing removed), so openInAdjustMode no longer needs to do anything here.
         var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
+
+        // Snapshot before the operator can change anything, so an edit can be undone from the
+        // cart. Covers the bulk selection too, since applying to a selection is precisely the
+        // change most worth being able to take back.
+        // Taken synchronously and before the window opens. Doing it on a background task raced
+        // the operator: a quick save could land before the snapshot existed, and the edit would
+        // silently record nothing to undo. It is a small local query against pages already in
+        // memory, so there is nothing to gain by deferring it.
+        var affectedIds = (selectionForBulkApply ?? new[] { jobId }).Distinct().ToList();
+        var beforeEdit = CaptureAdjustmentSnapshots(affectedIds);
+
         cropReviewViewModel.Saved += (_, _) =>
         {
+            var description = affectedIds.Count > 1 ? $"adjustments on {affectedIds.Count} pages" : "page adjustment";
+            _ = RecordAdjustmentEditAsync(description, affectedIds, beforeEdit);
+
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
             if (thumbnail != null)
             {

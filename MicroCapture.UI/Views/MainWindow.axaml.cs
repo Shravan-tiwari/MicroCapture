@@ -283,6 +283,15 @@ public partial class MainWindow : Window
             if (sender is Button btn && btn.DataContext is MicroCapture.UI.ViewModels.ThumbnailItem item
                 && DataContext is MicroCapture.UI.ViewModels.MainWindowViewModel vm)
             {
+                // Deleting a page removes it from the batch and from every export. It sits one
+                // click away on a small target next to the thumbnail, so it has to ask first —
+                // and unlike an adjustment, this one cannot be undone.
+                var confirmed = await ConfirmDialog.AskAsync(this,
+                    $"Delete page {item.PageNumber} from this batch?\n\n" +
+                    "It will be removed from the cart and from any export. This can't be undone.",
+                    "Delete page");
+                if (!confirmed) return;
+
                 await vm.DeleteCaptureAsync(item);
             }
         }
