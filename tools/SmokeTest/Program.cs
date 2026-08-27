@@ -72,6 +72,7 @@ TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
+await TestExportOutputsAreActuallyCorrect();
 TestMultipageTiffHasEveryPage();
 TestBatchLockIsAdvisory();
 await TestBatchAdoptedOnAnotherMachine();
@@ -1002,6 +1003,155 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+async Task TestExportOutputsAreActuallyCorrect()
+{
+    Console.WriteLine("\n-- Export outputs contain the right pages, not just a non-empty file --");
+    var root = TempWorkDir();
+    var dbPath = Path.Combine(root, "verify.db");
+    // A real batch folder, because that is what the app creates — it changes where captures,
+    // derivatives, OCR sidecars and the export itself are written, and none of that is exercised
+    // by a batch with no folder.
+    var batchFolder = Path.Combine(root, "VER-1");
+    BatchFolder.EnsureLayout(batchFolder);
+    const int pageCount = 3;
+    const int srcW = 900, srcH = 600;
+
+    // Three visually DISTINCT pages, so "all pages present" can't pass by duplicating one.
+    var markers = new[] { 40, 130, 220 };
+    void Seed()
+    {
+        for (var i = 0; i < pageCount; i++)
+        {
+            // Exactly where the app puts them: derivatives in output/, originals in temp/.
+            var processed = Path.Combine(BatchFolder.OutputPath(batchFolder), $"page{i + 1}.tif");
+            var original = Path.Combine(BatchFolder.TempPath(batchFolder), $"page{i + 1}.jpg");
+            if (!File.Exists(processed))
+            {
+                using var mat = new OpenCvSharp.Mat(srcH, srcW, OpenCvSharp.MatType.CV_8UC3,
+                    new OpenCvSharp.Scalar(markers[i], markers[i], markers[i]));
+                OpenCvSharp.Cv2.PutText(mat, $"PAGE {i + 1}", new OpenCvSharp.Point(40, 300),
+                    OpenCvSharp.HersheyFonts.HersheySimplex, 3.0, new OpenCvSharp.Scalar(255, 255, 255), 6);
+                OpenCvSharp.Cv2.ImWrite(processed, mat);
+            }
+            if (!File.Exists(original)) File.WriteAllText(original, "original");
+            var sidecar = ProcessedFilePaths.OcrSidecarPath(processed, ".txt");
+            if (!File.Exists(sidecar)) File.WriteAllText(sidecar, $"text of page {i + 1}");
+        }
+    }
+
+    string batchId;
+    Seed();
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "VER", OutputDirectory = root };
+        db.Projects.Add(project);
+        var batch = new Batch { ProjectId = project.Id, BatchCode = "VER-1", Name = "VER-1", Dpi = 300,
+            FolderPath = batchFolder };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+        for (var i = 0; i < pageCount; i++)
+            db.CaptureJobs.Add(new CaptureJob
+            {
+                BatchId = batch.Id, PageNumber = i + 1, ProcessingStatus = "Completed",
+                OriginalFilePath = Path.Combine(BatchFolder.TempPath(batchFolder), $"page{i + 1}.jpg"),
+                ProcessedFilePath = Path.Combine(BatchFolder.OutputPath(batchFolder), $"page{i + 1}.tif"), Dpi = 300
+            });
+        db.SaveChanges();
+    }
+
+    foreach (var format in MicroCapture.Processing.ExportFormat.SelectableNames)
+    {
+        var fmt = MicroCapture.Processing.ExportFormat.Resolve(format)!;
+        var dest = Path.Combine(root, "o_" + new string(format.Where(char.IsLetterOrDigit).ToArray()));
+        Directory.CreateDirectory(dest);
+        Seed();
+
+        using var db = new AppDbContext(dbPath);
+        foreach (var j in db.CaptureJobs.Where(j => j.BatchId == batchId)) j.ExportStatus = "Pending";
+        db.Batches.First(b => b.Id == batchId).Status = "Active";
+        db.SaveChanges();
+
+        string result = string.Empty;
+        try
+        {
+            // orderedJobIds is how the Finalize dialog exports — it passes the page list the
+            // operator sees, in that order. Exporting without it skips that whole path.
+            var ordered = db.CaptureJobs.Where(j => j.BatchId == batchId)
+                .OrderBy(j => j.PageNumber).Select(j => j.Id).ToList();
+            await RunPumped(async () => result = await new BatchExportService(db).ExportBatchAsync(
+                batchId, dest, format, orderedJobIds: ordered), timeoutMs: 90000);
+        }
+        catch (Exception ex)
+        {
+            Check($"[{format}] exports without throwing ({ex.GetType().Name}: {ex.Message})", false);
+            continue;
+        }
+
+        switch (fmt.Kind)
+        {
+            case MicroCapture.Processing.ExportKind.Pdf:
+            {
+                var pdf = File.Exists(result) ? result : Directory.GetFiles(dest, "*.pdf").FirstOrDefault();
+                if (pdf == null) { Check($"[{format}] produced a PDF", false); break; }
+                var bytes = File.ReadAllBytes(pdf);
+                var text = System.Text.Encoding.Latin1.GetString(bytes);
+                // Count page objects — a PDF that dropped pages still "exists" and still opens.
+                var pages = System.Text.RegularExpressions.Regex.Matches(text, @"/Type\s*/Page[^s]").Count;
+                Check($"[{format}] PDF contains all {pageCount} pages (found {pages})", pages == pageCount);
+                Check($"[{format}] PDF embeds image data", text.Contains("/Image"));
+                if (fmt.EmbedsText)
+                    Check($"[{format}] PDF carries a font for the text layer", text.Contains("/Font"));
+                break;
+            }
+            case MicroCapture.Processing.ExportKind.MultipageTiff:
+            {
+                var tif = File.Exists(result) ? result : Directory.GetFiles(dest, "*.tif").FirstOrDefault();
+                if (tif == null) { Check($"[{format}] produced a TIFF", false); break; }
+                using var t = BitMiracle.LibTiff.Classic.Tiff.Open(tif, "r");
+                var n = 0; var dims = new List<string>();
+                if (t != null) { do { n++; dims.Add($"{t.GetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGEWIDTH)[0].ToInt()}x{t.GetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGELENGTH)[0].ToInt()}"); } while (t.ReadDirectory()); }
+                Check($"[{format}] holds all {pageCount} pages (found {n})", n == pageCount);
+                Check($"[{format}] pages keep their source size", dims.All(d => d == $"{srcW}x{srcH}"));
+                break;
+            }
+            case MicroCapture.Processing.ExportKind.TextOnly:
+            {
+                var txts = Directory.Exists(result) ? Directory.GetFiles(result, "*.txt") : Array.Empty<string>();
+                Check($"[{format}] wrote a file per page plus a combined one (found {txts.Length})", txts.Length == pageCount + 1);
+                var combined = txts.FirstOrDefault(f => f.Contains("AllPages"));
+                var body = combined != null ? File.ReadAllText(combined) : string.Empty;
+                Check($"[{format}] combined file holds every page's text",
+                    Enumerable.Range(1, pageCount).All(i => body.Contains($"text of page {i}")));
+                break;
+            }
+            default:
+            {
+                var files = Directory.Exists(result)
+                    ? Directory.GetFiles(result, "*" + fmt.Extension) : Array.Empty<string>();
+                Check($"[{format}] wrote one file per page (found {files.Length})", files.Length == pageCount);
+                var ok = true; var why = "";
+                foreach (var f in files.OrderBy(f => f))
+                {
+                    using var img = OpenCvSharp.Cv2.ImRead(f, OpenCvSharp.ImreadModes.Color);
+                    if (img.Empty()) { ok = false; why = $"{Path.GetFileName(f)} unreadable"; break; }
+                    if (img.Width != srcW || img.Height != srcH) { ok = false; why = $"{Path.GetFileName(f)} is {img.Width}x{img.Height}"; break; }
+                }
+                Check($"[{format}] pages are readable at source size{(ok ? "" : " — " + why)}", ok);
+
+                // Each output must be a DIFFERENT page, not the same one repeated.
+                var means = files.OrderBy(f => f).Select(f =>
+                {
+                    using var img = OpenCvSharp.Cv2.ImRead(f, OpenCvSharp.ImreadModes.Grayscale);
+                    return img.Empty() ? -1 : (int)Math.Round(OpenCvSharp.Cv2.Mean(img).Val0 / 10);
+                }).ToList();
+                Check($"[{format}] each file is a distinct page", means.Distinct().Count() == means.Count && means.Count > 0);
+                break;
+            }
+        }
+    }
 }
 
 async Task TestExportReportsProgressAndCanBeCancelled()
