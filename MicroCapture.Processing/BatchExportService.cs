@@ -148,7 +148,7 @@ public class BatchExportService
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
             DeleteOcrSidecars(jobsToExport);
-            ClearBatchTempFolder(batch);
+            ClearBatchTempFolder(batch, jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -260,7 +260,7 @@ public class BatchExportService
             batch.Status = "Exported";
             DeleteOriginals(jobsToExport);
             DeleteOcrSidecars(jobsToExport);
-            ClearBatchTempFolder(batch);
+            ClearBatchTempFolder(batch, jobsToExport);
             AttachOrUpdateBatch(batch);
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
@@ -352,7 +352,7 @@ public class BatchExportService
         batch.Status = "Exported";
         DeleteOriginals(jobsToExport);
         DeleteOcrSidecars(jobsToExport);
-        ClearBatchTempFolder(batch);
+        ClearBatchTempFolder(batch, jobsToExport);
         AttachOrUpdateBatch(batch);
         AttachOrUpdateJobs(jobsToExport);
         await _dbContext.SaveChangesAsync();
@@ -517,15 +517,33 @@ public class BatchExportService
     /// <para>Only ever touches temp/, never output/ or thumbnails/, and only for a batch that
     /// actually has a batch folder. Runs after the finished file has been written, so a failed
     /// export leaves every original in place.</para></summary>
-    private static void ClearBatchTempFolder(Batch batch)
+    private static void ClearBatchTempFolder(Batch batch, List<CaptureJob> exportedJobs)
     {
         if (string.IsNullOrWhiteSpace(batch.FolderPath)) return;
 
         var temp = Path.Combine(batch.FolderPath!, "temp");
         if (!Directory.Exists(temp)) return;
 
+        // A page that FAILED processing never appears in the Finalize dialog — that list is
+        // Completed-only — so the operator has no way to know it exists, and its capture in
+        // temp/ is the only copy there is. Deleting it here would silently destroy work that
+        // could still be reprocessed. Keep anything belonging to a job that wasn't exported.
+        var exportedIds = exportedJobs.Select(j => j.Id).ToHashSet();
+        var keep = batch.Captures?
+            .Where(j => !exportedIds.Contains(j.Id) && j.ProcessingStatus is not ("Completed" or "Superseded"))
+            .Select(j => j.OriginalFilePath)
+            .Where(pth => !string.IsNullOrWhiteSpace(pth))
+            .Select(Path.GetFullPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase)
+            ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var file in Directory.EnumerateFiles(temp, "*", SearchOption.AllDirectories))
         {
+            if (keep.Contains(Path.GetFullPath(file)))
+            {
+                Console.Error.WriteLine($"Keeping '{file}': its page did not finish processing and this is its only copy.");
+                continue;
+            }
             try { File.Delete(file); }
             catch (Exception ex)
             {
@@ -737,7 +755,12 @@ public class BatchExportService
         }
     }
 
-    private static bool IsExportableImage(string path) => Path.GetExtension(path).ToLowerInvariant() is ".tif" or ".tiff" or ".jpg" or ".jpeg" or ".png";
+    /// <summary>Extensions that count as a page when locating a job's processed output. Must
+    /// cover every format ImageProcessor can write, or a batch captured in a missing one falls
+    /// through to the original — and once export has deleted that, produces a PDF with pages
+    /// silently absent. JPEG 2000 and BMP were missed when they were added as capture formats.</summary>
+    private static bool IsExportableImage(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is ".tif" or ".tiff" or ".jpg" or ".jpeg" or ".png" or ".jp2" or ".bmp";
 
     /// <summary>Decodes an image file to an <see cref="SKBitmap"/> for PDF/JPG/PNG export.
     /// SkiaSharp's own decoder cannot read the TIFF files <see cref="ImageProcessor"/> writes,

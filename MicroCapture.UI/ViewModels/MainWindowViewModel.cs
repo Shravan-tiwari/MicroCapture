@@ -30,6 +30,36 @@ public partial class MainWindowViewModel : ViewModelBase
     private string? _currentBatchFolder;
     private readonly AppPreferences _preferences = AppPreferences.Load();
 
+    // Refreshes this machine's claim on the open batch. Without it the lock ages past
+    // BatchLockService.StaleAfter while the batch is still being worked, so a second workstation
+    // opening the same folder sees an abandoned lock and is never warned — which is the one
+    // situation the lock exists for.
+    private Avalonia.Threading.DispatcherTimer? _batchLockHeartbeat;
+
+    private void StartBatchLockHeartbeat()
+    {
+        _batchLockHeartbeat ??= new Avalonia.Threading.DispatcherTimer
+        {
+            Interval = BatchLockService.HeartbeatInterval
+        };
+        _batchLockHeartbeat.Tick -= OnBatchLockHeartbeat;
+        _batchLockHeartbeat.Tick += OnBatchLockHeartbeat;
+        _batchLockHeartbeat.Start();
+    }
+
+    private void OnBatchLockHeartbeat(object? sender, EventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(_currentBatchFolder)) _batchLocks.Heartbeat(_currentBatchFolder!);
+    }
+
+    /// <summary>Gives up this machine's claim on whichever batch is open, before opening another
+    /// or on shutdown. Leaving it held is what litters every batch folder with a stale lock.</summary>
+    private void ReleaseCurrentBatchLock()
+    {
+        if (string.IsNullOrWhiteSpace(_currentBatchFolder)) return;
+        _batchLocks.Release(_currentBatchFolder!);
+    }
+
     private string? LastBatchLocation
     {
         get => _preferences.LastBatchLocation;
@@ -133,12 +163,22 @@ public partial class MainWindowViewModel : ViewModelBase
             // Old page number -> every job on that page, retired attempts included.
             var byOldPage = jobs.GroupBy(j => j.PageNumber).ToDictionary(g => g.Key, g => g.ToList());
 
+            // The cart shows at most the last MaxCartLoad pages, so renumbering only what it
+            // holds would leave every page outside it on its old number — two jobs per number,
+            // colliding filenames, and the next capture overwriting an existing page. Build the
+            // full batch order instead: pages before the visible window keep their relative
+            // order, then the cart's order as the operator just arranged it.
+            var visiblePages = RecentCaptures.Select(t => t.PageNumber).ToHashSet();
+            var hiddenPagesInOrder = byOldPage.Keys.Where(p => !visiblePages.Contains(p)).OrderBy(p => p).ToList();
+            var fullOrder = hiddenPagesInOrder.Concat(RecentCaptures.Select(t => t.PageNumber)).ToList();
+
             var renames = new List<(string From, string To)>();
+            var newPageByOld = new Dictionary<int, int>();
             var newPage = 1;
-            foreach (var thumbnail in RecentCaptures)
+            foreach (var oldPage in fullOrder)
             {
-                var oldPage = thumbnail.PageNumber;
-                if (!byOldPage.TryGetValue(oldPage, out var pageJobs)) { newPage++; continue; }
+                if (!byOldPage.ContainsKey(oldPage)) continue;
+                newPageByOld[oldPage] = newPage;
 
                 if (oldPage != newPage)
                 {
@@ -146,16 +186,29 @@ public partial class MainWindowViewModel : ViewModelBase
                     var newThumb = ThumbnailFileFor(_activeBatchCode, newPage);
                     if (File.Exists(oldThumb)) renames.Add((oldThumb, newThumb));
                 }
-
-                foreach (var job in pageJobs) job.PageNumber = newPage;
-                thumbnail.PageNumber = newPage;
                 newPage++;
+            }
+
+            // Applied after the mapping is complete, so a page never reads a number another page
+            // has already overwritten.
+            foreach (var (oldPage, pageJobs) in byOldPage)
+            {
+                if (!newPageByOld.TryGetValue(oldPage, out var assigned)) continue;
+                foreach (var job in pageJobs) job.PageNumber = assigned;
+            }
+            foreach (var thumbnail in RecentCaptures)
+            {
+                if (newPageByOld.TryGetValue(thumbnail.PageNumber, out var assigned))
+                    thumbnail.PageNumber = assigned;
             }
 
             await _dbContext.SaveChangesAsync();
             MoveThumbnailFiles(renames);
 
-            PageCount = RecentCaptures.Count == 0 ? 0 : RecentCaptures.Max(t => t.PageNumber);
+            // Across the whole batch, not just the cart — otherwise a batch longer than the cart
+            // window reports a page count lower than pages that actually exist, and the next
+            // capture reuses a live page number.
+            PageCount = newPageByOld.Count == 0 ? 0 : newPageByOld.Values.Max();
             await PublishManifestAsync();
             StatusText = $"Moved page to position {to + 1}";
         }
@@ -389,6 +442,12 @@ public partial class MainWindowViewModel : ViewModelBase
     // Auto-capture state machine: fires the shutter automatically once a page has been
     // stable, in-focus, and different from whatever was last captured for
     // StableFramesRequired consecutive checks. See UpdateDocumentStatus.
+    // How many thumbnails the cart holds. The load window is larger than the live trim so
+    // reopening a batch shows more history than a long capture session accumulates; both are
+    // named here because a reorder has to know the cart may not cover the whole batch.
+    private const int MaxCartThumbnails = 200;
+    private const int MaxCartLoad = 200;
+
     private const int StableFramesRequired = 3; // ~1.5s at the existing 500ms check interval
     private const double LiveSharpnessThreshold = 40.0; // live-view frames are lower detail than a full capture, so a lower bar than the QC BlurThreshold (100)
     private const double StablePositionToleranceFraction = 0.03; // allowed drift between checks, as a fraction of frame size
@@ -1141,8 +1200,10 @@ public partial class MainWindowViewModel : ViewModelBase
             LastBatchLocation = settings.BatchLocation;
             RememberRecentBatchFolder(folder);
 
+            ReleaseCurrentBatchLock();
             _currentBatchFolder = folder;
             _batchLocks.Acquire(folder);
+            StartBatchLockHeartbeat();
             ProjectCode = projectCode;
             BatchCode = batchCode;
 
@@ -1190,8 +1251,10 @@ public partial class MainWindowViewModel : ViewModelBase
             var batch = await _batchSync.AdoptAsync(folder, validation.Manifest!);
 
             var missing = _manifests.FindMissingPageFiles(folder, validation.Manifest!);
+            ReleaseCurrentBatchLock();
             _currentBatchFolder = folder;
             _batchLocks.Acquire(folder);
+            StartBatchLockHeartbeat();
             RememberRecentBatchFolder(folder);
             LastBatchLocation = Path.GetDirectoryName(folder);
 
@@ -1376,7 +1439,7 @@ public partial class MainWindowViewModel : ViewModelBase
             .GroupBy(job => job.PageNumber)
             .Select(group => group.OrderByDescending(job => job.Timestamp).First())
             .OrderBy(job => job.PageNumber)
-            .TakeLast(200);
+            .TakeLast(MaxCartLoad);
 
         foreach (var job in latestPerPage)
         {
@@ -1569,6 +1632,11 @@ public partial class MainWindowViewModel : ViewModelBase
             _lastCapturedSignature = _lastDetectedSignature;
             _stableFrameCount = 0;
 
+            // Same reason capture publishes. Without this the manifest still lists the attempt
+            // that was just superseded, so reopening the batch resurrects the bad shot and
+            // retires the good one — silent, and exactly backwards.
+            await PublishManifestAsync();
+
             StatusText = $"Page{(pagesInSet > 1 ? "s" : "")} {pageStr} recaptured";
         }
         catch (Exception ex)
@@ -1757,6 +1825,11 @@ public partial class MainWindowViewModel : ViewModelBase
             : _outputDirectory;
         var result = await MicroCapture.UI.Views.FinalizeBatchDialog.RunAsync(owner, _dbContext, batch, finalizeDirectory);
         if (result == null) return;
+
+        // Export changed batch.Status to "Exported" and deleted the originals it consumed, all
+        // of which lives only in the local database until this runs. Without it a reopened batch
+        // reads as still Active and reports every page's original as missing from disk.
+        await PublishManifestAsync();
 
         StatusText = result.MissingOcrText
             ? $"Exported: {Path.GetFileName(result.ExportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
@@ -2298,12 +2371,15 @@ public partial class MainWindowViewModel : ViewModelBase
         CartAppended?.Invoke(this, EventArgs.Empty);
         var placeholders = new List<ThumbnailItem> { thumbnail };
 
-        // Keep last 100 thumbnails to avoid memory buildup
-        while (RecentCaptures.Count > 100)
+        // Trim from the FRONT. The cart is in page order and new pages are appended, so the
+        // oldest page is index 0 — this used to take index ^1 back when captures were inserted
+        // at the front, and flipping the order left it removing the tile that had just been
+        // added. Past 100 pages every new capture vanished the instant it appeared.
+        while (RecentCaptures.Count > MaxCartThumbnails)
         {
-            var old = RecentCaptures[^1];
-            old.Thumbnail?.Dispose();
-            RecentCaptures.RemoveAt(RecentCaptures.Count - 1);
+            var oldest = RecentCaptures[0];
+            oldest.Thumbnail?.Dispose();
+            RecentCaptures.RemoveAt(0);
         }
 
         // Decoding the capture into a small preview bitmap can take a moment on a large TIFF —
@@ -2451,6 +2527,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public async Task ShutdownAsync()
     {
+        // Give up the batch lock on the way out, so the next machine to open this folder isn't
+        // told it's in use by a session that ended.
+        _batchLockHeartbeat?.Stop();
+        ReleaseCurrentBatchLock();
+
         // Flush any drag-end still sitting on the debounce, so frames adjusted moments before
         // closing aren't lost.
         PersistFramesNow();

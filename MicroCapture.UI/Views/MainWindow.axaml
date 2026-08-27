@@ -329,7 +329,7 @@
                         <TextBlock Text="{Binding SelectedCount, StringFormat='{}{0} selected'}"
                                    Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="12"/>
                         <Button Content="Apply Adjustments…" Command="{Binding ApplyAdjustmentsToSelectedCommand}" Classes="accentGhost"/>
-                        <Button Content="Delete Selected" Command="{Binding DeleteSelectedAsyncCommand}"
+                        <Button Content="Delete Selected" Command="{Binding DeleteSelectedCommand}"
                                 CommandParameter="{Binding $parent[Window]}" Classes="iconDanger"/>
                         <Button Content="Clear Selection" Click="OnClearSelectionClick" Classes="secondary"/>
                     </StackPanel>

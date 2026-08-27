@@ -67,6 +67,7 @@ TestPdfEncodingQuality();
 TestEveryCaptureFormatIsDecodableForExport();
 TestCapturesLiveInTempAndOutputsInOutput();
 await TestFinalizeEmptiesTempFolder();
+await TestFinalizeKeepsUnprocessedOriginals();
 TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
@@ -1364,6 +1365,48 @@ void TestPdfEncodingQuality()
     Console.WriteLine("\n-- PDF image encoding quality --");
     Console.WriteLine($"  [info] SKDocumentPdfMetadata.Default.EncodingQuality = {SkiaSharp.SKDocumentPdfMetadata.Default.EncodingQuality}");
     Console.WriteLine($"  [info] new SKDocumentPdfMetadata().EncodingQuality    = {new SkiaSharp.SKDocumentPdfMetadata().EncodingQuality}");
+}
+
+async Task TestFinalizeKeepsUnprocessedOriginals()
+{
+    Console.WriteLine("\n-- Finalizing never deletes the only copy of an unfinished page --");
+    var root = TempWorkDir();
+    var batchFolder = Path.Combine(root, "KEEPFAIL");
+    BatchFolder.EnsureLayout(batchFolder);
+    var dbPath = Path.Combine(root, "kf.db");
+
+    var page = Path.Combine(BatchFolder.OutputPath(batchFolder), "good.tif");
+    using (var mat = new OpenCvSharp.Mat(300, 200, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(90, 90, 90)))
+        OpenCvSharp.Cv2.ImWrite(page, mat);
+
+    var goodOriginal = Path.Combine(BatchFolder.TempPath(batchFolder), "good_src.jpg");
+    File.WriteAllText(goodOriginal, "consumed by the export");
+    // The page the operator never sees: Finalize lists Completed jobs only, so a Failed page is
+    // invisible there and its capture in temp/ is the only copy in existence.
+    var failedOriginal = Path.Combine(BatchFolder.TempPath(batchFolder), "failed_src.jpg");
+    File.WriteAllText(failedOriginal, "the only copy of a page that failed processing");
+
+    string batchId;
+    using (var db = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(db);
+        var project = new Project { Name = "KF", OutputDirectory = root };
+        db.Projects.Add(project);
+        var batch = new Batch { ProjectId = project.Id, BatchCode = "KEEPFAIL", Name = "KEEPFAIL", FolderPath = batchFolder, Dpi = 300 };
+        db.Batches.Add(batch);
+        batchId = batch.Id;
+        db.CaptureJobs.Add(new CaptureJob { BatchId = batch.Id, PageNumber = 1, ProcessingStatus = "Completed",
+            OriginalFilePath = goodOriginal, ProcessedFilePath = page, Dpi = 300 });
+        db.CaptureJobs.Add(new CaptureJob { BatchId = batch.Id, PageNumber = 2, ProcessingStatus = "Failed",
+            OriginalFilePath = failedOriginal, Dpi = 300 });
+        db.SaveChanges();
+    }
+
+    using (var db = new AppDbContext(dbPath))
+        await RunPumped(() => new BatchExportService(db).ExportBatchAsync(batchId, Path.Combine(root, "out"), "PDF"), timeoutMs: 60000);
+
+    Check("the failed page's original survives finalizing", File.Exists(failedOriginal));
+    Check("the exported page's original is still cleaned up", !File.Exists(goodOriginal));
 }
 
 async Task TestFinalizeEmptiesTempFolder()
