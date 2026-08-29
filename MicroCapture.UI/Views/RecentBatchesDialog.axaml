@@ -6,11 +6,11 @@
         Icon="/Assets/microcapture-icon.png"
         Width="560" Height="520"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
     <Border Classes="panel" Margin="18" Padding="20">
         <Grid RowDefinitions="Auto, Auto, *, Auto">
-            <TextBlock Grid.Row="0" Text="RECENT BATCHES" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
-            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,0,0,14"
+            <TextBlock Grid.Row="0" Text="RECENT BATCHES" Classes="sectionLabel" Foreground="{DynamicResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{DynamicResource InkMutedBrush}" Margin="0,0,0,14"
                        Text="Pick a batch to reopen it — capturing more pages or re-finalizing is always available, even for a batch that was already finalized."/>
 
             <ScrollViewer Grid.Row="2">
@@ -22,14 +22,14 @@
                                 <Grid ColumnDefinitions="*, Auto">
                                     <StackPanel Grid.Column="0" Spacing="3">
                                         <StackPanel Orientation="Horizontal" Spacing="8">
-                                            <TextBlock Text="{Binding ProjectCode}" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource InkBrush}"/>
-                                            <TextBlock Text="/" Foreground="{StaticResource InkSubtleBrush}"/>
-                                            <TextBlock Text="{Binding BatchCode}" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource InkBrush}"/>
+                                            <TextBlock Text="{Binding ProjectCode}" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource InkBrush}"/>
+                                            <TextBlock Text="/" Foreground="{DynamicResource InkSubtleBrush}"/>
+                                            <TextBlock Text="{Binding BatchCode}" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource InkBrush}"/>
                                         </StackPanel>
-                                        <TextBlock Text="{Binding Subtitle}" FontSize="12" Foreground="{StaticResource InkTertiaryBrush}"/>
+                                        <TextBlock Text="{Binding Subtitle}" FontSize="12" Foreground="{DynamicResource InkTertiaryBrush}"/>
                                     </StackPanel>
-                                    <Border Grid.Column="1" Background="{StaticResource Surface2Brush}" CornerRadius="6" Padding="8,3" VerticalAlignment="Center">
-                                        <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="Medium" Foreground="{StaticResource InkMutedBrush}"/>
+                                    <Border Grid.Column="1" Background="{DynamicResource Surface2Brush}" CornerRadius="6" Padding="8,3" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="Medium" Foreground="{DynamicResource InkMutedBrush}"/>
                                     </Border>
                                 </Grid>
                             </Button>
@@ -39,7 +39,7 @@
             </ScrollViewer>
 
             <TextBlock Grid.Row="2" Text="No batches yet — start one from the toolbar." FontSize="13"
-                       Foreground="{StaticResource InkTertiaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Foreground="{DynamicResource InkTertiaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"
                        IsVisible="{Binding IsEmpty}"/>
 
             <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">

@@ -5,11 +5,11 @@
         xmlns:acv="using:Avalonia.Data.Converters"
         x:Class="MicroCapture.UI.Views.CropReviewWindow"
         x:DataType="vm:CropReviewViewModel"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
     <Grid RowDefinitions="*, Auto">
         <Grid Grid.Row="0" ColumnDefinitions="2*, 1*">
             <!-- Main Image & Interactive Crop Canvas Area -->
-            <Border Grid.Column="0" Background="{StaticResource Surface1Brush}" BorderBrush="{StaticResource HairlineBrush}"
+            <Border Grid.Column="0" Background="{DynamicResource Surface1Brush}" BorderBrush="{DynamicResource HairlineBrush}"
                     BorderThickness="1" Margin="14" CornerRadius="10" ClipToBounds="True">
                 <Grid Name="ContainerGrid">
                     <!-- Adjust mode judges rotation/tone/color against the actual page, shown
@@ -25,7 +25,7 @@
                            VerticalAlignment="Center"/>
                     <TextBlock Text="{Binding LoadErrorMessage}"
                                IsVisible="{Binding LoadErrorMessage, Converter={x:Static acv:StringConverters.IsNotNullOrEmpty}}"
-                               Foreground="{StaticResource InkMutedBrush}"
+                               Foreground="{DynamicResource InkMutedBrush}"
                                TextWrapping="Wrap" TextAlignment="Center"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                MaxWidth="360" FontSize="14"/>
@@ -36,7 +36,7 @@
             <Border Grid.Column="1" Classes="panel" Margin="0,14,14,14" Padding="14">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                 <StackPanel Spacing="12">
-                    <TextBlock Text="LIVE PREVIEW" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}"/>
+                    <TextBlock Text="LIVE PREVIEW" Classes="sectionLabel" Foreground="{DynamicResource PrimaryHoverBrush}"/>
                     <Image Source="{Binding PreviewImage}" Stretch="Uniform" MaxHeight="500"/>
 
                     <!-- Rotate/flip/tone/color/sharpen controls, grouped — this window only ever
@@ -44,7 +44,7 @@
                          removed; reprocessing re-detects the page boundary automatically). -->
                     <StackPanel Spacing="16" Margin="0,8,0,0">
                         <StackPanel Spacing="8">
-                            <TextBlock Text="PRESETS" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <TextBlock Text="PRESETS" Classes="sectionLabel" Foreground="{DynamicResource InkSubtleBrush}"/>
                             <WrapPanel>
                                 <Button Content="Document" Command="{Binding ApplyPresetDocumentCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
                                 <Button Content="Photo" Command="{Binding ApplyPresetPhotoCommand}" Classes="accentGhost" Margin="0,0,6,6"/>
@@ -54,11 +54,11 @@
                         </StackPanel>
 
                         <StackPanel Spacing="8">
-                            <TextBlock Text="GEOMETRY" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <TextBlock Text="GEOMETRY" Classes="sectionLabel" Foreground="{DynamicResource InkSubtleBrush}"/>
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <Button Content="↺ Rotate" Command="{Binding RotateCounterclockwiseCommand}" Classes="secondary" ToolTip.Tip="Rotate counterclockwise 90°"/>
                                 <Button Content="↻ Rotate" Command="{Binding RotateClockwiseCommand}" Classes="secondary" ToolTip.Tip="Rotate clockwise 90°"/>
-                                <TextBlock Text="{Binding RotationDegrees, StringFormat='{}{0}°'}" VerticalAlignment="Center" Foreground="{StaticResource InkMutedBrush}"/>
+                                <TextBlock Text="{Binding RotationDegrees, StringFormat='{}{0}°'}" VerticalAlignment="Center" Foreground="{DynamicResource InkMutedBrush}"/>
                             </StackPanel>
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <ToggleButton Content="Flip H" IsChecked="{Binding FlipHorizontal}" Classes="secondary"/>
@@ -67,7 +67,7 @@
                         </StackPanel>
 
                         <StackPanel Spacing="8">
-                            <TextBlock Text="LIGHT &amp; COLOR" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <TextBlock Text="LIGHT &amp; COLOR" Classes="sectionLabel" Foreground="{DynamicResource InkSubtleBrush}"/>
                             <StackPanel Spacing="4">
                                 <TextBlock Text="Brightness" Classes="caption"/>
                                 <Slider Minimum="-1" Maximum="1" Value="{Binding Brightness}"/>
@@ -87,7 +87,7 @@
                         </StackPanel>
 
                         <StackPanel Spacing="8">
-                            <TextBlock Text="DETAIL" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <TextBlock Text="DETAIL" Classes="sectionLabel" Foreground="{DynamicResource InkSubtleBrush}"/>
                             <StackPanel Spacing="4">
                                 <TextBlock Text="Sharpness" Classes="caption"/>
                                 <Slider Minimum="0" Maximum="1" Value="{Binding Sharpness}"/>
@@ -100,13 +100,13 @@
                              hidden entirely in that mode rather than silently doing the wrong
                              thing for every other page it would touch. -->
                         <StackPanel Spacing="8" IsVisible="{Binding !IsPostExportAdjustOnly}">
-                            <TextBlock Text="BATCH" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
+                            <TextBlock Text="BATCH" Classes="sectionLabel" Foreground="{DynamicResource InkSubtleBrush}"/>
                             <Button Content="Apply to All in Batch" Command="{Binding ApplyToAllCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
                             <Button Content="Apply to Selected Now" Command="{Binding ApplyToSelectionCommand}" Classes="secondary"
                                     HorizontalAlignment="Stretch" IsVisible="{Binding HasSelectionForBulkApply}"
                                     ToolTip.Tip="Apply to the other selected pages without closing. Saving applies to them too, so this is optional."/>
                             <TextBlock IsVisible="{Binding HasSelectionForBulkApply}" FontSize="11" TextWrapping="Wrap"
-                                       Foreground="{StaticResource InkTertiaryBrush}"
+                                       Foreground="{DynamicResource InkTertiaryBrush}"
                                        Text="Saving applies these adjustments to every page you selected."/>
                         </StackPanel>
                     </StackPanel>
@@ -124,7 +124,7 @@
                         <Ellipse Width="7" Height="7" VerticalAlignment="Center"
                                  Fill="{Binding BoundaryHintText, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                         <TextBlock Text="{Binding BoundaryHintText}"
-                                   Foreground="{StaticResource InkMutedBrush}" VerticalAlignment="Center" FontSize="13"/>
+                                   Foreground="{DynamicResource InkMutedBrush}" VerticalAlignment="Center" FontSize="13"/>
                     </StackPanel>
                 </StackPanel>
 

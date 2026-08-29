@@ -3,12 +3,15 @@
              x:Class="MicroCapture.UI.App"
              xmlns:local="using:MicroCapture.UI"
              RequestedThemeVariant="Dark">
-             <!-- MicroCapture is a dark-canvas professional imaging tool by deliberate choice
-                  (matching the Linear-philosophy reference system, and the convention of every
-                  comparable tool — Lightroom, Capture One, ABBYY FineReader's dark mode) —
-                  pinned to "Dark" rather than "Default" so built-in Fluent chrome (CheckBox,
-                  Slider, ScrollBar) always matches the app's own hand-painted dark surfaces
-                  instead of flipping light on a light-mode OS. -->
+             <!-- Dark remains the default and the design centre — this is a professional imaging
+                  tool, and every comparable one (Lightroom, Capture One, ABBYY FineReader) leads
+                  with a dark canvas so the operator judges an image against a neutral ground
+                  rather than a glowing one.
+                  The variant is still declared here rather than left at "Default" so that the
+                  built-in Fluent chrome (CheckBox, Slider, ScrollBar) has a definite variant
+                  before any preference is read, and so the designer preview has one. AppTheme
+                  overwrites it at startup with the operator's saved choice — including
+                  "System", which is the only setting that lets the OS decide. -->
 
     <Application.DataTemplates>
         <local:ViewLocator />

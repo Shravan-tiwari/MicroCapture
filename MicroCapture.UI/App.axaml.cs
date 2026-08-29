@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Threading;
+using MicroCapture.UI.Theming;
 using MicroCapture.UI.ViewModels;
 using MicroCapture.UI.Views;
 using System;
@@ -20,6 +21,9 @@ public partial class App : Application
     public override void OnFrameworkInitializationCompleted()
     {
         ConfigureUnhandledExceptionLogging();
+        // Before the first window is built, not after: applying the saved palette later would
+        // show the operator a frame of the wrong one on every launch.
+        AppTheme.ApplySaved(AppPreferences.Load());
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             MicroCapture.Core.Interfaces.ICameraService cameraService;

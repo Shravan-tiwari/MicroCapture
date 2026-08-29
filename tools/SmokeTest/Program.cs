@@ -19,8 +19,12 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Threading;
+using MicroCapture.UI.Theming;
 using MicroCapture.UI.ViewModels;
 using MicroCapture.UI.Views;
+using Avalonia.Markup.Xaml;
+using Avalonia.Media;
+using Avalonia.Styling;
 
 var failures = 0;
 
@@ -108,6 +112,7 @@ await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
 await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
+TestDayAndNightModeRepaintTheWholeInterface();
 await TestCropReviewAdjustModeRotationReachesExport();
 await TestFinalizeSearchablePdfActuallyEmbedsOcrText();
 TestManualAdjustmentsAreNoOpAtDefaults();
@@ -3536,6 +3541,120 @@ async Task TestManualCropReviewFlowOnMockCameraStyleFrame()
         Check("Exported file reflects the manual crop, not the raw 3840x2160 capture",
             exported.Width == 2600 && exported.Height == 1100);
     }
+}
+
+void TestDayAndNightModeRepaintTheWholeInterface()
+{
+    Console.WriteLine("\n-- DAY / NIGHT MODE --");
+
+    // 1. Both palettes must define the same keys. A token present in one variant and missing from
+    //    the other doesn't fail the build and doesn't throw — the control just silently keeps
+    //    whatever brush it had, so a single forgotten line leaves one screen half-painted in the
+    //    other theme. Cheapest possible guard against the most likely way this breaks later.
+    var themeStyles = new Styles();
+    themeStyles.Add((IStyle)AvaloniaXamlLoader.Load(
+        new Uri("avares://MicroCapture.UI/Styles/Theme.axaml")));
+    var themeDictionaries = ((ResourceDictionary)((Styles)themeStyles[0]).Resources).ThemeDictionaries;
+
+    var darkKeys = ((ResourceDictionary)themeDictionaries[ThemeVariant.Dark]).Keys
+        .Select(k => k.ToString()!).OrderBy(k => k, StringComparer.Ordinal).ToList();
+    var lightKeys = ((ResourceDictionary)themeDictionaries[ThemeVariant.Light]).Keys
+        .Select(k => k.ToString()!).OrderBy(k => k, StringComparer.Ordinal).ToList();
+
+    Check($"Dark defines colour tokens ({darkKeys.Count})", darkKeys.Count > 10);
+    var missingFromLight = darkKeys.Except(lightKeys).ToList();
+    var missingFromDark = lightKeys.Except(darkKeys).ToList();
+    Check($"Every dark token has a light counterpart (missing: {string.Join(", ", missingFromLight)})",
+        missingFromLight.Count == 0);
+    Check($"Every light token has a dark counterpart (missing: {string.Join(", ", missingFromDark)})",
+        missingFromDark.Count == 0);
+
+    // 2. Light is not the dark palette under another name. Checking a few load-bearing tokens
+    //    actually inverted catches a copy-paste that leaves white text on white.
+    Color ColorOf(ThemeVariant variant, string key) =>
+        ((SolidColorBrush)((ResourceDictionary)themeDictionaries[variant])[key]!).Color;
+    double Luminance(Color c) => (0.299 * c.R + 0.587 * c.G + 0.114 * c.B) / 255.0;
+
+    Check("Light canvas is light and dark canvas is dark",
+        Luminance(ColorOf(ThemeVariant.Light, "CanvasBrush")) > 0.75
+        && Luminance(ColorOf(ThemeVariant.Dark, "CanvasBrush")) < 0.15);
+    Check("Body text inverts with the canvas",
+        Luminance(ColorOf(ThemeVariant.Light, "InkBrush")) < 0.2
+        && Luminance(ColorOf(ThemeVariant.Dark, "InkBrush")) > 0.85);
+
+    // 3. Status colours have to stay readable, and amber on white is the case that fails: the
+    //    dark-mode warning colour is around 2:1 against a light canvas, which would make warnings
+    //    the least legible text on the screen. Assert the light palette actually darkened them.
+    double Contrast(Color a, Color b)
+    {
+        double Channel(double v) { v /= 255.0; return v <= 0.03928 ? v / 12.92 : Math.Pow((v + 0.055) / 1.055, 2.4); }
+        double Rel(Color c) => 0.2126 * Channel(c.R) + 0.7152 * Channel(c.G) + 0.0722 * Channel(c.B);
+        var (x, y) = (Rel(a), Rel(b));
+        return (Math.Max(x, y) + 0.05) / (Math.Min(x, y) + 0.05);
+    }
+
+    foreach (var key in new[] { "SuccessBrush", "WarningBrush", "FailBrush", "InkSubtleBrush", "PrimaryBrush" })
+    {
+        var onLight = Contrast(ColorOf(ThemeVariant.Light, key), ColorOf(ThemeVariant.Light, "Surface1Brush"));
+        var onDark = Contrast(ColorOf(ThemeVariant.Dark, key), ColorOf(ThemeVariant.Dark, "Surface1Brush"));
+        Check($"{key} stays readable in both themes (light {onLight:F1}:1, dark {onDark:F1}:1)",
+            onLight >= 3.0 && onDark >= 3.0);
+    }
+
+    // 4. The switch has to actually reach the running window. Every colour is referenced with
+    //    DynamicResource for exactly this reason — StaticResource resolves once at load and would
+    //    leave the app frozen in whichever palette it started in, which builds and runs perfectly
+    //    while doing nothing.
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, TempDbPath());
+    var window = new MainWindow { DataContext = vm };
+    Dispatcher.UIThread.RunJobs();
+
+    AppTheme.Apply(ThemeMode.Dark);
+    Dispatcher.UIThread.RunJobs();
+    var darkBackground = (window.Background as SolidColorBrush)?.Color;
+
+    AppTheme.Apply(ThemeMode.Light);
+    Dispatcher.UIThread.RunJobs();
+    var lightBackground = (window.Background as SolidColorBrush)?.Color;
+
+    Check($"Switching to day mode repaints the open window (dark {darkBackground} -> light {lightBackground})",
+        darkBackground != null && lightBackground != null && darkBackground != lightBackground
+        && Luminance(lightBackground.Value) > Luminance(darkBackground.Value));
+
+    // 5. Brushes that come from value converters can't follow a DynamicResource, because a
+    //    converter only re-runs when its binding source changes and the theme is not one of its
+    //    sources. They're recoloured in place instead; check that actually happened.
+    SemanticBrushes.Apply(light: false);
+    var darkWarning = SemanticBrushes.Warning.Color;
+    SemanticBrushes.Apply(light: true);
+    Check($"Converter-produced status colours follow the theme too ({darkWarning} -> {SemanticBrushes.Warning.Color})",
+        darkWarning != SemanticBrushes.Warning.Color);
+
+    // 6. The cycle visits all three modes and returns, and the label always names the mode that
+    //    is on rather than the one a click would bring.
+    var seen = new List<ThemeMode>();
+    var mode = ThemeMode.Dark;
+    for (var i = 0; i < 3; i++) { seen.Add(mode); mode = AppTheme.Next(mode); }
+    Check("The theme control cycles dark -> light -> system and back",
+        seen.SequenceEqual(new[] { ThemeMode.Dark, ThemeMode.Light, ThemeMode.System })
+        && mode == ThemeMode.Dark);
+
+    vm.ThemeMode = ThemeMode.Light;
+    var lightLabel = vm.ThemeModeLabel;
+    vm.ThemeMode = ThemeMode.Dark;
+    Check($"The control's label changes with the mode ({lightLabel} vs {vm.ThemeModeLabel})",
+        lightLabel != vm.ThemeModeLabel && !string.IsNullOrWhiteSpace(lightLabel));
+
+    // 7. An unreadable or hand-edited preference must not open the app in a surprise palette.
+    Check("An unrecognised saved theme falls back to dark, not to a white screen",
+        AppTheme.Parse(null) == ThemeMode.Dark
+        && AppTheme.Parse("") == ThemeMode.Dark
+        && AppTheme.Parse("chartreuse") == ThemeMode.Dark
+        && AppTheme.Parse("light") == ThemeMode.Light
+        && AppTheme.Parse("System") == ThemeMode.System);
+
+    AppTheme.Apply(ThemeMode.Dark);
 }
 
 async Task TestRealUiFlowCaptureCropSaveThumbnailAndExport()

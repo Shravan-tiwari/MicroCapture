@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\MicroCapture.Core\MicroCapture.Core.csproj" />
+    <ProjectReference Include="..\..\MicroCapture.Processing\MicroCapture.Processing.csproj" />
+    <ProjectReference Include="..\..\MicroCapture.UI\MicroCapture.UI.csproj" />
+    <ProjectReference Include="..\..\MicroCapture.Camera\MicroCapture.Camera.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Headless" Version="11.1.3" />
+    <PackageReference Include="Avalonia.Skia" Version="11.1.3" />
+  </ItemGroup>
+
+  <!-- Local macOS dev/test convenience only: see MicroCapture.UI.csproj for why this is needed. -->
+  <Target Name="FixOpenCvMacOsLibraryPath" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <ItemGroup>
+      <OpenCvMacNativeDeps Include="$(OutDir)runtimes/osx-arm64/native/*.dylib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OpenCvMacNativeDeps)" DestinationFolder="$(OutDir)..\libs" SkipUnchangedFiles="true" Condition="'@(OpenCvMacNativeDeps)' != ''" />
+  </Target>
+
+</Project>

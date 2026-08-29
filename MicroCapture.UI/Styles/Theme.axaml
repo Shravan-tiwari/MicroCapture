@@ -2,44 +2,112 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
   <!--
-    Shared design tokens, adapted from the Linear-philosophy reference document: a near-black
-    canvas + surface ladder, one restrained accent, and hairline borders — extended with a
-    semantic status set (success/warning/fail) the reference document didn't need for a
-    marketing page but this app cannot ship without. See the UI audit artifact for the full
-    rationale. Styling only — no control here changes what data flows, only how it renders.
+    Shared design tokens, in two variants. Every style below is written once against semantic
+    keys (Surface2Brush, InkSubtleBrush) rather than literal colours, so day and night mode are
+    two palettes rather than two stylesheets — a control styled here is correct in both, and a
+    new one cannot be added to only one of them. Extended with a semantic status set
+    (success/warning/fail) the reference document didn't need for a marketing page but this app
+    cannot ship without. Styling only — no control here changes what data flows, only how it
+    renders.
   -->
   <Styles.Resources>
     <ResourceDictionary>
-      <!-- Surface ladder -->
-      <SolidColorBrush x:Key="CanvasBrush" Color="#010102"/>
-      <SolidColorBrush x:Key="Surface1Brush" Color="#0f1011"/>
-      <SolidColorBrush x:Key="Surface2Brush" Color="#141516"/>
-      <SolidColorBrush x:Key="Surface3Brush" Color="#1a1b1d"/>
+      <!-- Every colour token is defined once per variant under the same key, so a control asks
+           for "Surface2Brush" and gets whichever one the current variant defines. This is why
+           every consumer below (and in the Views) uses DynamicResource rather than
+           StaticResource: StaticResource resolves once at load and would freeze the app in
+           whichever theme it started in. -->
+      <ResourceDictionary.ThemeDictionaries>
 
-      <!-- Text -->
-      <SolidColorBrush x:Key="InkBrush" Color="#f7f8f8"/>
-      <SolidColorBrush x:Key="InkMutedBrush" Color="#c9cdd6"/>
-      <SolidColorBrush x:Key="InkSubtleBrush" Color="#8a8f98"/>
-      <SolidColorBrush x:Key="InkTertiaryBrush" Color="#62666d"/>
+        <!-- ───────── Dark (the default) ─────────
+             A near-black canvas + surface ladder, one restrained accent, and hairline borders,
+             adapted from the Linear-philosophy reference document and matching the convention of
+             comparable imaging tools (Lightroom, Capture One). -->
+        <ResourceDictionary x:Key="Dark">
+          <!-- Surface ladder -->
+          <SolidColorBrush x:Key="CanvasBrush" Color="#010102"/>
+          <SolidColorBrush x:Key="Surface1Brush" Color="#0f1011"/>
+          <SolidColorBrush x:Key="Surface2Brush" Color="#141516"/>
+          <SolidColorBrush x:Key="Surface3Brush" Color="#1a1b1d"/>
 
-      <!-- Hairlines -->
-      <SolidColorBrush x:Key="HairlineBrush" Color="#23252a"/>
-      <SolidColorBrush x:Key="HairlineStrongBrush" Color="#34343a"/>
+          <!-- Text -->
+          <SolidColorBrush x:Key="InkBrush" Color="#f7f8f8"/>
+          <SolidColorBrush x:Key="InkMutedBrush" Color="#c9cdd6"/>
+          <SolidColorBrush x:Key="InkSubtleBrush" Color="#8a8f98"/>
+          <SolidColorBrush x:Key="InkTertiaryBrush" Color="#62666d"/>
 
-      <!-- Accent — reserved for exactly one primary action per screen, focus rings, and the
-           brand-adjacent numeric readouts (page count). Never used decoratively. -->
-      <SolidColorBrush x:Key="PrimaryBrush" Color="#5e6ad2"/>
-      <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#828fff"/>
-      <SolidColorBrush x:Key="PrimaryFocusBrush" Color="#5e69d1"/>
-      <SolidColorBrush x:Key="PrimaryWashBrush" Color="#1f2266d2"/>
+          <!-- Hairlines -->
+          <SolidColorBrush x:Key="HairlineBrush" Color="#23252a"/>
+          <SolidColorBrush x:Key="HairlineStrongBrush" Color="#34343a"/>
 
-      <!-- Semantic status — separate from the accent on purpose, so it always means the same
-           thing wherever it appears. -->
-      <SolidColorBrush x:Key="SuccessBrush" Color="#27a644"/>
-      <SolidColorBrush x:Key="WarningBrush" Color="#d99a3d"/>
-      <SolidColorBrush x:Key="FailBrush" Color="#e5484d"/>
+          <!-- Accent — reserved for exactly one primary action per screen, focus rings, and the
+               brand-adjacent numeric readouts (page count). Never used decoratively. -->
+          <SolidColorBrush x:Key="PrimaryBrush" Color="#5e6ad2"/>
+          <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#828fff"/>
+          <SolidColorBrush x:Key="PrimaryFocusBrush" Color="#5e69d1"/>
+          <SolidColorBrush x:Key="PrimaryWashBrush" Color="#1f2266d2"/>
 
-      <!-- Type scale -->
+          <!-- Semantic status — separate from the accent on purpose, so it always means the same
+               thing wherever it appears. -->
+          <SolidColorBrush x:Key="SuccessBrush" Color="#27a644"/>
+          <SolidColorBrush x:Key="WarningBrush" Color="#d99a3d"/>
+          <SolidColorBrush x:Key="FailBrush" Color="#e5484d"/>
+          <SolidColorBrush x:Key="InProgressBrush" Color="#5e6ad2"/>
+          <SolidColorBrush x:Key="NeutralStatusBrush" Color="#8a8f98"/>
+
+          <!-- Translucent plate for badges that sit on top of the live camera image, where the
+               backdrop is a photograph rather than any app surface. -->
+          <SolidColorBrush x:Key="ScrimBrush" Color="#cc0f1011"/>
+        </ResourceDictionary>
+
+        <!-- ───────── Light ─────────
+             The same ladder inverted, not a naive colour flip. Two things are deliberately not
+             mirrored: the canvas is a soft off-white rather than pure white (a full-brightness
+             field beside a lit copy stand is fatiguing over a shift), and the accent and status
+             colours are darkened rather than reused, because a hue tuned to carry against
+             near-black is too pale to read against white. Amber in particular fails badly:
+             #d99a3d on white is roughly 2:1 contrast, so warnings would be the least legible
+             text on screen — exactly backwards. -->
+        <ResourceDictionary x:Key="Light">
+          <!-- Surface ladder — ascends toward white as the dark ladder ascends toward light,
+               so "Surface3" still means "the raised one" and every style keeps its meaning. -->
+          <SolidColorBrush x:Key="CanvasBrush" Color="#eef0f3"/>
+          <SolidColorBrush x:Key="Surface1Brush" Color="#f8f9fa"/>
+          <SolidColorBrush x:Key="Surface2Brush" Color="#ffffff"/>
+          <SolidColorBrush x:Key="Surface3Brush" Color="#e9ebef"/>
+
+          <!-- Text -->
+          <SolidColorBrush x:Key="InkBrush" Color="#16171a"/>
+          <SolidColorBrush x:Key="InkMutedBrush" Color="#3b3f47"/>
+          <SolidColorBrush x:Key="InkSubtleBrush" Color="#5d626b"/>
+          <SolidColorBrush x:Key="InkTertiaryBrush" Color="#787d87"/>
+
+          <!-- Hairlines -->
+          <SolidColorBrush x:Key="HairlineBrush" Color="#d8dbe0"/>
+          <SolidColorBrush x:Key="HairlineStrongBrush" Color="#bcc0c7"/>
+
+          <!-- Accent. Hover darkens here rather than brightening: on a light ground, "more
+               emphasis" reads as deeper, not paler. -->
+          <SolidColorBrush x:Key="PrimaryBrush" Color="#4f5bc4"/>
+          <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#3d47a8"/>
+          <SolidColorBrush x:Key="PrimaryFocusBrush" Color="#333c92"/>
+          <SolidColorBrush x:Key="PrimaryWashBrush" Color="#242f66d2"/>
+
+          <!-- Semantic status, darkened for contrast against white. -->
+          <SolidColorBrush x:Key="SuccessBrush" Color="#1a7f36"/>
+          <SolidColorBrush x:Key="WarningBrush" Color="#8a5a08"/>
+          <SolidColorBrush x:Key="FailBrush" Color="#c02026"/>
+          <SolidColorBrush x:Key="InProgressBrush" Color="#4f5bc4"/>
+          <SolidColorBrush x:Key="NeutralStatusBrush" Color="#5d626b"/>
+
+          <!-- The live-view badge still sits on a photograph, so it needs its own opaque-ish
+               plate rather than a surface colour; here it is a light plate with dark text. -->
+          <SolidColorBrush x:Key="ScrimBrush" Color="#e8f8f9fa"/>
+        </ResourceDictionary>
+
+      </ResourceDictionary.ThemeDictionaries>
+
+      <!-- Type scale — the same in both variants. -->
       <x:Double x:Key="FontSizeDisplay">24</x:Double>
       <x:Double x:Key="FontSizeBody">14</x:Double>
       <x:Double x:Key="FontSizeCaption">12</x:Double>
@@ -50,7 +118,7 @@
   <!-- ───────────── Buttons ───────────── -->
 
   <Style Selector="Button.primary">
-    <Setter Property="Background" Value="{StaticResource PrimaryBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryBrush}"/>
     <Setter Property="Foreground" Value="White"/>
     <Setter Property="Padding" Value="16,10"/>
     <Setter Property="CornerRadius" Value="8"/>
@@ -59,64 +127,64 @@
     <Setter Property="Cursor" Value="Hand"/>
   </Style>
   <Style Selector="Button.primary:pointerover">
-    <Setter Property="Background" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryHoverBrush}"/>
   </Style>
   <Style Selector="Button.primary:pressed">
-    <Setter Property="Background" Value="{StaticResource PrimaryFocusBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryFocusBrush}"/>
   </Style>
 
   <!-- The one button that visually signals "this is currently on" — Auto Capture, toggled
        via the IsAutoCapture-bound Classes.active on the Button in MainWindow.axaml. -->
   <Style Selector="Button.toggle">
-    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
-    <Setter Property="Foreground" Value="{StaticResource InkMutedBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface2Brush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkMutedBrush}"/>
     <Setter Property="Padding" Value="14,9"/>
     <Setter Property="CornerRadius" Value="8"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource HairlineStrongBrush}"/>
     <Setter Property="Cursor" Value="Hand"/>
   </Style>
   <Style Selector="Button.toggle.active">
-    <Setter Property="Background" Value="{StaticResource PrimaryBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryBrush}"/>
     <Setter Property="Foreground" Value="White"/>
-    <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource PrimaryBrush}"/>
   </Style>
   <Style Selector="Button.toggle:pointerover">
-    <Setter Property="Background" Value="{StaticResource Surface3Brush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface3Brush}"/>
   </Style>
   <Style Selector="Button.toggle.active:pointerover">
-    <Setter Property="Background" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryHoverBrush}"/>
   </Style>
 
   <Style Selector="Button.secondary">
-    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
-    <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface2Brush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkBrush}"/>
     <Setter Property="Padding" Value="14,8"/>
     <Setter Property="CornerRadius" Value="8"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="BorderBrush" Value="{StaticResource HairlineBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource HairlineBrush}"/>
     <Setter Property="Cursor" Value="Hand"/>
   </Style>
   <Style Selector="Button.secondary:pointerover">
-    <Setter Property="Background" Value="{StaticResource Surface3Brush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface3Brush}"/>
   </Style>
 
   <Style Selector="Button.ghost">
     <Setter Property="Background" Value="Transparent"/>
-    <Setter Property="Foreground" Value="{StaticResource InkSubtleBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkSubtleBrush}"/>
     <Setter Property="Padding" Value="10,5"/>
     <Setter Property="CornerRadius" Value="6"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="Cursor" Value="Hand"/>
   </Style>
   <Style Selector="Button.ghost:pointerover">
-    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
-    <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface2Brush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkBrush}"/>
   </Style>
 
   <Style Selector="Button.accentGhost">
-    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
-    <Setter Property="Foreground" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface2Brush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource PrimaryHoverBrush}"/>
     <Setter Property="Padding" Value="10,5"/>
     <Setter Property="CornerRadius" Value="6"/>
     <Setter Property="BorderThickness" Value="0"/>
@@ -125,7 +193,7 @@
   </Style>
 
   <Style Selector="Button.destructive">
-    <Setter Property="Background" Value="{StaticResource FailBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource FailBrush}"/>
     <Setter Property="Foreground" Value="White"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="Cursor" Value="Hand"/>
@@ -139,7 +207,7 @@
        now has its own hover-revealed control (Button.tileAction.danger), so this one is simply
        always visible, which is what a destructive action should be. -->
   <Style Selector="Button.iconDanger">
-    <Setter Property="Background" Value="{StaticResource FailBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource FailBrush}"/>
     <Setter Property="Foreground" Value="White"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="CornerRadius" Value="6"/>
@@ -165,7 +233,7 @@
     <Setter Property="CornerRadius" Value="4"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="Background" Value="Transparent"/>
-    <Setter Property="Foreground" Value="{StaticResource InkTertiaryBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkTertiaryBrush}"/>
     <Setter Property="Opacity" Value="0.35"/>
     <Setter Property="VerticalAlignment" Value="Stretch"/>
     <Setter Property="HorizontalContentAlignment" Value="Center"/>
@@ -177,7 +245,7 @@
   </Style>
   <Style Selector="Button.insertPoint:pointerover">
     <Setter Property="Opacity" Value="1"/>
-    <Setter Property="Background" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource PrimaryHoverBrush}"/>
     <Setter Property="Foreground" Value="White"/>
   </Style>
 
@@ -207,17 +275,17 @@
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="HorizontalContentAlignment" Value="Center"/>
     <Setter Property="VerticalContentAlignment" Value="Center"/>
-    <Setter Property="Background" Value="{StaticResource Surface1Brush}"/>
-    <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
-    <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface1Brush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource HairlineStrongBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkBrush}"/>
   </Style>
   <Style Selector="Button.tileAction:pointerover">
-    <Setter Property="Background" Value="{StaticResource Surface2Brush}"/>
-    <Setter Property="BorderBrush" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface2Brush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource PrimaryHoverBrush}"/>
   </Style>
   <Style Selector="Button.tileAction.danger:pointerover">
-    <Setter Property="Background" Value="{StaticResource FailBrush}"/>
-    <Setter Property="BorderBrush" Value="{StaticResource FailBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource FailBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource FailBrush}"/>
     <Setter Property="Foreground" Value="White"/>
   </Style>
 
@@ -229,15 +297,15 @@
   <!-- Every button gets a visible focus ring for keyboard-first operation — the app leans on
        Space/R/A shortcuts already, but nothing previously showed which control had focus. -->
   <Style Selector="Button:focus-visible">
-    <Setter Property="BorderBrush" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource PrimaryHoverBrush}"/>
     <Setter Property="BorderThickness" Value="2"/>
   </Style>
 
   <!-- ───────────── Cards / panels ───────────── -->
 
   <Style Selector="Border.panel">
-    <Setter Property="Background" Value="{StaticResource Surface1Brush}"/>
-    <Setter Property="BorderBrush" Value="{StaticResource HairlineBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource Surface1Brush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource HairlineBrush}"/>
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="CornerRadius" Value="10"/>
   </Style>
@@ -245,20 +313,20 @@
   <!-- ───────────── Typography ───────────── -->
 
   <Style Selector="TextBlock.sectionLabel">
-    <Setter Property="Foreground" Value="{StaticResource InkTertiaryBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkTertiaryBrush}"/>
     <Setter Property="FontSize" Value="{StaticResource FontSizeLabel}"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="LetterSpacing" Value="1"/>
   </Style>
 
   <Style Selector="TextBlock.display">
-    <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkBrush}"/>
     <Setter Property="FontSize" Value="{StaticResource FontSizeDisplay}"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
   </Style>
 
   <Style Selector="TextBlock.caption">
-    <Setter Property="Foreground" Value="{StaticResource InkSubtleBrush}"/>
+    <Setter Property="Foreground" Value="{DynamicResource InkSubtleBrush}"/>
     <Setter Property="FontSize" Value="{StaticResource FontSizeCaption}"/>
   </Style>
 

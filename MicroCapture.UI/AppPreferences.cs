@@ -25,6 +25,11 @@ public class AppPreferences
     /// <summary>Last folder a batch was created in, used to seed the New Batch dialog.</summary>
     public string? LastBatchLocation { get; set; }
 
+    /// <summary>Day/night mode: "Dark", "Light", or "System". A per-operator preference about
+    /// this screen in this room, so it belongs here rather than in a batch — an operator working
+    /// under a bright window and one in a dim studio should not be arguing over a batch file.</summary>
+    public string ThemeMode { get; set; } = "Dark";
+
     /// <summary>Folders scanned to list available batches — typically the shared drive batches are
     /// kept on. Scanning is read-only, so several machines pointed at one share can't conflict.</summary>
     public List<string> BatchSearchRoots { get; set; } = new();

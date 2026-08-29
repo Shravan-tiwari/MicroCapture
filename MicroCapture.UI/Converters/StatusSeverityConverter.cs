@@ -2,6 +2,7 @@ using System;
 using System.Globalization;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
+using MicroCapture.UI.Theming;
 
 namespace MicroCapture.UI.Converters;
 
@@ -15,15 +16,18 @@ public class StatusSeverityConverter : IValueConverter
 {
     public static readonly StatusSeverityConverter Instance = new();
 
-    // Keep in sync with the semantic tokens in Styles/Theme.axaml.
-    private static readonly IBrush Success = new SolidColorBrush(Color.Parse("#27a644"));
-    private static readonly IBrush Warning = new SolidColorBrush(Color.Parse("#d99a3d"));
-    private static readonly IBrush Fail = new SolidColorBrush(Color.Parse("#e5484d"));
-    private static readonly IBrush Neutral = new SolidColorBrush(Color.Parse("#8a8f98"));
+    // Shared, theme-reactive instances rather than fixed colours: a converter only runs when its
+    // binding source changes, and switching day/night mode changes no status text, so returning a
+    // literal colour here would leave every status stuck in the previous palette. SemanticBrushes
+    // recolours these in place instead. See AppTheme.
+    private static IBrush Success => SemanticBrushes.Success;
+    private static IBrush Warning => SemanticBrushes.Warning;
+    private static IBrush Fail => SemanticBrushes.Fail;
+    private static IBrush Neutral => SemanticBrushes.Neutral;
     // A capture actively being processed — distinct from Neutral (which otherwise also covers
     // "no status yet"/unrecognized strings) so "in progress" reads as a visibly different state
     // from "nothing has happened" or "processed", not the same grey dot as both.
-    private static readonly IBrush InProgress = new SolidColorBrush(Color.Parse("#5e6ad2"));
+    private static IBrush InProgress => SemanticBrushes.InProgress;
 
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {

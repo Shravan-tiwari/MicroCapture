@@ -6,27 +6,27 @@
         Icon="/Assets/microcapture-icon.png"
         Width="760" Height="620"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
     <Border Classes="panel" Margin="18" Padding="20">
         <Grid RowDefinitions="Auto, *, Auto, Auto" ColumnDefinitions="2*, 1*">
 
             <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Text="FINALIZE BATCH"
-                       Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+                       Classes="sectionLabel" Foreground="{DynamicResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
 
             <!-- Page list: reorder / delete -->
-            <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="10" Margin="0,0,10,0">
+            <Border Grid.Row="1" Grid.Column="0" Background="{DynamicResource Surface2Brush}" CornerRadius="8" Padding="10" Margin="0,0,10,0">
                 <ScrollViewer>
                     <ItemsControl ItemsSource="{Binding Pages}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
-                                <Border Background="{StaticResource Surface1Brush}" CornerRadius="6" Padding="8" Margin="0,0,0,6">
+                                <Border Background="{DynamicResource Surface1Brush}" CornerRadius="6" Padding="8" Margin="0,0,0,6">
                                     <Grid ColumnDefinitions="Auto, *, Auto">
                                         <Border Grid.Column="0" Width="60" Height="60" CornerRadius="4" ClipToBounds="True"
-                                                Background="{StaticResource Surface2Brush}" Margin="0,0,10,0">
+                                                Background="{DynamicResource Surface2Brush}" Margin="0,0,10,0">
                                             <Image Source="{Binding Thumbnail}" Stretch="Uniform"/>
                                         </Border>
                                         <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="13"
-                                                   Foreground="{StaticResource InkBrush}"
+                                                   Foreground="{DynamicResource InkBrush}"
                                                    Text="{Binding PageNumber, StringFormat='Page {0}'}"/>
                                         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
                                             <Button Content="↑" Width="30" Height="28" Padding="0" Click="OnMoveUpClick"
@@ -50,7 +50,7 @@
             <!-- Export options -->
             <StackPanel Grid.Row="1" Grid.Column="1" Spacing="14">
                 <StackPanel Spacing="6">
-                    <TextBlock Text="FORMAT" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
+                    <TextBlock Text="FORMAT" Classes="sectionLabel" FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}"/>
                     <ComboBox ItemsSource="{Binding AvailableFormats}" SelectedItem="{Binding SelectedFormat}" HorizontalAlignment="Stretch"/>
                 </StackPanel>
 
@@ -63,13 +63,13 @@
                         Command="{Binding RunOcrNowCommand}"
                         ToolTip.Tip="Run OCR on this batch's pages now, so the export itself doesn't have to wait for it"/>
                 <TextBlock Text="{Binding OcrStatusText}" FontSize="11" TextWrapping="Wrap"
-                           Foreground="{StaticResource InkTertiaryBrush}"
+                           Foreground="{DynamicResource InkTertiaryBrush}"
                            IsVisible="{Binding HasOcrStatus}"/>
 
                 <StackPanel Spacing="6" IsVisible="{Binding SupportsWatermark}">
                     <CheckBox IsChecked="{Binding WatermarkEnabled}" Content="Watermark"
                               ToolTip.Tip="Burns the selected watermark preset into every exported page, whichever format you choose."
-                              Foreground="{StaticResource InkMutedBrush}"/>
+                              Foreground="{DynamicResource InkMutedBrush}"/>
                     <!-- Stacked, not side by side. This column is about 240px wide, but a 160px
                          combo plus the button needs nearer 290 — so the button was laid out past
                          the panel edge, visible-ish but impossible to click. Both now stretch to
@@ -91,15 +91,15 @@
                 </StackPanel>
 
                 <StackPanel Spacing="6">
-                    <TextBlock Text="FILE NAME" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
-                    <TextBox Text="{Binding FileName}" Background="{StaticResource Surface2Brush}"
-                             Foreground="{StaticResource InkBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <TextBlock Text="FILE NAME" Classes="sectionLabel" FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding FileName}" Background="{DynamicResource Surface2Brush}"
+                             Foreground="{DynamicResource InkBrush}" BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
                 </StackPanel>
 
                 <StackPanel Spacing="6">
-                    <TextBlock Text="DESTINATION" Classes="sectionLabel" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"/>
-                    <TextBox Text="{Binding DestinationDirectory}" IsReadOnly="True" Background="{StaticResource Surface2Brush}"
-                             Foreground="{StaticResource InkMutedBrush}" BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                    <TextBlock Text="DESTINATION" Classes="sectionLabel" FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}"/>
+                    <TextBox Text="{Binding DestinationDirectory}" IsReadOnly="True" Background="{DynamicResource Surface2Brush}"
+                             Foreground="{DynamicResource InkMutedBrush}" BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
                     <Button Content="Browse…" Classes="secondary" HorizontalAlignment="Stretch"
                             Command="{Binding BrowseDestinationCommand}" CommandParameter="{Binding $parent[Window]}"/>
                 </StackPanel>
@@ -107,7 +107,7 @@
 
             <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,14,0,0" Spacing="6">
                 <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="13"
-                           Foreground="{StaticResource InkMutedBrush}"/>
+                           Foreground="{DynamicResource InkMutedBrush}"/>
 
                 <!-- Shown only while an export is running. A large batch is minutes of solid work;
                      without this the dialog looked frozen and there was no way to tell a healthy
@@ -118,11 +118,11 @@
                                  Height="6" CornerRadius="3"/>
                     <Grid ColumnDefinitions="*, Auto">
                         <TextBlock Grid.Column="0" Text="{Binding ProgressText}" FontSize="12"
-                                   Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis"/>
+                                   Foreground="{DynamicResource InkBrush}" TextTrimming="CharacterEllipsis"/>
                         <TextBlock Grid.Column="1" Text="{Binding ElapsedText}" FontSize="12"
-                                   Foreground="{StaticResource InkTertiaryBrush}"/>
+                                   Foreground="{DynamicResource InkTertiaryBrush}"/>
                     </Grid>
-                    <TextBlock FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" TextWrapping="Wrap"
+                    <TextBlock FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}" TextWrapping="Wrap"
                                Text="You can keep this window open — the batch isn't changed until the export finishes."/>
                 </StackPanel>
             </StackPanel>

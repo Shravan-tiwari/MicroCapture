@@ -6,11 +6,11 @@
         Width="420" SizeToContent="Height"
         CanResize="False"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
     <Border Classes="panel" Margin="18" Padding="20">
         <StackPanel Spacing="18">
             <TextBlock Name="MessageText" TextWrapping="Wrap" FontSize="14"
-                       Foreground="{StaticResource InkMutedBrush}"/>
+                       Foreground="{DynamicResource InkMutedBrush}"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
                 <Button Name="CancelButton" Content="Cancel" Classes="secondary"/>
                 <Button Name="ConfirmButton" Content="Confirm" Classes="primary"/>

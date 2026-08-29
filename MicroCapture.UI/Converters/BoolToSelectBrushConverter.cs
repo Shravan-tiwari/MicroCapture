@@ -2,6 +2,7 @@ using System;
 using System.Globalization;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
+using MicroCapture.UI.Theming;
 
 namespace MicroCapture.UI.Converters;
 
@@ -12,7 +13,8 @@ public class BoolToSelectBrushConverter : IValueConverter
 {
     public static readonly BoolToSelectBrushConverter Instance = new();
 
-    private static readonly IBrush Selected = new SolidColorBrush(Color.Parse("#5e6ad2"));
+    // Theme-reactive; see the note in StatusSeverityConverter.
+    private static IBrush Selected => SemanticBrushes.Accent;
     private static readonly IBrush Unselected = Brushes.Transparent;
 
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>

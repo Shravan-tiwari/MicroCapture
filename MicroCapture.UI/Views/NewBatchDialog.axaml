@@ -6,11 +6,11 @@
         Icon="/Assets/microcapture-icon.png"
         Width="620" Height="640"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
     <Border Classes="panel" Margin="18" Padding="20">
         <Grid RowDefinitions="Auto, Auto, *, Auto, Auto">
-            <TextBlock Grid.Row="0" Text="NEW BATCH" Classes="sectionLabel" Foreground="{StaticResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
-            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{StaticResource InkMutedBrush}" Margin="0,0,0,16"
+            <TextBlock Grid.Row="0" Text="NEW BATCH" Classes="sectionLabel" Foreground="{DynamicResource PrimaryHoverBrush}" Margin="0,0,0,14"/>
+            <TextBlock Grid.Row="1" TextWrapping="Wrap" FontSize="13" Foreground="{DynamicResource InkMutedBrush}" Margin="0,0,0,16"
                        Text="These settings apply to every page in the batch and are fixed once it's created, so all its pages come out matching. They're saved into the batch folder, so the batch opens with the same settings on any machine."/>
 
             <ScrollViewer Grid.Row="2">
@@ -19,29 +19,29 @@
                     <StackPanel Spacing="6">
                         <TextBlock Text="PROJECT CODE" Classes="sectionLabel"/>
                         <TextBox Text="{Binding ProjectCode}" Watermark="e.g. QLD-TOURISM"
-                                 Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
-                                 BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                                 Background="{DynamicResource Surface2Brush}" Foreground="{DynamicResource InkBrush}"
+                                 BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
                     </StackPanel>
 
                     <StackPanel Spacing="6">
                         <TextBlock Text="BATCH CODE" Classes="sectionLabel"/>
                         <TextBox Text="{Binding BatchCode}" Watermark="e.g. CAIRNS-001"
-                                 Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
-                                 BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                                 Background="{DynamicResource Surface2Brush}" Foreground="{DynamicResource InkBrush}"
+                                 BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
                     </StackPanel>
 
                     <StackPanel Spacing="6">
                         <TextBlock Text="BATCH LOCATION ON DRIVE" Classes="sectionLabel"/>
                         <Grid ColumnDefinitions="*, Auto">
                             <TextBox Grid.Column="0" Text="{Binding BatchLocation}" Watermark="Choose a folder…"
-                                     Background="{StaticResource Surface2Brush}" Foreground="{StaticResource InkBrush}"
-                                     BorderBrush="{StaticResource HairlineStrongBrush}" CornerRadius="8"/>
+                                     Background="{DynamicResource Surface2Brush}" Foreground="{DynamicResource InkBrush}"
+                                     BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
                             <Button Grid.Column="1" Content="Browse…" Classes="secondary" Margin="8,0,0,0"
                                     Command="{Binding BrowseCommand}"/>
                         </Grid>
-                        <TextBlock Text="{Binding ResolvedBatchFolder}" FontSize="11" Foreground="{StaticResource InkTertiaryBrush}"
+                        <TextBlock Text="{Binding ResolvedBatchFolder}" FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}"
                                    TextWrapping="Wrap"/>
-                        <TextBlock FontSize="11" Foreground="{StaticResource InkTertiaryBrush}" TextWrapping="Wrap"
+                        <TextBlock FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}" TextWrapping="Wrap"
                                    Text="Saving to a shared drive lets other workstations open this batch. A local folder works too — the batch can still be copied or moved later and will open correctly."/>
                     </StackPanel>
 
@@ -68,30 +68,30 @@
 
                     <StackPanel Spacing="8" Margin="0,4,0,0">
                         <TextBlock Text="PROCESSING" Classes="sectionLabel"/>
-                        <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource InkTertiaryBrush}"
+                        <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource InkTertiaryBrush}"
                                    Text="These are being built and can't be switched on yet. They're listed here so you can see what's coming."/>
                         <!-- Shown but not operable. Listing them communicates the roadmap; leaving
                              them clickable would let an operator set an option that silently does
                              nothing to their batch. -->
                         <StackPanel Spacing="8" IsEnabled="False" Opacity="0.55">
                             <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction  (in development)"
-                                      Foreground="{StaticResource InkMutedBrush}"/>
+                                      Foreground="{DynamicResource InkMutedBrush}"/>
                             <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split book pages  (in development)"
-                                      Foreground="{StaticResource InkMutedBrush}"/>
+                                      Foreground="{DynamicResource InkMutedBrush}"/>
                             <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (black &amp; white)  (in development)"
-                                      Foreground="{StaticResource InkMutedBrush}"/>
+                                      Foreground="{DynamicResource InkMutedBrush}"/>
                             <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough suppression  (in development)"
-                                      Foreground="{StaticResource InkMutedBrush}"/>
+                                      Foreground="{DynamicResource InkMutedBrush}"/>
                         </StackPanel>
                     </StackPanel>
 
                 </StackPanel>
             </ScrollViewer>
 
-            <Border Grid.Row="3" Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12,9" Margin="0,14,0,0"
+            <Border Grid.Row="3" Background="{DynamicResource Surface2Brush}" CornerRadius="8" Padding="12,9" Margin="0,14,0,0"
                     IsVisible="{Binding HasValidationMessage}">
                 <TextBlock Text="{Binding ValidationMessage}" TextWrapping="Wrap" FontSize="12"
-                           Foreground="{StaticResource InkBrush}"/>
+                           Foreground="{DynamicResource InkBrush}"/>
             </Border>
 
             <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,14,0,0">

@@ -13,6 +13,7 @@ using MicroCapture.Core.Data;
 using MicroCapture.Core.Interfaces;
 using MicroCapture.Core.Models;
 using MicroCapture.Core.Services;
+using MicroCapture.UI.Theming;
 using MicroCapture.UI.Views;
 
 namespace MicroCapture.UI.ViewModels;
@@ -29,6 +30,39 @@ public partial class MainWindowViewModel : ViewModelBase
     /// given one yet. This is what the manifest is read from and published back to.</summary>
     private string? _currentBatchFolder;
     private readonly AppPreferences _preferences = AppPreferences.Load();
+
+    // ───────────── Day / night mode ─────────────
+    // One control that cycles Dark → Light → System rather than three, because this is a
+    // preference an operator sets once and then forgets, not a mode they switch between while
+    // working. The label states which one is in force so the cycle is never a guess.
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ThemeModeLabel))]
+    [NotifyPropertyChangedFor(nameof(ThemeModeTooltip))]
+    private ThemeMode _themeMode = AppTheme.Current;
+
+    /// <summary>Sun for the light palette, moon for the dark one, half-moon for "whatever the OS
+    /// says". The glyph shows the mode that is on, not the one a click would bring.</summary>
+    public string ThemeModeLabel => ThemeMode switch
+    {
+        ThemeMode.Light => "\u2600",
+        ThemeMode.Dark => "\u263e",
+        _ => "\u25d1",
+    };
+
+    public string ThemeModeTooltip => ThemeMode switch
+    {
+        ThemeMode.Light => "Day mode. Click for system mode.",
+        ThemeMode.Dark => "Night mode. Click for day mode.",
+        _ => "Following the system setting. Click for night mode.",
+    };
+
+    [RelayCommand]
+    private void CycleTheme()
+    {
+        ThemeMode = AppTheme.Next(ThemeMode);
+        AppTheme.ApplyAndSave(ThemeMode, _preferences);
+    }
 
     // Refreshes this machine's claim on the open batch. Without it the lock ages past
     // BatchLockService.StaleAfter while the batch is still being worked, so a second workstation

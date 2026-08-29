@@ -15,7 +15,7 @@
         Icon="/Assets/microcapture-icon.png"
         Width="1400" Height="800"
         MinWidth="960" MinHeight="640"
-        Background="{StaticResource CanvasBrush}">
+        Background="{DynamicResource CanvasBrush}">
 
     <Design.DataContext>
         <vm:MainWindowViewModel/>
@@ -31,8 +31,8 @@
     <Grid RowDefinitions="Auto, *, 200, Auto">
 
         <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
-        <Border Grid.Row="0" Background="{StaticResource Surface1Brush}" Padding="14,10"
-                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+        <Border Grid.Row="0" Background="{DynamicResource Surface1Brush}" Padding="14,10"
+                BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="0,0,0,1">
             <Grid ColumnDefinitions="*, Auto, Auto">
                 <!-- Only the four buttons the workflow is built around live up here:
                      Connect/Disconnect, New Batch, Open Batch, Finalize Batch. Everything that
@@ -66,12 +66,12 @@
                 <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="10" VerticalAlignment="Center" Margin="16,0">
                     <StackPanel VerticalAlignment="Center" IsVisible="{Binding HasOpenBatch}">
                         <TextBlock Text="{Binding OpenBatchLabel}" FontSize="13" FontWeight="SemiBold"
-                                   Foreground="{StaticResource InkBrush}"/>
+                                   Foreground="{DynamicResource InkBrush}"/>
                         <TextBlock Text="{Binding OpenBatchSettingsLabel}" FontSize="11"
-                                   Foreground="{StaticResource InkTertiaryBrush}"/>
+                                   Foreground="{DynamicResource InkTertiaryBrush}"/>
                     </StackPanel>
                     <TextBlock Text="PAGE" Classes="sectionLabel" VerticalAlignment="Center" />
-                    <TextBlock Text="{Binding PageCount}" Foreground="{StaticResource PrimaryHoverBrush}"
+                    <TextBlock Text="{Binding PageCount}" Foreground="{DynamicResource PrimaryHoverBrush}"
                                VerticalAlignment="Center" FontSize="28" FontWeight="SemiBold"/>
                 </StackPanel>
 
@@ -81,8 +81,15 @@
                             Command="{Binding ToggleAutoCaptureCommand}"
                             Content="AUTO" FontWeight="SemiBold"
                             ToolTip.Tip="Automatically capture once the page is stable, in focus, and different from the last capture. In frame mode this watches the contents of your drawn frames rather than looking for a page boundary."/>
-                    <TextBlock Text="{Binding CameraModel}" Foreground="{StaticResource InkSubtleBrush}"
+                    <TextBlock Text="{Binding CameraModel}" Foreground="{DynamicResource InkSubtleBrush}"
                                VerticalAlignment="Center" FontSize="12" />
+                    <!-- Day/night. Sits with AUTO rather than with the four batch buttons on the
+                         left: like AUTO it changes how the operator works, not what the batch is,
+                         so it doesn't belong in the row the spec reserves for batch actions. -->
+                    <Button Classes="ghost" Command="{Binding CycleThemeCommand}"
+                            Content="{Binding ThemeModeLabel}" FontSize="16" Padding="8,4"
+                            VerticalAlignment="Center"
+                            ToolTip.Tip="{Binding ThemeModeTooltip}"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -91,8 +98,8 @@
         <Grid Grid.Row="1" ColumnDefinitions="*, 280">
 
             <!-- Live View Area -->
-            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
-                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+            <Border Grid.Column="0" Background="{DynamicResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding IsShowingLiveView}">
                 <Grid Name="LiveViewContainer">
                     <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
@@ -107,9 +114,9 @@
                             SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
                             IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
                     <!-- Overlay: readiness badge -->
-                    <Border Background="#cc0f1011" HorizontalAlignment="Left" VerticalAlignment="Top"
+                    <Border Background="{DynamicResource ScrimBrush}" HorizontalAlignment="Left" VerticalAlignment="Top"
                             Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"
-                            BorderBrush="{StaticResource HairlineStrongBrush}" BorderThickness="1">
+                            BorderBrush="{DynamicResource HairlineStrongBrush}" BorderThickness="1">
                         <TextBlock Text="{Binding CaptureReadiness}"
                                    Foreground="{Binding CaptureReadiness, Converter={x:Static conv:StatusSeverityConverter.Instance}}"
                                    FontWeight="SemiBold" FontSize="13" />
@@ -120,16 +127,16 @@
             <!-- Inline lens calibration panel — replaces the live view while it runs. Fixed
                  frames no longer have a panel of their own: they are edited directly on the
                  live view above. -->
-            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
-                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+            <Border Grid.Column="0" Background="{DynamicResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding LensCalibrationViewModel, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
                 <views:LensCalibrationPanel DataContext="{Binding LensCalibrationViewModel}"/>
             </Border>
 
             <!-- Crop Review — replaces the live view in place while reviewing/adjusting a
                  capture, instead of opening a separate popup window. -->
-            <Border Grid.Column="0" Background="{StaticResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
-                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+            <Border Grid.Column="0" Background="{DynamicResource CanvasBrush}" Margin="10,10,5,5" CornerRadius="10"
+                    BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding ActiveCropReview, Converter={x:Static acv:ObjectConverters.IsNotNull}}">
                 <views:CropReviewWindow DataContext="{Binding ActiveCropReview}"/>
             </Border>
@@ -140,18 +147,18 @@
                     <StackPanel Spacing="16">
                         <!-- Status Indicators -->
                         <TextBlock Text="STATUS" Classes="sectionLabel" />
-                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                        <Border Background="{DynamicResource Surface2Brush}" CornerRadius="8" Padding="12">
                             <StackPanel Spacing="8">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Focus" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
-                                    <TextBlock Text="{Binding FocusStatus}" Foreground="{StaticResource InkMutedBrush}" FontSize="13"/>
+                                    <TextBlock Text="Focus" Foreground="{DynamicResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="{Binding FocusStatus}" Foreground="{DynamicResource InkMutedBrush}" FontSize="13"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Exposure" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
-                                    <TextBlock Text="{Binding ExposureStatus}" Foreground="{StaticResource InkMutedBrush}" FontSize="13"/>
+                                    <TextBlock Text="Exposure" Foreground="{DynamicResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="{Binding ExposureStatus}" Foreground="{DynamicResource InkMutedBrush}" FontSize="13"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Document" Foreground="{StaticResource InkTertiaryBrush}" Width="76" FontSize="13"/>
+                                    <TextBlock Text="Document" Foreground="{DynamicResource InkTertiaryBrush}" Width="76" FontSize="13"/>
                                     <TextBlock Text="{Binding DocumentStatus}" FontSize="13" FontWeight="Medium"
                                                Foreground="{Binding DocumentStatus, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                                 </StackPanel>
@@ -162,14 +169,14 @@
                              becomes _frame01, _frame02, ... — so the list shows the mapping
                              explicitly and is reordered by hand, never auto-sorted. -->
                         <TextBlock Text="FRAMES" Classes="sectionLabel" Margin="0,4,0,0"/>
-                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                        <Border Background="{DynamicResource Surface2Brush}" CornerRadius="8" Padding="12">
                             <StackPanel Spacing="10">
                                 <TextBlock Text="{Binding FrameSummary}" FontSize="13" TextWrapping="Wrap"
-                                           Foreground="{StaticResource InkMutedBrush}"/>
+                                           Foreground="{DynamicResource InkMutedBrush}"/>
 
                                 <TextBlock Text="Drag on the live view to draw a frame. Drag inside one to move it, its handles to resize, and × or DEL to remove."
                                            FontSize="11" TextWrapping="Wrap"
-                                           Foreground="{StaticResource InkTertiaryBrush}"
+                                           Foreground="{DynamicResource InkTertiaryBrush}"
                                            IsVisible="{Binding !IsFrameMode}"/>
 
                                 <ItemsControl ItemsSource="{Binding FrameList}" IsVisible="{Binding IsFrameMode}">
@@ -181,7 +188,7 @@
                                                     <Border Width="10" Height="10" CornerRadius="2" VerticalAlignment="Center"
                                                             Background="{Binding Color}"/>
                                                     <TextBlock Text="{Binding Label}" FontSize="12" VerticalAlignment="Center"
-                                                               Foreground="{StaticResource InkMutedBrush}"/>
+                                                               Foreground="{DynamicResource InkMutedBrush}"/>
                                                 </StackPanel>
                                             </Border>
                                         </DataTemplate>
@@ -190,7 +197,7 @@
 
                                 <TextBlock Text="Frame editing is locked while pages are still processing."
                                            FontSize="11" TextWrapping="Wrap"
-                                           Foreground="{StaticResource WarningBrush}"
+                                           Foreground="{DynamicResource WarningBrush}"
                                            IsVisible="{Binding !AreFrameEditsAllowed}"/>
 
                                 <WrapPanel Orientation="Horizontal">
@@ -274,7 +281,7 @@
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate x:DataType="vm:CameraControlItem">
                                     <Grid ColumnDefinitions="*, 120" Margin="0,3">
-                                        <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkSubtleBrush}"
+                                        <TextBlock Text="{Binding DisplayName}" Foreground="{DynamicResource InkSubtleBrush}"
                                                    VerticalAlignment="Center" FontSize="13"/>
                                         <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
                                                   IsEnabled="{Binding !IsBusy}" HorizontalAlignment="Stretch">
@@ -291,30 +298,30 @@
 
                         <!-- Keyboard Shortcuts -->
                         <TextBlock Text="SHORTCUTS" Classes="sectionLabel" Margin="0,4,0,0" />
-                        <Border Background="{StaticResource Surface2Brush}" CornerRadius="8" Padding="12">
+                        <Border Background="{DynamicResource Surface2Brush}" CornerRadius="8" Padding="12">
                             <StackPanel Spacing="7">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Capture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Capture" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="SPACE" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Recapture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Recapture" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="R" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Toggle auto-capture" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Toggle auto-capture" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="A" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Browse pages" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Browse pages" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="← →" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Adjust browsed page" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Adjust browsed page" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="ENTER" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Delete frame or page" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Delete frame or page" Foreground="{DynamicResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="DEL" Classes="caption"/>
                                 </StackPanel>
                             </StackPanel>
@@ -331,14 +338,14 @@
                      (ctrl/shift-click). Kept inside the same fixed-height row as the filmstrip
                      itself, not a new row, so it doesn't grow/shrink the overall layout. -->
                 <Border Grid.Row="0" Margin="0,0,0,6"
-                        Background="{StaticResource Surface2Brush}" CornerRadius="6" Padding="10,6">
+                        Background="{DynamicResource Surface2Brush}" CornerRadius="6" Padding="10,6">
                     <Grid ColumnDefinitions="Auto,*,Auto">
                         <!-- Selection actions. Only shown when something is selected, so the bar
                              never offers an action that would do nothing. -->
                         <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center"
                                     IsVisible="{Binding HasSelection}">
                             <TextBlock Text="{Binding SelectedCount, StringFormat='{}{0} selected'}"
-                                       Foreground="{StaticResource InkBrush}" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource InkBrush}" VerticalAlignment="Center"
                                        FontSize="12" FontWeight="SemiBold"/>
                             <Button Content="Adjust Selected…" Classes="accentGhost"
                                     Command="{Binding ApplyAdjustmentsToSelectedCommand}"
@@ -360,7 +367,7 @@
                                     Command="{Binding ToggleSelectAllCommand}"
                                     ToolTip.Tip="Select every page in the cart"/>
                             <TextBlock VerticalAlignment="Center" FontSize="12"
-                                       Foreground="{StaticResource InkTertiaryBrush}"
+                                       Foreground="{DynamicResource InkTertiaryBrush}"
                                        Text="Click a page to adjust it · drag to reorder · ctrl-click to select several"/>
                         </StackPanel>
 
@@ -368,12 +375,12 @@
                              Capturing into the middle of a batch is surprising enough that it has
                              to be stated and easy to turn off. -->
                         <Border Grid.Column="1" IsVisible="{Binding HasInsertPoint}" Margin="12,0"
-                                Background="{StaticResource Surface1Brush}" CornerRadius="6" Padding="10,4"
-                                BorderBrush="{StaticResource PrimaryHoverBrush}" BorderThickness="1"
+                                Background="{DynamicResource Surface1Brush}" CornerRadius="6" Padding="10,4"
+                                BorderBrush="{DynamicResource PrimaryHoverBrush}" BorderThickness="1"
                                 HorizontalAlignment="Left" VerticalAlignment="Center">
                             <StackPanel Orientation="Horizontal" Spacing="10">
                                 <TextBlock Text="{Binding InsertPointLabel}" FontSize="11.5"
-                                           Foreground="{StaticResource InkBrush}" VerticalAlignment="Center"/>
+                                           Foreground="{DynamicResource InkBrush}" VerticalAlignment="Center"/>
                                 <Button Content="Add at end instead" Classes="secondary" FontSize="11" Padding="8,3"
                                         Command="{Binding ClearInsertPointCommand}"/>
                             </StackPanel>
@@ -432,8 +439,8 @@
                                 </Grid.RowDefinitions>
 
                                 <Button Classes="tile"
-                                        Background="{StaticResource Surface2Brush}"
-                                        BorderBrush="{Binding BorderColor, TargetNullValue={StaticResource HairlineBrush}}"
+                                        Background="{DynamicResource Surface2Brush}"
+                                        BorderBrush="{Binding BorderColor, TargetNullValue={DynamicResource HairlineBrush}}"
                                         BorderThickness="2" CornerRadius="8" Padding="6,6,6,5"
                                         HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
                                         ToolTip.Tip="Click to adjust this page · drag to reorder · ctrl-click to select"
@@ -443,19 +450,19 @@
                                         Click="OnThumbnailClick"
                                         Tag="{Binding JobId}">
                                     <StackPanel Spacing="5">
-                                        <Border CornerRadius="5" ClipToBounds="True" Background="{StaticResource Surface1Brush}">
+                                        <Border CornerRadius="5" ClipToBounds="True" Background="{DynamicResource Surface1Brush}">
                                             <Image Source="{Binding Thumbnail}" Height="64" Stretch="Uniform"/>
                                         </Border>
                                         <!-- The page number is what the operator navigates by, so
                                              it reads as the tile's label rather than a caption. -->
                                         <TextBlock Text="{Binding PageNumber, StringFormat='Page {0}'}"
                                                    HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource InkBrush}"/>
+                                                   Foreground="{DynamicResource InkBrush}"/>
                                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="4">
                                             <Ellipse Width="6" Height="6" VerticalAlignment="Center"
                                                      Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                                             <TextBlock Text="{Binding Status}" FontSize="9.5"
-                                                       Foreground="{StaticResource InkSubtleBrush}"
+                                                       Foreground="{DynamicResource InkSubtleBrush}"
                                                        TextTrimming="CharacterEllipsis" MaxWidth="66"/>
                                         </StackPanel>
                                     </StackPanel>
@@ -464,7 +471,7 @@
                                 <!-- Selection ring. Non-hit-testable so it never steals a click
                                      from the tile underneath it. -->
                                 <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
-                                        BorderBrush="{StaticResource PrimaryHoverBrush}"
+                                        BorderBrush="{DynamicResource PrimaryHoverBrush}"
                                         BorderThickness="2.5" IsHitTestVisible="False"/>
 
                                 <!-- The arrow-key browse cursor. Deliberately a different mark
@@ -472,7 +479,7 @@
                                      selecting it for a batch action are different acts, and one
                                      shouldn't look like the other. -->
                                 <Border IsVisible="{Binding IsCurrent}" CornerRadius="8"
-                                        BorderBrush="{StaticResource WarningBrush}"
+                                        BorderBrush="{DynamicResource WarningBrush}"
                                         BorderThickness="2" IsHitTestVisible="False"/>
 
                                 <!-- Select and delete sit in a top strip that appears on hover, or
@@ -509,12 +516,12 @@
         </Border>
 
         <!-- ═══════════════ STATUS BAR ═══════════════ -->
-        <Border Grid.Row="3" Background="{StaticResource Surface1Brush}" Padding="12,7"
-                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="3" Background="{DynamicResource Surface1Brush}" Padding="12,7"
+                BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="0,1,0,0">
             <Grid ColumnDefinitions="*, Auto">
-                <TextBlock Grid.Column="0" Text="{Binding StatusText}" Foreground="{StaticResource InkMutedBrush}" FontSize="12"
+                <TextBlock Grid.Column="0" Text="{Binding StatusText}" Foreground="{DynamicResource InkMutedBrush}" FontSize="12"
                            VerticalAlignment="Center" />
-                <TextBlock Grid.Column="1" Text="Micrographics v0.4.0" Foreground="{StaticResource InkTertiaryBrush}"
+                <TextBlock Grid.Column="1" Text="Micrographics v0.4.0" Foreground="{DynamicResource InkTertiaryBrush}"
                            FontSize="11" VerticalAlignment="Center" />
             </Grid>
         </Border>
