@@ -14,21 +14,75 @@
                 <Grid Name="ContainerGrid">
                     <!-- Adjust mode judges rotation/tone/color against the actual page, shown
                          large — PreviewImage is the same live-adjusted render the small LIVE
-                         PREVIEW panel already computes (RenderPreviewInto), just shown at full
-                         size here so changes are actually visible rather than needing to be
-                         judged from a thumbnail. This window only ever offers Adjust mode now —
-                         manual crop-quad/split-line/dewarp-curve editing has been removed. -->
-                    <Image Name="AdjustTargetImage"
-                           Source="{Binding PreviewImage}"
-                           Stretch="Uniform"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center"/>
+                         PREVIEW panel already computes, at full size here so changes are
+                         visible rather than judged from a thumbnail. This window only ever
+                         offers Adjust mode now — manual crop-quad/split-line/dewarp-curve
+                         editing has been removed.
+
+                         The image sits in a ScrollViewer and is given an explicit pixel size by
+                         the code-behind rather than being stretched to fit, because that is what
+                         makes zoom mean something: at fit the size is the fitted size, and past
+                         it the scroller pans over an image genuinely larger than the viewport.
+                         Stretch is None for the same reason — the size is the zoom. -->
+                    <ScrollViewer Name="PreviewScroller"
+                                  HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Auto">
+                        <Grid Name="ZoomHost" Background="Transparent">
+                            <Image Name="AdjustTargetImage"
+                                   Source="{Binding PreviewImage}"
+                                   Stretch="None"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"/>
+                        </Grid>
+                    </ScrollViewer>
+
                     <TextBlock Text="{Binding LoadErrorMessage}"
                                IsVisible="{Binding LoadErrorMessage, Converter={x:Static acv:StringConverters.IsNotNullOrEmpty}}"
                                Foreground="{DynamicResource InkMutedBrush}"
                                TextWrapping="Wrap" TextAlignment="Center"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                MaxWidth="360" FontSize="14"/>
+
+                    <!-- Loupe: the patch of page under the cursor, magnified, pinned near the
+                         pointer. Focus is the thing this window is most often opened to judge,
+                         and a whole page scaled into a panel is exactly the view in which soft
+                         focus is invisible. Not hit-testable — it must never eat the wheel
+                         events or drags it is floating over. -->
+                    <Border Name="Loupe" Width="196" Height="196" CornerRadius="98"
+                            IsVisible="False" IsHitTestVisible="False"
+                            HorizontalAlignment="Left" VerticalAlignment="Top"
+                            Background="{DynamicResource Surface1Brush}"
+                            BorderBrush="{DynamicResource PrimaryHoverBrush}" BorderThickness="2"
+                            ClipToBounds="True">
+                        <Image Name="LoupeImage" Stretch="Fill"/>
+                    </Border>
+
+                    <!-- Zoom controls, over the image rather than in the side panel: they act on
+                         this view, not on the page's stored adjustments, and nothing here is
+                         saved. -->
+                    <Border HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="14"
+                            Background="{DynamicResource ScrimBrush}" CornerRadius="8"
+                            BorderBrush="{DynamicResource HairlineStrongBrush}" BorderThickness="1"
+                            Padding="6,4">
+                        <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                            <Button Name="ZoomOutButton" Classes="ghost" Content="−" FontSize="16" Padding="9,1"
+                                    ToolTip.Tip="Zoom out"/>
+                            <TextBlock Name="ZoomLabel" Text="Fit" VerticalAlignment="Center"
+                                       MinWidth="42" TextAlignment="Center" FontSize="12"
+                                       Foreground="{DynamicResource InkMutedBrush}"/>
+                            <Button Name="ZoomInButton" Classes="ghost" Content="+" FontSize="16" Padding="9,1"
+                                    ToolTip.Tip="Zoom in"/>
+                            <Rectangle Width="1" Height="16" Margin="4,0" VerticalAlignment="Center"
+                                       Fill="{DynamicResource HairlineStrongBrush}"/>
+                            <Button Name="ZoomFitButton" Classes="ghost" Content="Fit" FontSize="12" Padding="7,3"
+                                    ToolTip.Tip="Fit the whole page in the window"/>
+                            <Button Name="ZoomActualButton" Classes="ghost" Content="100%" FontSize="12" Padding="7,3"
+                                    ToolTip.Tip="Show the preview at its own pixel size"/>
+                            <ToggleButton Name="LoupeToggle" Classes="secondary" Content="Loupe" FontSize="12"
+                                          Padding="7,3" IsChecked="True"
+                                          ToolTip.Tip="Magnify whatever is under the cursor"/>
+                        </StackPanel>
+                    </Border>
                 </Grid>
             </Border>
 

@@ -59,9 +59,23 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private Bitmap? _image;
     [ObservableProperty] private string _boundaryHintText = string.Empty;
 
-    // The full-frame corners passed to the preview renderer — this window no longer offers
-    // crop-quad editing, so the preview always renders against the whole image.
-    private CropPoint[] _fullFrameCorners = Array.Empty<CropPoint>();
+    // The corners the preview is rendered against — the page as it will actually be cropped,
+    // not the whole camera frame.
+    //
+    // When crop-quad editing was removed from this window these were left pinned to the full
+    // frame, so the preview showed the raw shot: desk, rig, and the operator's hands included.
+    // That made the window quietly useless for its one job — every adjustment was being judged
+    // against an image that is not the one being saved, and the cropping the pipeline does was
+    // invisible until export. They are filled in from the job's own crop box when it has one
+    // (a fixed-frame page), otherwise from the same boundary detection the processor runs, and
+    // only fall back to the full frame when neither is available.
+    private CropPoint[] _previewCorners = Array.Empty<CropPoint>();
+
+    /// <summary>The shape the preview is currently rendered against, in the original image's
+    /// pixels. Exposed for tests: the headless platform decodes every bitmap to a 1×1 stub, so
+    /// the rendered preview's size can't be inspected, and this is the decision that actually
+    /// distinguishes "the page" from "the whole frame".</summary>
+    public IReadOnlyList<CropPoint> PreviewCropCorners => _previewCorners;
 
     // ───────────── ADJUST MODE (rotate/flip/tone/color/sharpen) ─────────────
 
@@ -216,10 +230,8 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
                 using var ms = new MemoryStream(bytes);
                 var bmp = new Bitmap(ms);
                 Image = bmp;
-                ImageWidth = (int)bmp.Size.Width;
-                ImageHeight = (int)bmp.Size.Height;
-                _fullFrameCorners = RectCorners(0, 0, ImageWidth, ImageHeight);
                 _previewRenderer = CropPreviewRenderer.Create(derivative);
+                AdoptSourceSize(bmp);
                 BoundaryHintText = "Original photo already deleted (batch exported) — tone/rotation touch-ups only.";
                 RenderPreview();
             }
@@ -255,21 +267,45 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         {
             using var quickStream = File.OpenRead(job.OriginalFilePath);
             var quickBmp = new Bitmap(quickStream);
-            var imageWidth = (int)quickBmp.Size.Width;
-            var imageHeight = (int)quickBmp.Size.Height;
             Image = quickBmp;
-            ImageWidth = imageWidth;
-            ImageHeight = imageHeight;
-            _fullFrameCorners = RectCorners(0, 0, imageWidth, imageHeight);
             _previewRenderer = CropPreviewRenderer.Create(job.OriginalFilePath);
-            BoundaryHintText = "Adjust rotation, flip, and tone/color — reprocessing re-detects the page boundary automatically.";
+            AdoptSourceSize(quickBmp);
+            BoundaryHintText = "Finding the page…";
+            // Paint the whole frame immediately so the window is never blank, then narrow to the
+            // real page once it's known. Detection reads and analyses a full-resolution capture,
+            // which is too slow to hold the window closed for.
             RenderPreview();
+            ResolvePreviewCropAsync(job);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[CropReviewViewModel] Image decode failed: {ex}");
             LoadErrorMessage = $"Could not load this page: {ex.Message}";
         }
+    }
+
+    /// <summary>Records the source image's true pixel dimensions and seeds the preview shape
+    /// with the whole frame.
+    ///
+    /// <para>Taken from the preview renderer, which decodes with OpenCV, rather than from the
+    /// Avalonia bitmap. <c>Bitmap.Size</c> is in device-independent units, not pixels: for
+    /// anything carrying a resolution tag above 96 DPI — which is every scan this app produces —
+    /// it reports a fraction of the real size. Crop boxes and detected boundaries are in real
+    /// pixels, so mixing the two silently crops to a corner of the page.</para></summary>
+    private void AdoptSourceSize(Bitmap decoded)
+    {
+        if (_previewRenderer is { SourceWidth: > 0, SourceHeight: > 0 } renderer)
+        {
+            ImageWidth = renderer.SourceWidth;
+            ImageHeight = renderer.SourceHeight;
+        }
+        else
+        {
+            ImageWidth = decoded.PixelSize.Width;
+            ImageHeight = decoded.PixelSize.Height;
+        }
+
+        _previewCorners = RectCorners(0, 0, ImageWidth, ImageHeight);
     }
 
     private static CropPoint[] RectCorners(double x, double y, double w, double h) =>
@@ -281,12 +317,83 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         _previewTimer.Start();
     }
 
+    /// <summary>Works out what this page's preview should actually be cropped to, off the UI
+    /// thread, and re-renders once it knows.
+    ///
+    /// <para>Two sources, in order. A job carrying its own crop box is a fixed-frame page: the
+    /// operator drew that rectangle themselves, so it is definitive and no detection should
+    /// second-guess it. Anything else gets the same boundary detection the processor will run at
+    /// save time, so the preview and the output agree. If neither produces a usable shape the
+    /// whole frame stays — which is also what the processor falls back to, so the preview is
+    /// still honest — and the hint says so rather than letting an uncropped preview read as a
+    /// detection that succeeded.</para></summary>
+    private void ResolvePreviewCropAsync(CaptureJob job)
+    {
+        var imagePath = job.OriginalFilePath;
+        var cropBox = job.LeftCropBox;
+        var manualCrop = job.ManualOverrideApplied;
+        var width = ImageWidth;
+        var height = ImageHeight;
+
+        Task.Run(() =>
+        {
+            CropPoint[]? corners = null;
+            var hint = string.Empty;
+            try
+            {
+                if (manualCrop && !string.IsNullOrWhiteSpace(cropBox))
+                {
+                    var parsed = ImageProcessor.ParseCropShape(cropBox, width, height);
+                    if (parsed.Length == 4)
+                    {
+                        corners = parsed;
+                        hint = "Showing this page's frame. Adjust rotation, flip, and tone/color.";
+                    }
+                }
+
+                if (corners == null)
+                {
+                    var boundary = new ImageProcessor().DetectDocumentBoundary(imagePath);
+                    if (boundary is { } found)
+                    {
+                        corners = found.Quad is { Length: 4 } quad
+                            ? quad
+                            : RectCorners(found.X, found.Y, found.Width, found.Height);
+                        hint = "Showing the cropped page. Adjust rotation, flip, and tone/color.";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Advisory: a detection failure must leave a usable window, not an empty one.
+                Console.Error.WriteLine($"[CropReviewViewModel] Preview crop detection failed: {ex}");
+            }
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (_disposed) return;
+                if (corners is { Length: 4 })
+                {
+                    _previewCorners = corners;
+                    BoundaryHintText = hint;
+                    RenderPreview();
+                }
+                else
+                {
+                    // Said plainly. An uncropped preview that looks like a successful one would
+                    // have the operator adjust against the wrong image without knowing it.
+                    BoundaryHintText = "No page boundary found — showing the whole frame. Reprocessing will try again.";
+                }
+            });
+        });
+    }
+
     private void RenderPreview()
     {
         var renderer = _previewRenderer;
         if (renderer == null) return;
 
-        var corners = _fullFrameCorners;
+        var corners = _previewCorners;
         var adjustSnapshot = (RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance);
 
         Task.Run(() =>
@@ -497,8 +604,14 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         Saved?.Invoke(this, EventArgs.Empty);
     }
 
+    // Detection runs on a background thread and posts its result back; the window can be closed
+    // before it lands, and rendering into a disposed renderer would throw on a thread with no
+    // one to catch it.
+    private bool _disposed;
+
     public void Dispose()
     {
+        _disposed = true;
         _previewTimer.Stop();
         _previewRenderer?.Dispose();
         _previewRenderer = null;

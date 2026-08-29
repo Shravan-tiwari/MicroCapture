@@ -69,6 +69,7 @@ TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
 await TestLiveViewRotationAppliesToNewCapturesOnly();
+await TestCropReviewPreviewsTheCroppedPageNotTheWholeFrame();
 TestPdfEncodingQuality();
 TestEveryCaptureFormatIsDecodableForExport();
 TestCapturesLiveInTempAndOutputsInOutput();
@@ -1846,6 +1847,114 @@ void AppendTiffPageForTest(BitMiracle.LibTiff.Classic.Tiff output, string source
         output.WriteScanline(row, y);
     }
     output.WriteDirectory();
+}
+
+async Task TestCropReviewPreviewsTheCroppedPageNotTheWholeFrame()
+{
+    Console.WriteLine("\n-- Crop Review previews the cropped page, not the raw camera frame --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "croppreview.db");
+
+    // A page occupying part of a much larger frame — the shape of every real capture, and the
+    // case where showing the whole frame instead of the page is unmistakable.
+    const int frameWidth = 1600, frameHeight = 1200;
+    var pageRect = new SKRectI(400, 260, 1180, 980);
+    var capture = WriteBoundaryTestImage(Path.Combine(workDir, "spread.png"), frameWidth, frameHeight, pageRect);
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+    var project = new Project { Name = "CROPPREV", OutputDirectory = workDir };
+    db.Projects.Add(project);
+    await db.SaveChangesAsync();
+    var batch = new Batch { Id = Guid.NewGuid().ToString(), ProjectId = project.Id, Name = "CROPPREV" };
+    db.Batches.Add(batch);
+    await db.SaveChangesAsync();
+
+    // The rendered preview can't be measured here: the headless platform decodes every bitmap to
+    // a 1x1 stub. What matters anyway is the shape the preview is rendered against — that is the
+    // decision this window was getting wrong.
+    double Area(IReadOnlyList<CropPoint> corners)
+    {
+        if (corners.Count != 4) return 0;
+        var width = Math.Abs(corners[1].X - corners[0].X);
+        var height = Math.Abs(corners[3].Y - corners[0].Y);
+        return width * height;
+    }
+    var wholeFrameArea = (double)frameWidth * frameHeight;
+
+    // 1. The ordinary case: no stored crop box, so the preview shape has to come from the same
+    //    boundary detection the processor runs at save time.
+    var detected = await queue.EnqueueCaptureAsync(batch.Id, capture, 1, "PNG");
+    var detectedVm = new CropReviewViewModel(detected.Id, db, queue);
+    PumpUntil(() => !detectedVm.BoundaryHintText.Contains("Finding", StringComparison.Ordinal), timeoutMs: 30000);
+
+    Check("Crop Review renders a preview", detectedVm.PreviewImage != null);
+    var detectedArea = Area(detectedVm.PreviewCropCorners);
+    Check($"The preview is cropped to the detected page, not the whole camera frame ({detectedArea / wholeFrameArea:P0} of the frame)",
+        detectedArea > 0 && detectedArea < wholeFrameArea * 0.85);
+    Check($"The operator is told what they are looking at (\"{detectedVm.BoundaryHintText}\")",
+        detectedVm.BoundaryHintText.Contains("cropped page", StringComparison.OrdinalIgnoreCase));
+    detectedVm.Dispose();
+
+    // 2. A fixed-frame page carries the rectangle the operator drew themselves. That is
+    //    definitive — the preview must use it rather than re-detecting and second-guessing them.
+    var framed = await queue.EnqueueCaptureAsync(batch.Id, capture, 2, "PNG", 150, "600,300,300,700");
+    var framedVm = new CropReviewViewModel(framed.Id, db, queue);
+    PumpUntil(() => !framedVm.BoundaryHintText.Contains("Finding", StringComparison.Ordinal), timeoutMs: 30000);
+
+    var corners = framedVm.PreviewCropCorners;
+    Check($"A fixed-frame page previews exactly the frame the operator drew ({string.Join(" ", corners.Select(c => $"{c.X:0},{c.Y:0}"))})",
+        corners.Count == 4
+        && Math.Abs(corners[0].X - 600) < 1 && Math.Abs(corners[0].Y - 300) < 1
+        && Math.Abs(corners[2].X - 900) < 1 && Math.Abs(corners[2].Y - 1000) < 1);
+    Check($"...and says so (\"{framedVm.BoundaryHintText}\")",
+        framedVm.BoundaryHintText.Contains("frame", StringComparison.OrdinalIgnoreCase));
+    framedVm.Dispose();
+
+    // 3. Nothing detectable: the whole frame is still shown, because that is also what the
+    //    processor falls back to — but it must not be presented as a successful crop.
+    var blank = WriteSolidImage(Path.Combine(workDir, "blank.png"), 900, 700);
+    var blankJob = await queue.EnqueueCaptureAsync(batch.Id, blank, 3, "PNG");
+    var blankVm = new CropReviewViewModel(blankJob.Id, db, queue);
+    PumpUntil(() => !blankVm.BoundaryHintText.Contains("Finding", StringComparison.Ordinal), timeoutMs: 30000);
+    Check($"An undetectable page says so instead of passing the whole frame off as the page (\"{blankVm.BoundaryHintText}\")",
+        blankVm.BoundaryHintText.Contains("whole frame", StringComparison.OrdinalIgnoreCase));
+    Check("...and still shows the whole frame rather than nothing at all",
+        Math.Abs(Area(blankVm.PreviewCropCorners) - 900.0 * 700.0) < 1);
+    blankVm.Dispose();
+
+    // 4. And those corners really do produce a smaller image — the renderer is what the UI shows,
+    //    so check the shape actually crops rather than trusting the numbers alone.
+    using (var renderer = CropPreviewRenderer.Create(capture))
+    {
+        var wholeFrame = renderer!.RenderPreview(new[]
+        {
+            new CropPoint(0, 0), new CropPoint(frameWidth, 0),
+            new CropPoint(frameWidth, frameHeight), new CropPoint(0, frameHeight)
+        });
+        var cropped = renderer.RenderPreview(new[]
+        {
+            new CropPoint(600, 300), new CropPoint(900, 300),
+            new CropPoint(900, 1000), new CropPoint(600, 1000)
+        });
+        Check($"A cropped preview really is a different, smaller render than the whole frame ({cropped?.Length} vs {wholeFrame?.Length} bytes)",
+            wholeFrame != null && cropped != null && cropped.Length < wholeFrame.Length);
+    }
+
+    // 5. The window itself still builds — the preview area is now a scroller, a loupe and a zoom
+    //    bar rather than one Image, and a bad resource key there only throws on construction.
+    try
+    {
+        var reviewWindow = new CropReviewWindow { DataContext = new CropReviewViewModel(detected.Id, db, queue) };
+        Dispatcher.UIThread.RunJobs();
+        Check("The zoomable Crop Review window builds without a missing resource or binding",
+            reviewWindow.Content != null);
+        (reviewWindow.DataContext as CropReviewViewModel)?.Dispose();
+    }
+    catch (Exception ex)
+    {
+        Check($"The zoomable Crop Review window builds ({ex.GetType().Name}: {ex.Message})", false);
+    }
 }
 
 async Task TestLiveViewRotationAppliesToNewCapturesOnly()
