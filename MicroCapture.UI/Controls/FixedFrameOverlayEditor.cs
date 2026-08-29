@@ -404,6 +404,12 @@ public class FixedFrameOverlayEditor : Control
             var fill = new SolidColorBrush(Color.FromArgb(isSelected ? (byte)55 : (byte)30, color.R, color.G, color.B));
             context.DrawRectangle(fill, stroke, displayRect);
 
+            // Every frame carries its number, not just the selected one. Frame order decides
+            // output page order, so which frame is which is exactly what the operator needs to
+            // read at a glance — and colour alone can't say it when a batch has more frames than
+            // the palette has entries.
+            DrawFrameNumber(context, displayRect, i + 1, color);
+
             if (!IsEditingEnabled) continue;
 
             foreach (var handle in FrameGeometry.AllHandles)
@@ -431,6 +437,25 @@ public class FixedFrameOverlayEditor : Control
                 bandRect);
             DrawSizeReadout(context, band, bandRect);
         }
+    }
+
+    /// <summary>Draws a frame's 1-based number in its top-left corner, on the frame's own colour
+    /// so number and outline read as the same object. Sits inside the frame rather than outside,
+    /// so it can't be clipped at the edge of the live view or overlap a neighbour.</summary>
+    private static void DrawFrameNumber(DrawingContext context, Rect displayRect, int number, Color color)
+    {
+        if (displayRect.Width < 22 || displayRect.Height < 22) return;
+
+        var text = new FormattedText(number.ToString(), System.Globalization.CultureInfo.InvariantCulture,
+            FlowDirection.LeftToRight, Typeface.Default, 12, Brushes.White);
+
+        const double padding = 5;
+        var width = Math.Max(18, text.Width + padding * 2);
+        var height = text.Height + 3;
+        var badge = new Rect(displayRect.X + 3, displayRect.Y + 3, width, height);
+
+        context.DrawRectangle(new SolidColorBrush(color), null, new RoundedRect(badge, 3));
+        context.DrawText(text, new Point(badge.X + (badge.Width - text.Width) / 2, badge.Y + 1));
     }
 
     private static void DrawHandle(DrawingContext context, double cx, double cy, Color color)

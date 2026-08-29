@@ -75,6 +75,7 @@ await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
 await TestSaveAppliesToEverySelectedPage();
 await TestCartAdjustmentUndoRedo();
+TestFrameColoursAreDistinguishable();
 TestWatermarkEditorOpensWithExistingPreset();
 TestAutoCaptureWaitsForThePageTurnToFinish();
 await TestExportOutputsAreActuallyCorrect();
@@ -1127,6 +1128,41 @@ async Task TestCartAdjustmentUndoRedo()
     }
     await RunPumped(() => vm.RecordAdjustmentEditAsync("page adjustment", new[] { jobId }, before2), timeoutMs: 20000);
     Check("A new edit discards the redo branch", !vm.CanRedoAdjustment);
+}
+
+void TestFrameColoursAreDistinguishable()
+{
+    Console.WriteLine("\n-- Adjacent frames get visibly different colours --");
+
+    // Frames are numbered from 0 up, so entries 0 and 1 are the pair an operator sees most.
+    // Those used to be two shades of the same indigo, so the first two frames drawn on the live
+    // view looked identical and there was no way to tell which was which.
+    double Distance(Avalonia.Media.Color a, Avalonia.Media.Color b)
+    {
+        // Rough perceptual weighting — greens read as further apart than blues at equal
+        // numeric distance, and a plain RGB delta would call two blues "different enough".
+        double dr = a.R - b.R, dg = a.G - b.G, dbl = a.B - b.B;
+        return Math.Sqrt(2 * dr * dr + 4 * dg * dg + 3 * dbl * dbl);
+    }
+
+    var worstPair = "";
+    var worst = double.MaxValue;
+    for (var i = 0; i < 8; i++)
+    {
+        var a = MicroCapture.UI.FixedFrameColorPalette.GetColor(i);
+        var b = MicroCapture.UI.FixedFrameColorPalette.GetColor(i + 1);
+        var d = Distance(a, b);
+        if (d < worst) { worst = d; worstPair = $"{i + 1} and {i + 2}"; }
+    }
+
+    Console.WriteLine($"  [info] closest adjacent pair: frames {worstPair}, distance {worst:F0}");
+    Check($"Every adjacent frame pair is clearly distinct (closest: frames {worstPair} at {worst:F0})", worst > 150);
+
+    // And no two frames within one palette cycle share a colour outright.
+    var distinct = Enumerable.Range(0, 8)
+        .Select(i => MicroCapture.UI.FixedFrameColorPalette.GetColor(i).ToString())
+        .Distinct().Count();
+    Check("All eight palette entries are different colours", distinct == 8);
 }
 
 void TestWatermarkEditorOpensWithExistingPreset()
