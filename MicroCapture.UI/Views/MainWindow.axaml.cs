@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
@@ -282,6 +283,56 @@ public partial class MainWindow : Window
     /// scrolls horizontally only — so the wheel did nothing over it and the strip appeared stuck
     /// at whichever pages were on screen. A mouse without a horizontal wheel had no way to reach
     /// the rest of the batch except by dragging the scrollbar.</para></summary>
+    /// <summary>Delete acts on the current context: a selected frame first, then the page being
+    /// browsed, then a cart selection. Deleting a page asks first — unlike removing a frame, it
+    /// cannot be undone.</summary>
+    private async Task HandleDeleteKeyAsync(MainWindowViewModel vm)
+    {
+        if (vm.SelectedFrameIndex >= 0)
+        {
+            vm.HandleKeyShortcut("Delete");
+            return;
+        }
+
+        var browsing = vm.CurrentBrowsePageItem;
+        if (browsing != null)
+        {
+            var confirmed = await ConfirmDialog.AskAsync(this,
+                $"Delete page {browsing.PageNumber} from this batch?\n\n" +
+                "It will be removed from the cart and from any export. This can't be undone.",
+                "Delete page");
+            if (confirmed) await vm.DeleteCaptureAsync(browsing);
+            return;
+        }
+
+        if (vm.HasSelection)
+        {
+            vm.DeleteSelectedCommand.Execute(this);
+            return;
+        }
+
+        vm.StatusText = "Nothing to delete — select a frame, browse to a page with the arrow keys, or select pages in the cart.";
+    }
+
+    /// <summary>Brings the browsed page into view, centred so the pages either side stay visible —
+    /// which is the point of browsing rather than jumping. Deferred so the scroller sees the
+    /// layout the change produced rather than the one before it.</summary>
+    private void ScrollBrowsedPageIntoView(MainWindowViewModel vm)
+    {
+        var index = vm.BrowseRequestedIndex;
+        if (index < 0) return;
+
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
+            if (scroller == null) return;
+            const double tileStride = 118; // tile plus its insert-point button
+            var target = index * tileStride - (scroller.Viewport.Width - tileStride) / 2;
+            var maximum = Math.Max(0, scroller.Extent.Width - scroller.Viewport.Width);
+            scroller.Offset = scroller.Offset.WithX(Math.Clamp(target, 0, maximum));
+        }, Avalonia.Threading.DispatcherPriority.Background);
+    }
+
     private void OnFilmstripWheel(object? sender, PointerWheelEventArgs e)
     {
         if (sender is not ScrollViewer scroller) return;
@@ -365,34 +416,30 @@ public partial class MainWindow : Window
                     vm.HandleKeyShortcut("A");
                     e.Handled = true;
                     break;
-                case Key.Delete:
-                case Key.Back:
-                    // Removes the selected fixed frame. Safe to claim unconditionally here: the
-                    // TextBox early-out above already protects text editing, which is the only
-                    // other thing in this window that wants these keys.
-                    vm.HandleKeyShortcut("Delete");
+                case Key.Left:
+                    vm.BrowsePages(-1);
+                    ScrollBrowsedPageIntoView(vm);
                     e.Handled = true;
                     break;
-                case Key.F2:
-                    // Debug: cycle every camera control to the next option (fallback when mouse is blocked)
-                    try
+                case Key.Right:
+                    vm.BrowsePages(1);
+                    ScrollBrowsedPageIntoView(vm);
+                    e.Handled = true;
+                    break;
+                case Key.Enter:
+                    // Only claimed while browsing; otherwise Enter belongs to whatever has focus.
+                    if (vm.CurrentBrowsePageItem != null)
                     {
-                        foreach (var ctrl in vm.CameraControls)
-                        {
-                            var opts = ctrl.Options;
-                            if (opts == null || opts.Count == 0) continue;
-                            var current = ctrl.SelectedOption;
-                            int idx = -1;
-                            if (current != null)
-                            {
-                                for (int i = 0; i < opts.Count; i++) if (opts[i].Value == current.Value) { idx = i; break; }
-                            }
-                            var next = opts[(idx + 1) % opts.Count];
-                            ctrl.SelectedOption = next;
-                            Console.WriteLine($"[F2] Cycled {ctrl.DisplayName} -> {next.DisplayName}");
-                        }
+                        vm.OpenCurrentBrowsePage();
+                        e.Handled = true;
                     }
-                    catch (Exception ex) { Console.WriteLine($"[F2] cycle failed: {ex}"); }
+                    break;
+                case Key.Delete:
+                case Key.Back:
+                    // Acts on whatever the operator is actually working with. It used to remove a
+                    // fixed frame unconditionally, so pressing it while browsing pages either did
+                    // nothing (no frame selected) or removed a frame they weren't looking at.
+                    _ = HandleDeleteKeyAsync(vm);
                     e.Handled = true;
                     break;
             }

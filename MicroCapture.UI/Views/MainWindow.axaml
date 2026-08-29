@@ -310,7 +310,11 @@
                                     <TextBlock Text="← →" Classes="caption"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="Remove frame" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="Adjust browsed page" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
+                                    <TextBlock Text="ENTER" Classes="caption"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Delete frame or page" Foreground="{StaticResource InkMutedBrush}" FontSize="12" Width="130"/>
                                     <TextBlock Text="DEL" Classes="caption"/>
                                 </StackPanel>
                             </StackPanel>
@@ -462,6 +466,14 @@
                                 <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
                                         BorderBrush="{StaticResource PrimaryHoverBrush}"
                                         BorderThickness="2.5" IsHitTestVisible="False"/>
+
+                                <!-- The arrow-key browse cursor. Deliberately a different mark
+                                     from the selection ring: browsing to look at a page and
+                                     selecting it for a batch action are different acts, and one
+                                     shouldn't look like the other. -->
+                                <Border IsVisible="{Binding IsCurrent}" CornerRadius="8"
+                                        BorderBrush="{StaticResource WarningBrush}"
+                                        BorderThickness="2" IsHitTestVisible="False"/>
 
                                 <!-- Select and delete sit in a top strip that appears on hover, or
                                      stays put while selected. They used to be two 20px circles

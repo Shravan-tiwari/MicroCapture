@@ -125,6 +125,51 @@ public partial class MainWindowViewModel : ViewModelBase
             ? MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, batchCode)
             : BatchFolder.ThumbnailsPath(_currentBatchFolder);
 
+    // ---------- Page browsing ----------
+
+    /// <summary>Moves the browse cursor through the cart. The shortcuts panel has advertised
+    /// "Browse pages ← →" since before there was any handler for the arrow keys, so this did
+    /// nothing at all.</summary>
+    public void BrowsePages(int delta)
+    {
+        if (RecentCaptures.Count == 0)
+        {
+            StatusText = "No pages to browse yet.";
+            return;
+        }
+
+        var current = RecentCaptures.ToList().FindIndex(t => t.IsCurrent);
+        // Starting fresh from an arrow press lands on the first or last page depending on
+        // direction, rather than jumping to whichever end the list happens to begin at.
+        var next = current < 0
+            ? (delta > 0 ? 0 : RecentCaptures.Count - 1)
+            : Math.Clamp(current + delta, 0, RecentCaptures.Count - 1);
+
+        for (var i = 0; i < RecentCaptures.Count; i++) RecentCaptures[i].IsCurrent = i == next;
+
+        CurrentBrowsePage = RecentCaptures[next].PageNumber;
+        BrowseRequestedIndex = next;
+        BrowseScrollRequested?.Invoke(this, next);
+        StatusText = $"Page {RecentCaptures[next].PageNumber} of {RecentCaptures.Count} — Enter to adjust it, Delete to remove it.";
+    }
+
+    /// <summary>Index the view should scroll into sight. Raised rather than bound so the view can
+    /// scroll after layout has caught up with the change.</summary>
+    public event EventHandler<int>? BrowseScrollRequested;
+    public int BrowseRequestedIndex { get; private set; } = -1;
+    [ObservableProperty] private int _currentBrowsePage;
+
+    /// <summary>Opens whichever page the browse cursor is on.</summary>
+    public void OpenCurrentBrowsePage()
+    {
+        var current = RecentCaptures.FirstOrDefault(t => t.IsCurrent);
+        if (current == null) { StatusText = "Use the arrow keys to pick a page first."; return; }
+        OpenCropReview(current.JobId, selectionForBulkApply: null);
+    }
+
+    /// <summary>The page the Delete key should act on: the one being browsed, or nothing.</summary>
+    public ThumbnailItem? CurrentBrowsePageItem => RecentCaptures.FirstOrDefault(t => t.IsCurrent);
+
     // ---------- Insert point ----------
 
     /// <summary>Where the next capture lands, when the operator has chosen a spot in the cart
@@ -3021,6 +3066,12 @@ public partial class ThumbnailItem : ObservableObject
     // tracked independently of Status rather than folded into it.
     [ObservableProperty] private string _ocrStatus = "Pending";
     [ObservableProperty] private string _filePath = "";
+
+    /// <summary>The page the arrow keys are currently on. Deliberately separate from IsSelected:
+    /// browsing through pages to look at them is not the same act as selecting pages to run a
+    /// batch action over, and conflating the two made stepping through a batch silently build up
+    /// a selection.</summary>
+    [ObservableProperty] private bool _isCurrent;
 
     // Which fixed frame this thumbnail represents within its capture (0 for an ordinary,
     // non-fixed-frame capture — always exactly one thumbnail per job in that case).
