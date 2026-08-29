@@ -411,6 +411,22 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             }
 
             await _dbContext.SaveChangesAsync();
+
+            // Opened for a multi-selection, Save covers the whole selection.
+            //
+            // It used to write only the page on screen, leaving the other selected pages
+            // untouched unless the operator also found and pressed "Apply to Selected" — so
+            // choosing "Adjust Selected", confirming it would affect N pages, adjusting, and
+            // saving changed exactly one of them. The scope was already agreed at the cart, so
+            // asking again here (or requiring a second button) contradicts what the operator was
+            // told would happen.
+            if (_selectionForBulkApply.Count > 0)
+            {
+                var others = _selectionForBulkApply.Where(id => id != _jobId).ToList();
+                if (others.Count > 0)
+                    BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => others.Contains(j.Id)));
+            }
+
             Saved?.Invoke(this, EventArgs.Empty);
         }
 
@@ -440,6 +456,9 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             confirmed => { if (confirmed) BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => j.BatchId == _batchId && j.Id != _jobId)); }));
     }
 
+    /// <summary>Applies to the rest of the selection without closing, for an operator who wants
+    /// to see it land before committing. Save does this too, so this is a convenience rather
+    /// than a required step — which is exactly what it used to be mistaken for.</summary>
     [RelayCommand]
     private void ApplyToSelection()
     {

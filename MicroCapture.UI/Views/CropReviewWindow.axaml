@@ -102,8 +102,12 @@
                         <StackPanel Spacing="8" IsVisible="{Binding !IsPostExportAdjustOnly}">
                             <TextBlock Text="BATCH" Classes="sectionLabel" Foreground="{StaticResource InkSubtleBrush}"/>
                             <Button Content="Apply to All in Batch" Command="{Binding ApplyToAllCommand}" Classes="secondary" HorizontalAlignment="Stretch"/>
-                            <Button Content="Apply to Selected" Command="{Binding ApplyToSelectionCommand}" Classes="secondary"
-                                    HorizontalAlignment="Stretch" IsVisible="{Binding HasSelectionForBulkApply}"/>
+                            <Button Content="Apply to Selected Now" Command="{Binding ApplyToSelectionCommand}" Classes="secondary"
+                                    HorizontalAlignment="Stretch" IsVisible="{Binding HasSelectionForBulkApply}"
+                                    ToolTip.Tip="Apply to the other selected pages without closing. Saving applies to them too, so this is optional."/>
+                            <TextBlock IsVisible="{Binding HasSelectionForBulkApply}" FontSize="11" TextWrapping="Wrap"
+                                       Foreground="{StaticResource InkTertiaryBrush}"
+                                       Text="Saving applies these adjustments to every page you selected."/>
                         </StackPanel>
                     </StackPanel>
                 </StackPanel>

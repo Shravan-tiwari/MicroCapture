@@ -73,6 +73,7 @@ TestEncoderSupport();
 await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
+await TestSaveAppliesToEverySelectedPage();
 await TestCartAdjustmentUndoRedo();
 TestWatermarkEditorOpensWithExistingPreset();
 TestAutoCaptureWaitsForThePageTurnToFinish();
@@ -1007,6 +1008,55 @@ void TestBatchManifestSurvivesInterruptedWrite()
     var unrecoverable = service.Validate(batchFolder);
     Check("An unrecoverable manifest fails with a clear message", !unrecoverable.IsValid);
     Check("The unrecoverable error mentions damage", unrecoverable.Error?.Contains("damaged") == true);
+}
+
+async Task TestSaveAppliesToEverySelectedPage()
+{
+    Console.WriteLine("\n-- Saving from a multi-selection changes every selected page --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "bulk.db");
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "BULK";
+    vm.BatchCode = "BULK";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    for (var i = 0; i < 3; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")), timeoutMs: 40000);
+
+    var selected = vm.RecentCaptures.Select(t => t.JobId).ToList();
+    Check("Three pages available to select", selected.Count == 3);
+
+    using var db = new AppDbContext(dbPath);
+    var queue = new CaptureQueueService(db);
+
+    // Exactly what "Adjust Selected" does: open Crop Review on the first page, carrying the
+    // whole selection.
+    var crop = new CropReviewViewModel(selected[0], db, queue, selected);
+    PumpUntil(() => crop.Image != null, timeoutMs: 20000);
+    Check("Crop Review knows it has a selection", crop.HasSelectionForBulkApply);
+
+    crop.Brightness = 0.42;
+    crop.RotationDegrees = 90;
+    Dispatcher.UIThread.RunJobs();
+
+    // Save alone — no second button. Previously this wrote only the page on screen, so choosing
+    // "Adjust Selected", confirming N pages, and saving changed exactly one of them.
+    var window = new CropReviewWindow { DataContext = crop };
+    await RunPumped(() => crop.SaveCommand.ExecuteAsync(window), timeoutMs: 30000);
+
+    using var verify = new AppDbContext(dbPath);
+    var jobs = verify.CaptureJobs.AsNoTracking().Where(j => selected.Contains(j.Id)).ToList();
+    Check("All three selected pages were updated", jobs.Count == 3);
+    Check("Every selected page got the brightness",
+        jobs.All(j => Math.Abs(j.Brightness - 0.42) < 0.001));
+    Check("Every selected page got the rotation", jobs.All(j => j.RotationDegrees == 90));
+    Check("Every selected page is re-queued for reprocessing",
+        jobs.All(j => j.ProcessingStatus == "Pending"));
 }
 
 async Task TestCartAdjustmentUndoRedo()
