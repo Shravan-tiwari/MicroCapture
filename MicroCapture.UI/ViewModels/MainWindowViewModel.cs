@@ -2500,7 +2500,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // This window only ever offers Adjust mode now (manual crop-quad/split-line/dewarp-curve
         // editing removed), so openInAdjustMode no longer needs to do anything here.
-        var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
 
         // Snapshot before the operator can change anything, so an edit can be undone from the
         // cart.
@@ -2516,6 +2515,13 @@ public partial class MainWindowViewModel : ViewModelBase
         // the operator: a quick save could land before the snapshot existed, and the edit would
         // silently record nothing to undo.
         var baseline = SnapshotBatchAdjustments(jobId, selectionForBulkApply);
+
+        // Constructed after the snapshot: both share this context, and the snapshot clears its
+        // change tracker. Loading first meant clearing the tracker out from under a window that
+        // had just populated it.
+        var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
+        cropReviewViewModel.StatusReported += (_, message) =>
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => StatusText = message);
 
         cropReviewViewModel.Saved += (_, _) =>
         {
@@ -2537,6 +2543,14 @@ public partial class MainWindowViewModel : ViewModelBase
             // before the window opened.
             foreach (var snapshot in ReadAdjustmentSnapshots(affectedIds))
                 baseline[snapshot.JobId] = snapshot;
+
+            // Show every affected page working, not just the one that was on screen. A bulk
+            // apply that re-queues twelve pages while only one tile visibly changes reads as
+            // having applied to one page — which is exactly how a working bulk apply gets
+            // reported as broken.
+            var affected = affectedIds.ToHashSet();
+            foreach (var affectedTile in RecentCaptures.Where(t => affected.Contains(t.JobId)))
+                affectedTile.Status = "Reprocessing…";
 
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
             if (thumbnail != null)

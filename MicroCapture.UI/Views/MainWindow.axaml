@@ -137,7 +137,12 @@
                          LayoutTransformControl rather than a RenderTransform because layout has
                          to follow: at 90° the image is measured tall-in-a-wide-box, so a
                          portrait page fills the area instead of overflowing and being clipped. -->
-                    <LayoutTransformControl Name="LiveViewRotator">
+                    <!-- Centred explicitly. A LayoutTransformControl left to stretch reports the
+                         rotated bounds but keeps the child anchored at the untransformed origin,
+                         so at 90° the image sat off to one side of the panel instead of in the
+                         middle of it. -->
+                    <LayoutTransformControl Name="LiveViewRotator"
+                                            HorizontalAlignment="Center" VerticalAlignment="Center">
                         <LayoutTransformControl.LayoutTransform>
                             <RotateTransform Angle="{Binding LiveViewRotation}"/>
                         </LayoutTransformControl.LayoutTransform>

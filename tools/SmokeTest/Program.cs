@@ -83,6 +83,7 @@ await TestExportReportsProgressAndCanBeCancelled();
 await TestSaveAppliesToEverySelectedPage();
 await TestCartAdjustmentUndoRedo();
 await TestUndoCoversEveryPageABulkApplyTouched();
+await TestAdjustSelectedSaveAppliesToTheWholeSelection();
 TestFrameColoursAreDistinguishable();
 TestWatermarkEditorOpensWithExistingPreset();
 TestAutoCaptureWaitsForThePageTurnToFinish();
@@ -1067,6 +1068,111 @@ async Task TestSaveAppliesToEverySelectedPage()
     Check("Every selected page got the rotation", jobs.All(j => j.RotationDegrees == 90));
     Check("Every selected page is re-queued for reprocessing",
         jobs.All(j => j.ProcessingStatus == "Pending"));
+}
+
+async Task TestAdjustSelectedSaveAppliesToTheWholeSelection()
+{
+    Console.WriteLine("\n-- Adjust Selected: saving applies to every selected page --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "adjustsel.db");
+
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb);
+        seedDb.Projects.Add(new Project { Name = "ADJSEL", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "ADJSEL";
+    vm.BatchCode = "ADJSEL";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    for (var i = 0; i < 3; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
+    if (vm.RecentCaptures.Count != 3) { Check("Three pages captured", false); return; }
+
+    foreach (var thumbnail in vm.RecentCaptures) thumbnail.IsSelected = true;
+    var jobIds = vm.RecentCaptures.Select(t => t.JobId).ToList();
+
+    await RunPumped(() => vm.ApplyAdjustmentsToSelectedCommand.ExecuteAsync(null), timeoutMs: 20000);
+    var review = vm.ActiveCropReview;
+    Check("Adjust Selected opens the editor", review != null);
+    if (review == null) return;
+
+    PumpUntil(() => review.Image != null, timeoutMs: 20000);
+
+    // Saving is the moment N pages get overwritten, so that is where the question is asked —
+    // and it must actually be asked, not skipped because a binding handed back a null window.
+    var asked = string.Empty;
+    review.ConfirmBulkApplyRequested += (_, request) => { asked = request.Message; request.OnAnswered(true); };
+
+    review.Brightness = 0.45;
+    Dispatcher.UIThread.RunJobs();
+    await RunPumped(() => review.SaveCommand.ExecuteAsync(null), timeoutMs: 30000);
+
+    Check($"Saving asks before widening the edit to the selection (\"{asked}\")",
+        asked.Contains("3 selected pages", StringComparison.OrdinalIgnoreCase));
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var applied = db.CaptureJobs.Where(j => jobIds.Contains(j.Id))
+            .Count(j => Math.Abs(j.Brightness - 0.45) < 0.001);
+        Check($"Saving applies the adjustment to every selected page (got {applied} of {jobIds.Count})",
+            applied == jobIds.Count);
+    }
+
+    // Every page the save touched shows it is working. A bulk apply where only the page that was
+    // on screen visibly changes reads as having applied to one page.
+    Check($"Every affected page shows that it is reprocessing ({string.Join(", ", vm.RecentCaptures.Select(t => t.Status))})",
+        vm.RecentCaptures.All(t => t.Status.Contains("Reprocess", StringComparison.OrdinalIgnoreCase)
+                                   || t.Status.StartsWith("Process", StringComparison.OrdinalIgnoreCase)));
+
+    // Declining leaves the other pages alone but still keeps the operator's own edit to the page
+    // they were looking at — cancelling the widening is not cancelling their work.
+    vm.ReviewCropCommand.Execute(jobIds[0]);
+    Dispatcher.UIThread.RunJobs();
+
+    // And a batch whose originals are gone (already exported) must not be re-queued into jobs the
+    // worker can only fail. This is what "apply all fails on an old batch" looked like.
+    using (var db = new AppDbContext(dbPath))
+    {
+        // Settle every page first, so anything Pending afterwards can only have been queued by
+        // the Apply to All under test.
+        foreach (var job in db.CaptureJobs)
+        {
+            job.ProcessingStatus = "Processed";
+            if (job.Id != jobIds[0] && File.Exists(job.OriginalFilePath)) File.Delete(job.OriginalFilePath);
+        }
+        await db.SaveChangesAsync();
+    }
+
+    var exportedReview = vm.ActiveCropReview;
+    Check("Crop Review reopened for the exported-batch case", exportedReview != null);
+    if (exportedReview != null)
+    {
+        PumpUntil(() => exportedReview.Image != null, timeoutMs: 20000);
+        var reported = string.Empty;
+        exportedReview.StatusReported += (_, message) => reported = message;
+        exportedReview.ConfirmBulkApplyRequested += (_, request) => request.OnAnswered(true);
+        exportedReview.Brightness = 0.2;
+        Dispatcher.UIThread.RunJobs();
+        exportedReview.ApplyToAllCommand.Execute(null);
+        Dispatcher.UIThread.RunJobs();
+
+        using var db = new AppDbContext(dbPath);
+        var queuedWithNoOriginal = db.CaptureJobs
+            .Where(j => j.Id != jobIds[0] && j.ProcessingStatus == "Pending")
+            .AsEnumerable()
+            .Count(j => !File.Exists(j.OriginalFilePath));
+        Check($"Apply to All doesn't queue pages whose originals were removed at export (got {queuedWithNoOriginal})",
+            queuedWithNoOriginal == 0);
+        Check($"...and says why they were skipped (\"{reported}\")",
+            reported.Contains("skipped", StringComparison.OrdinalIgnoreCase));
+    }
 }
 
 async Task TestUndoCoversEveryPageABulkApplyTouched()

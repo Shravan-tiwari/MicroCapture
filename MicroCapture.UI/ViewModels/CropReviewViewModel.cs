@@ -524,14 +524,24 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             //
             // It used to write only the page on screen, leaving the other selected pages
             // untouched unless the operator also found and pressed "Apply to Selected" — so
-            // choosing "Adjust Selected", confirming it would affect N pages, adjusting, and
-            // saving changed exactly one of them. The scope was already agreed at the cart, so
-            // asking again here (or requiring a second button) contradicts what the operator was
-            // told would happen.
-            if (_selectionForBulkApply.Count > 0)
+            // choosing "Adjust Selected", adjusting, and saving changed exactly one of them.
+            //
+            // Confirmed here rather than when the window opened. Opening is not the commitment:
+            // an operator can open Adjust Selected, look, and change nothing. Save is the point
+            // at which N pages are overwritten and re-queued, so that is where the question
+            // belongs — and asking it here means the answer is given with the adjustment already
+            // visible in the preview, rather than in the abstract before anything was set.
+            var others = _selectionForBulkApply.Where(id => id != _jobId).ToList();
+            if (others.Count > 0)
             {
-                var others = _selectionForBulkApply.Where(id => id != _jobId).ToList();
-                if (others.Count > 0)
+                var proceed = await ConfirmAsync(
+                    $"Apply these adjustments to all {_selectionForBulkApply.Count} selected pages?\n\n" +
+                    $"This replaces any adjustments the other {others.Count} already have, and reprocesses them. " +
+                    "You can undo it from the cart.");
+
+                // Declining cancels the widening, not the page in front of them: their own edit
+                // to this page is already saved and there is no reason to throw it away.
+                if (proceed)
                     BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => others.Contains(j.Id)));
             }
 
@@ -569,12 +579,40 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     /// The window subscribes and shows a confirm dialog, then calls back with the answer.</summary>
     public event EventHandler<BulkApplyConfirmRequest>? ConfirmBulkApplyRequested;
 
+    /// <summary>Asks the window to put a question to the operator and waits for the answer.
+    /// Wraps the existing callback-style event so a confirmation can sit in the middle of an
+    /// async Save without restructuring it.
+    ///
+    /// <para>Deliberately routed through the window rather than taking an owner Window as a
+    /// command parameter: the view resolves its own top-level, so the dialog cannot silently
+    /// fail to appear because a <c>$parent[Window]</c> binding came back null — which is exactly
+    /// how the previous confirmation went missing.</para></summary>
+    private Task<bool> ConfirmAsync(string message)
+    {
+        var handler = ConfirmBulkApplyRequested;
+        // Nothing listening means no UI to ask through (tests, design-time). Proceeding is the
+        // right default there: the caller has already decided this is what should happen.
+        if (handler == null) return Task.FromResult(true);
+
+        var completion = new TaskCompletionSource<bool>();
+        handler(this, new BulkApplyConfirmRequest(message, answer => completion.TrySetResult(answer)));
+        return completion.Task;
+    }
+
     [RelayCommand]
     private void ApplyToAll()
     {
-        if (string.IsNullOrEmpty(_batchId)) return;
+        if (string.IsNullOrEmpty(_batchId))
+        {
+            StatusReported?.Invoke(this, "This page isn't part of an open batch, so there is nothing to apply it to.");
+            return;
+        }
         var count = _dbContext.CaptureJobs.Count(j => j.BatchId == _batchId && j.Id != _jobId);
-        if (count == 0) return;
+        if (count == 0)
+        {
+            StatusReported?.Invoke(this, "There are no other pages in this batch.");
+            return;
+        }
         ConfirmBulkApplyRequested?.Invoke(this, new BulkApplyConfirmRequest(
             $"Apply these adjustments to {count} other page{(count == 1 ? "" : "s")} in this batch?",
             confirmed => { if (confirmed) BulkApplyToJobs(_dbContext.CaptureJobs.Where(j => j.BatchId == _batchId && j.Id != _jobId)); }));
@@ -601,8 +639,22 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     /// geometry adjustment stack, never someone else's crop shape.</summary>
     private void BulkApplyToJobs(IQueryable<CaptureJob> targets)
     {
+        var applied = 0;
+        var skipped = 0;
+
         foreach (var target in targets)
         {
+            // Re-queuing a page whose original is gone cannot work: the worker reprocesses from
+            // OriginalFilePath, and once a batch has been exported that file is deleted. Marking
+            // it Pending anyway hands the worker a job it can only fail, which is how "apply to
+            // all" on an already-exported batch turned a good batch into a screen of failures.
+            // Skipped and counted instead, and the operator is told.
+            if (string.IsNullOrEmpty(target.OriginalFilePath) || !File.Exists(target.OriginalFilePath))
+            {
+                skipped++;
+                continue;
+            }
+
             _affectedJobIds.Add(target.Id);
             target.RotationDegrees = RotationDegrees;
             target.FlipHorizontal = FlipHorizontal;
@@ -617,10 +669,24 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             target.QcStatus = "Pending";
             target.OcrStatus = "Pending";
             target.ExportStatus = "Pending";
+            applied++;
         }
+
         _dbContext.SaveChanges();
-        Saved?.Invoke(this, EventArgs.Empty);
+
+        StatusReported?.Invoke(this, skipped == 0
+            ? $"Applied to {applied} page(s) — reprocessing."
+            : $"Applied to {applied} page(s). {skipped} skipped: their original photos were removed when "
+              + "this batch was exported, so there is nothing left to reprocess from. Open one of those "
+              + "pages on its own to touch it up directly.");
+
+        if (applied > 0) Saved?.Invoke(this, EventArgs.Empty);
     }
+
+    /// <summary>Progress and outcome messages for the host's status line — a bulk apply that
+    /// partly succeeded has to say so somewhere, and this window has no status line of its
+    /// own.</summary>
+    public event EventHandler<string>? StatusReported;
 
     // Detection runs on a background thread and posts its result back; the window can be closed
     // before it lands, and rendering into a disposed renderer would throw on a thread with no

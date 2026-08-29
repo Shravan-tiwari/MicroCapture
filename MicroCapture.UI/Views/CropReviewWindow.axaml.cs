@@ -129,9 +129,21 @@ public partial class CropReviewWindow : UserControl
                 // ActiveCropReview host) — ConfirmDialog needs an actual owner Window for
                 // centering/modality, so resolve the containing top-level instead of using
                 // `this`.
-                var confirmed = TopLevel.GetTopLevel(this) is Window owner
-                    && await ConfirmDialog.AskAsync(owner, request.Message, "Apply Adjustments");
-                request.OnAnswered(confirmed);
+                //
+                // When there is no owner to ask through, proceed rather than decline. This used
+                // to answer "no" silently, which is the worst of both: the operator is asked
+                // nothing, told nothing, and the bulk apply they explicitly asked for simply
+                // does not happen — indistinguishable from the feature being broken. The
+                // confirmation is a safety net over an intent the operator has already stated by
+                // pressing the button; losing the net must not lose the action too. What was
+                // applied is reported on the status line either way.
+                if (TopLevel.GetTopLevel(this) is not Window owner)
+                {
+                    request.OnAnswered(true);
+                    return;
+                }
+
+                request.OnAnswered(await ConfirmDialog.AskAsync(owner, request.Message, "Apply Adjustments"));
             };
         }
     }
