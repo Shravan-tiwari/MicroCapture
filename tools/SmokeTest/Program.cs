@@ -1340,6 +1340,21 @@ async Task TestExportOutputsAreActuallyCorrect()
                 }
                 Check($"[{format}] pages are readable at source size{(ok ? "" : " — " + why)}", ok);
 
+                // DPI has to survive the export. OpenCV's TIFF writer records no resolution at
+                // all, so re-encoded pages silently opened as 96 DPI whatever the batch was
+                // captured at.
+                if (fmt.Extension == ".tif")
+                {
+                    var first = files.OrderBy(f => f).FirstOrDefault();
+                    if (first != null)
+                    {
+                        using var t = BitMiracle.LibTiff.Classic.Tiff.Open(first, "r");
+                        var xres = t?.GetField(BitMiracle.LibTiff.Classic.TiffTag.XRESOLUTION);
+                        var reported = xres != null ? (int)Math.Round(xres[0].ToDouble()) : 0;
+                        Check($"[{format}] keeps the batch's DPI (reported {reported})", reported == 300);
+                    }
+                }
+
                 // Each output must be a DIFFERENT page, not the same one repeated.
                 var means = files.OrderBy(f => f).Select(f =>
                 {

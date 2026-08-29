@@ -243,37 +243,30 @@ public class BatchExportService
                     {
                         // A watermarked TIFF has to be re-encoded rather than copied — the point
                         // of the copy below is preserving the source bytes, which no longer
-                        // represent what should be exported once a mark is burned in.
-                        if (!WriteWatermarkedWithOpenCv(watermarked, targetPath, exportFormat))
+                        // represent what should be exported once a mark is burned in. Routed
+                        // through the same LibTiff writer so it keeps its DPI and compression;
+                        // OpenCV would drop the resolution tags and the page would read as 96 DPI.
+                        using var watermarkedMat = WatermarkedToMat(watermarked);
+                        if (watermarkedMat.Empty())
                             throw new IOException($"Could not write watermarked TIFF export: {targetPath}");
-                    }
-                    else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff"
-                             && exportFormat.Compression != "None")
-                    {
-                        // The source is already a TIFF ImageProcessor wrote (with its own DPI/
-                        // Author/Software tags, and — when binarized — genuine 1-bit/CCITT-G4
-                        // encoding). Copy it byte-for-byte rather than decoding and
-                        // re-encoding through OpenCV, which would silently re-inflate a
-                        // binarized page back to an ordinary 8-bit grayscale TIFF and throw
-                        // away the compression/size win that was the point of binarizing.
-                        File.Copy(f, targetPath, overwrite: true);
+                        WriteTiffPage(targetPath, watermarkedMat, job.Dpi, exportFormat.Compression == "None");
                     }
                     else
                     {
                         // Non-TIFF processed source (e.g. the SkiaSharp fallback path's .jpg) —
                         // OpenCV writes a real TIFF rather than mislabelling a PNG.
+                        // Every TIFF export is written here rather than byte-copied from the
+                        // source. Copying preserved whatever tags the source happened to carry,
+                        // which meant a page whose source lacked resolution tags exported as
+                        // 96 DPI — and it silently ignored the chosen compression, since the
+                        // copy is by definition whatever the source already was. This writer
+                        // stamps DPI and applies the compression, and still detects a bitonal
+                        // page and keeps it 1-bit CCITT G4, which was the only reason to copy.
                         using var image = Cv2.ImRead(f, ImreadModes.Unchanged);
                         if (image.Empty())
                             throw new IOException($"Could not read page for export: {f}");
 
-                        // Honour the chosen compression. This is the only place it can be applied
-                        // — previously it was read solely as a guard and never handed to a writer,
-                        // so "TIFF Uncompressed" produced an LZW file like every other TIFF.
-                        var tiffParams = exportFormat.Compression == "None"
-                            ? new[] { (int)ImwriteFlags.TiffCompression, 1 }   // 1 = no compression
-                            : new[] { (int)ImwriteFlags.TiffCompression, 5 };  // 5 = LZW
-                        if (!Cv2.ImWrite(targetPath, image, tiffParams))
-                            throw new IOException($"Could not write TIFF export: {targetPath}");
+                        WriteTiffPage(targetPath, image, job.Dpi, exportFormat.Compression == "None");
                     }
                     if (!File.Exists(targetPath) || new FileInfo(targetPath).Length == 0)
                         throw new IOException($"Export output was not created: {targetPath}");
@@ -289,6 +282,76 @@ public class BatchExportService
             AttachOrUpdateJobs(jobsToExport);
             await _dbContext.SaveChangesAsync();
             return exportDir;
+        }
+    }
+
+    /// <summary>Writes one page as a TIFF with its resolution tags and the chosen compression.
+    ///
+    /// <para>OpenCV's TIFF writer records no resolution at all, so every re-encoded page opened
+    /// as 96 DPI regardless of what the batch was captured at — and re-encoding is the normal
+    /// path for uncompressed TIFF and for any watermarked page. LibTiff is what the capture
+    /// pipeline already uses to stamp DPI (see ImageProcessor.WriteTiff); export now does the
+    /// same rather than quietly dropping it.</para></summary>
+    private static void WriteTiffPage(string targetPath, Mat image, int dpi, bool uncompressed)
+    {
+        var isBitonal = image.Channels() == 1 && IsBlackAndWhiteOnly(image);
+
+        using var rgb = new Mat();
+        if (!isBitonal && image.Channels() == 1) Cv2.CvtColor(image, rgb, ColorConversionCodes.GRAY2RGB);
+        else if (!isBitonal && image.Channels() == 4) Cv2.CvtColor(image, rgb, ColorConversionCodes.BGRA2RGB);
+        else if (!isBitonal) Cv2.CvtColor(image, rgb, ColorConversionCodes.BGR2RGB);
+
+        var source = isBitonal ? image : rgb;
+        var width = source.Cols;
+        var height = source.Rows;
+
+        using var output = BitMiracle.LibTiff.Classic.Tiff.Open(targetPath, "w");
+        if (output == null) throw new IOException($"Could not create TIFF: {targetPath}");
+
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGEWIDTH, width);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.IMAGELENGTH, height);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.SAMPLESPERPIXEL, isBitonal ? 1 : 3);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.BITSPERSAMPLE, isBitonal ? 1 : 8);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.ORIENTATION, BitMiracle.LibTiff.Classic.Orientation.TOPLEFT);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PLANARCONFIG, BitMiracle.LibTiff.Classic.PlanarConfig.CONTIG);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.PHOTOMETRIC, isBitonal
+            ? BitMiracle.LibTiff.Classic.Photometric.MINISBLACK
+            : BitMiracle.LibTiff.Classic.Photometric.RGB);
+        // A bitonal page keeps CCITT G4 whatever the format asks: 1-bit content has nothing to
+        // gain from "uncompressed" and everything to lose in size.
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.COMPRESSION, isBitonal
+            ? BitMiracle.LibTiff.Classic.Compression.CCITTFAX4
+            : uncompressed ? BitMiracle.LibTiff.Classic.Compression.NONE
+                           : BitMiracle.LibTiff.Classic.Compression.LZW);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.XRESOLUTION, (double)dpi);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.YRESOLUTION, (double)dpi);
+        output.SetField(BitMiracle.LibTiff.Classic.TiffTag.RESOLUTIONUNIT, BitMiracle.LibTiff.Classic.ResUnit.INCH);
+
+        if (isBitonal)
+        {
+            source.GetArray(out byte[] grey);
+            var stride = (width + 7) / 8;
+            var packed = new byte[stride];
+            for (var y = 0; y < height; y++)
+            {
+                Array.Clear(packed, 0, packed.Length);
+                var rowStart = y * width;
+                for (var x = 0; x < width; x++)
+                    if (grey[rowStart + x] != 0) packed[x / 8] |= (byte)(0x80 >> (x % 8));
+                output.WriteScanline(packed, y);
+            }
+        }
+        else
+        {
+            using var flat = source.Reshape(1);
+            flat.GetArray(out byte[] rgbBytes);
+            var stride = width * 3;
+            var row = new byte[stride];
+            for (var y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(rgbBytes, y * stride, row, 0, stride);
+                output.WriteScanline(row, y);
+            }
         }
     }
 
