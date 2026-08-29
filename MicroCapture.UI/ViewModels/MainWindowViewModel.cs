@@ -1307,6 +1307,55 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>The adjustment state of every page Crop Review could reach from here: the open
+    /// batch, plus the page and any selection it was opened for, in case the batch can't be
+    /// determined. Keyed by job id so an edit's "before" can be assembled from whichever pages
+    /// turn out to have been written.</summary>
+    private Dictionary<string, AdjustmentSnapshot> SnapshotBatchAdjustments(string jobId, IReadOnlyList<string>? selection)
+    {
+        var ids = new HashSet<string> { jobId };
+        if (selection != null) ids.UnionWith(selection);
+
+        try
+        {
+            if (!string.IsNullOrEmpty(_currentBatchId))
+            {
+                _dbContext.ChangeTracker.Clear();
+                ids.UnionWith(_dbContext.CaptureJobs.AsNoTracking()
+                    .Where(j => j.BatchId == _currentBatchId)
+                    .Select(j => j.Id));
+            }
+        }
+        catch (Exception ex)
+        {
+            // Falling back to the page and its selection still gives a usable undo for the
+            // ordinary edit; only a bulk apply would be under-covered.
+            Console.Error.WriteLine($"Could not snapshot the batch for undo: {ex}");
+        }
+
+        return ReadAdjustmentSnapshots(ids).ToDictionary(s => s.JobId);
+    }
+
+    private List<AdjustmentSnapshot> ReadAdjustmentSnapshots(IEnumerable<string> jobIds)
+    {
+        try
+        {
+            var ids = jobIds.ToHashSet();
+            if (ids.Count == 0) return new List<AdjustmentSnapshot>();
+            _dbContext.ChangeTracker.Clear();
+            return _dbContext.CaptureJobs.AsNoTracking()
+                .Where(j => ids.Contains(j.Id))
+                .ToList()
+                .Select(AdjustmentSnapshot.From)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Could not snapshot adjustments: {ex}");
+            return new List<AdjustmentSnapshot>();
+        }
+    }
+
     /// <summary>Captures the current adjustment state of the given pages, for the caller to hand
     /// back to <see cref="RecordAdjustmentEditAsync"/> once its change has been saved.</summary>
     public List<object> CaptureAdjustmentSnapshots(IEnumerable<string> jobIds)
@@ -2454,19 +2503,40 @@ public partial class MainWindowViewModel : ViewModelBase
         var cropReviewViewModel = new CropReviewViewModel(jobId, _dbContext, _queueService, selectionForBulkApply);
 
         // Snapshot before the operator can change anything, so an edit can be undone from the
-        // cart. Covers the bulk selection too, since applying to a selection is precisely the
-        // change most worth being able to take back.
+        // cart.
+        //
+        // Every page in the batch, not just the one being opened or the selection it was opened
+        // for: "Apply to All in Batch" widens the edit to the whole batch after this window is
+        // already open, and undo was previously recording only the page that had been clicked —
+        // so undoing a 400-page bulk apply restored exactly one page and left the other 399
+        // changed. The window reports back which pages it actually wrote, and the baseline has to
+        // already cover them. It is one query of ten small fields per page, taken once.
+        //
         // Taken synchronously and before the window opens. Doing it on a background task raced
         // the operator: a quick save could land before the snapshot existed, and the edit would
-        // silently record nothing to undo. It is a small local query against pages already in
-        // memory, so there is nothing to gain by deferring it.
-        var affectedIds = (selectionForBulkApply ?? new[] { jobId }).Distinct().ToList();
-        var beforeEdit = CaptureAdjustmentSnapshots(affectedIds);
+        // silently record nothing to undo.
+        var baseline = SnapshotBatchAdjustments(jobId, selectionForBulkApply);
 
         cropReviewViewModel.Saved += (_, _) =>
         {
+            // What was written, not what was selected. Drained each time, so an Apply to All
+            // followed by a Save records as two undo steps covering their own real extents.
+            var affectedIds = cropReviewViewModel.TakeAffectedJobIds().ToList();
+            if (affectedIds.Count == 0) affectedIds = new List<string> { jobId };
+
+            var beforeEdit = affectedIds
+                .Where(baseline.ContainsKey)
+                .Select(id => (object)baseline[id])
+                .ToList();
+
             var description = affectedIds.Count > 1 ? $"adjustments on {affectedIds.Count} pages" : "page adjustment";
             _ = RecordAdjustmentEditAsync(description, affectedIds, beforeEdit);
+
+            // Move the baseline forward for the pages just written, so a second edit in the same
+            // session undoes back to the state before *it* rather than all the way to the state
+            // before the window opened.
+            foreach (var snapshot in ReadAdjustmentSnapshots(affectedIds))
+                baseline[snapshot.JobId] = snapshot;
 
             var thumbnail = RecentCaptures.FirstOrDefault(t => t.JobId == jobId);
             if (thumbnail != null)

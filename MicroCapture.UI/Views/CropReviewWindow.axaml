@@ -43,22 +43,8 @@
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                MaxWidth="360" FontSize="14"/>
 
-                    <!-- Loupe: the patch of page under the cursor, magnified, pinned near the
-                         pointer. Focus is the thing this window is most often opened to judge,
-                         and a whole page scaled into a panel is exactly the view in which soft
-                         focus is invisible. Not hit-testable — it must never eat the wheel
-                         events or drags it is floating over. -->
-                    <Border Name="Loupe" Width="196" Height="196" CornerRadius="98"
-                            IsVisible="False" IsHitTestVisible="False"
-                            HorizontalAlignment="Left" VerticalAlignment="Top"
-                            Background="{DynamicResource Surface1Brush}"
-                            BorderBrush="{DynamicResource PrimaryHoverBrush}" BorderThickness="2"
-                            ClipToBounds="True">
-                        <Image Name="LoupeImage" Stretch="Fill"/>
-                    </Border>
-
-                    <!-- Zoom controls, over the image rather than in the side panel: they act on
-                         this view, not on the page's stored adjustments, and nothing here is
+                    <!-- Zoom controls, over the image rather than in the side panel: they act
+                         on this view, not on the page's stored adjustments, and nothing here is
                          saved. -->
                     <Border HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="14"
                             Background="{DynamicResource ScrimBrush}" CornerRadius="8"
@@ -76,11 +62,6 @@
                                        Fill="{DynamicResource HairlineStrongBrush}"/>
                             <Button Name="ZoomFitButton" Classes="ghost" Content="Fit" FontSize="12" Padding="7,3"
                                     ToolTip.Tip="Fit the whole page in the window"/>
-                            <Button Name="ZoomActualButton" Classes="ghost" Content="100%" FontSize="12" Padding="7,3"
-                                    ToolTip.Tip="Show the preview at its own pixel size"/>
-                            <ToggleButton Name="LoupeToggle" Classes="secondary" Content="Loupe" FontSize="12"
-                                          Padding="7,3" IsChecked="True"
-                                          ToolTip.Tip="Magnify whatever is under the cursor"/>
                         </StackPanel>
                     </Border>
                 </Grid>

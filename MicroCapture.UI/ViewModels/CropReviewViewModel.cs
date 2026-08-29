@@ -518,6 +518,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             }
 
             await _dbContext.SaveChangesAsync();
+            _affectedJobIds.Add(job.Id);
 
             // Opened for a multi-selection, Save covers the whole selection.
             //
@@ -545,6 +546,22 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     /// is offered at all, distinct from Apply-to-All which is always available once a batch is
     /// known.</summary>
     public bool HasSelectionForBulkApply => _selectionForBulkApply.Count > 0;
+
+    // Pages this session has actually written to. The host records undo history from this rather
+    // than from the selection it opened the window with, because the two are not the same: "Apply
+    // to All in Batch" widens the edit to every page after the window is already open, and an
+    // undo scoped to the one page that happened to be clicked is not an undo of what happened.
+    private readonly List<string> _affectedJobIds = new();
+
+    /// <summary>The pages written since the last call, and clears the list. Drained per Saved
+    /// event so that two actions in one session — an Apply to All followed by a Save, say —
+    /// record as two separate undo steps covering what each one actually touched.</summary>
+    public IReadOnlyList<string> TakeAffectedJobIds()
+    {
+        var taken = _affectedJobIds.Distinct().ToList();
+        _affectedJobIds.Clear();
+        return taken;
+    }
 
     /// <summary>Raised when a bulk action (Apply to All/Selection) needs the operator to
     /// confirm scope + count before committing — per the UX research, silently applying to a
@@ -586,6 +603,7 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
     {
         foreach (var target in targets)
         {
+            _affectedJobIds.Add(target.Id);
             target.RotationDegrees = RotationDegrees;
             target.FlipHorizontal = FlipHorizontal;
             target.FlipVertical = FlipVertical;

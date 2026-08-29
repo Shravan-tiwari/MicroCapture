@@ -124,36 +124,37 @@
                     BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding IsShowingLiveView}">
                 <Grid Name="LiveViewContainer">
-                    <!-- The image and the frame overlay rotate as one unit, inside a single
-                         LayoutTransformControl. Rotating them separately would be worse than not
-                         rotating at all: the frames are stored in unrotated capture coordinates
-                         and the crop happens before the rotation is applied, so a frame that
-                         stayed put on screen while the page turned under it would quietly select
-                         a different part of the page than the one it was drawn over. Rotating the
-                         pair keeps every frame glued to the same physical region — no frame's
-                         position, size or order changes, which is the point.
+                    <!-- Only the camera image rotates. The frames deliberately do not: they
+                         stay exactly where they were drawn, at the size and in the order they
+                         were drawn, and rotating the view never moves or renumbers one.
+
+                         Consequence worth knowing: a frame is stored in the capture's own
+                         unrotated coordinates and the crop is taken before the rotation is
+                         applied, so with the view turned, a frame selects the region it covers
+                         on the *unrotated* page rather than the one under it on screen. Draw
+                         frames with the view upright, or set the orientation first.
 
                          LayoutTransformControl rather than a RenderTransform because layout has
-                         to follow: at 90° the view is measured tall-in-a-wide-box, so a portrait
-                         page fills the area instead of overflowing and being clipped. -->
+                         to follow: at 90° the image is measured tall-in-a-wide-box, so a
+                         portrait page fills the area instead of overflowing and being clipped. -->
                     <LayoutTransformControl Name="LiveViewRotator">
                         <LayoutTransformControl.LayoutTransform>
                             <RotateTransform Angle="{Binding LiveViewRotation}"/>
                         </LayoutTransformControl.LayoutTransform>
-                        <Grid>
-                            <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
-                            <!-- Overlay: interactive fixed frames drawn straight onto the live view.
-                                 Drag empty space to create one, drag a frame to move it, its handles to
-                                 resize, and the × badge (or DEL) to remove it — no modal, no calibration
-                                 shot, editable at any time. -->
-                            <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
-                                    Frames="{Binding Frames}"
-                                    SourceImageSize="{Binding FrameReferenceSize}"
-                                    CaptureImageSize="{Binding CaptureImageSize}"
-                                    SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
-                                    IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
-                        </Grid>
+                        <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
                     </LayoutTransformControl>
+
+                    <!-- Overlay: interactive fixed frames drawn straight onto the live view.
+                         Drag empty space to create one, drag a frame to move it, its handles to
+                         resize, and the × badge (or DEL) to remove it — no modal, no calibration
+                         shot, editable at any time. -->
+                    <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
+                            Frames="{Binding Frames}"
+                            SourceImageSize="{Binding FrameReferenceSize}"
+                            CaptureImageSize="{Binding CaptureImageSize}"
+                            SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
+                            IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
+
                     <!-- Overlay: readiness badge -->
                     <Border Background="{DynamicResource ScrimBrush}" HorizontalAlignment="Left" VerticalAlignment="Top"
                             Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"

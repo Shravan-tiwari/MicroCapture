@@ -82,6 +82,7 @@ await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
 await TestSaveAppliesToEverySelectedPage();
 await TestCartAdjustmentUndoRedo();
+await TestUndoCoversEveryPageABulkApplyTouched();
 TestFrameColoursAreDistinguishable();
 TestWatermarkEditorOpensWithExistingPreset();
 TestAutoCaptureWaitsForThePageTurnToFinish();
@@ -1066,6 +1067,81 @@ async Task TestSaveAppliesToEverySelectedPage()
     Check("Every selected page got the rotation", jobs.All(j => j.RotationDegrees == 90));
     Check("Every selected page is re-queued for reprocessing",
         jobs.All(j => j.ProcessingStatus == "Pending"));
+}
+
+async Task TestUndoCoversEveryPageABulkApplyTouched()
+{
+    Console.WriteLine("\n-- Undo covers every page the edit actually touched --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "undoscope.db");
+
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb);
+        seedDb.Projects.Add(new Project { Name = "UNDOSCOPE", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "UNDOSCOPE";
+    vm.BatchCode = "UNDOSCOPE";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    for (var i = 0; i < 4; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 4, timeoutMs: 30000);
+    Check("Four pages are in the cart", vm.RecentCaptures.Count == 4);
+    if (vm.RecentCaptures.Count != 4) return;
+
+    var jobIds = vm.RecentCaptures.Select(t => t.JobId).ToList();
+
+    // Open one page and apply to the whole batch — the case that was recording a one-page undo
+    // for a four-page change.
+    vm.ReviewCropCommand.Execute(jobIds[0]);
+    Dispatcher.UIThread.RunJobs();
+    var review = vm.ActiveCropReview;
+    Check("Crop Review opened for the first page", review != null);
+    if (review == null) return;
+
+    PumpUntil(() => review.Image != null, timeoutMs: 20000);
+    review.ConfirmBulkApplyRequested += (_, request) => request.OnAnswered(true);
+    review.Brightness = 0.5;
+    Dispatcher.UIThread.RunJobs();
+    review.ApplyToAllCommand.Execute(null);
+    PumpUntil(() => vm.CanUndoAdjustment, timeoutMs: 20000);
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var changed = db.CaptureJobs.Count(j => Math.Abs(j.Brightness - 0.5) < 0.001);
+        Check($"Apply to All changed every other page in the batch (got {changed})", changed >= 3);
+    }
+    Check($"The undo step names the real extent of the change (\"{vm.UndoLabel}\")",
+        vm.UndoLabel.Contains("pages", StringComparison.OrdinalIgnoreCase));
+
+    await RunPumped(() => vm.UndoAdjustmentCommand.ExecuteAsync(null), timeoutMs: 20000);
+
+    using (var db = new AppDbContext(dbPath))
+    {
+        var stillChanged = db.CaptureJobs.Where(j => jobIds.Contains(j.Id))
+            .Count(j => Math.Abs(j.Brightness - 0.5) < 0.001);
+        // The whole point: undoing a bulk apply used to restore the single page the window was
+        // opened for and leave every other page it had changed exactly as the bulk apply left it.
+        Check($"Undo restores every page the bulk apply touched, not just the one on screen ({stillChanged} still changed)",
+            stillChanged == 0);
+    }
+
+    // And redo puts all of them back, or the history is only half usable. Three, not four:
+    // "Apply to All in Batch" writes the other pages, and the one on screen is only written when
+    // the operator saves it.
+    await RunPumped(() => vm.RedoAdjustmentCommand.ExecuteAsync(null), timeoutMs: 20000);
+    using (var db = new AppDbContext(dbPath))
+    {
+        var restored = db.CaptureJobs.Where(j => jobIds.Contains(j.Id))
+            .Count(j => Math.Abs(j.Brightness - 0.5) < 0.001);
+        Check($"Redo reapplies it to every one of them (got {restored} of 3)", restored == 3);
+    }
 }
 
 async Task TestCartAdjustmentUndoRedo()
