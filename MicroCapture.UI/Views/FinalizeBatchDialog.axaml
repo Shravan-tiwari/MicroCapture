@@ -75,16 +75,23 @@
                     <CheckBox IsChecked="{Binding WatermarkEnabled}" Content="Watermark"
                               ToolTip.Tip="Burns the selected watermark preset into every exported page, whichever format you choose."
                               Foreground="{StaticResource InkMutedBrush}"/>
-                    <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding WatermarkEnabled}">
-                        <ComboBox ItemsSource="{Binding WatermarkPresets}" SelectedItem="{Binding SelectedWatermarkPreset}" Width="160">
+                    <!-- Stacked, not side by side. This column is about 240px wide, but a 160px
+                         combo plus the button needs nearer 290 — so the button was laid out past
+                         the panel edge, visible-ish but impossible to click. Both now stretch to
+                         the column instead of overflowing it. -->
+                    <StackPanel Spacing="6" IsVisible="{Binding WatermarkEnabled}">
+                        <ComboBox ItemsSource="{Binding WatermarkPresets}" SelectedItem="{Binding SelectedWatermarkPreset}"
+                                  HorizontalAlignment="Stretch">
                             <ComboBox.ItemTemplate>
                                 <DataTemplate>
                                     <TextBlock Text="{Binding Name}"/>
                                 </DataTemplate>
                             </ComboBox.ItemTemplate>
                         </ComboBox>
-                        <Button Content="Edit Watermark…" Classes="secondary"
-                                Command="{Binding EditWatermarkCommand}" CommandParameter="{Binding $parent[Window]}"/>
+                        <Button Content="Edit Watermark…" Classes="secondary" HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
+                                Command="{Binding EditWatermarkCommand}" CommandParameter="{Binding $parent[Window]}"
+                                ToolTip.Tip="Design the watermark — text or logo, position, size and opacity — against one of this batch's own pages"/>
                     </StackPanel>
                 </StackPanel>
 

@@ -301,8 +301,13 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private async Task EditWatermarkAsync(Avalonia.Controls.Window owner)
+    private async Task EditWatermarkAsync(Avalonia.Controls.Window? owner)
     {
+        // Nullable because the command parameter can resolve to null before the window is fully
+        // in the visual tree; a non-nullable parameter turned that into a hard failure with no
+        // explanation rather than a no-op.
+        if (owner == null) return;
+
         if (Pages.Count == 0)
         {
             StatusText = "Wait for at least one page to finish processing before editing a watermark.";
