@@ -426,6 +426,22 @@ public partial class ImageProcessor
     /// silently suppress the capture.</summary>
     internal const int ContentSignatureSize = 40;
 
+    // ---------- Automatic processing switches ----------
+    //
+    // Steps that used to run on every capture with no operator control. Pages came out altered
+    // in ways nothing in the app admitted to, which is indistinguishable from a bug when the
+    // result looks wrong. Named here so what runs automatically is visible in one place rather
+    // than buried mid-pipeline.
+
+    /// <summary>Off: inpainting is destructive and there is no UI for it.</summary>
+    private const bool EnableAutomaticFingerRemoval = false;
+
+    /// <summary>On: CLAHE contrast enhancement and a mild unsharp pass. Left enabled because
+    /// every capture to date was produced with them and turning them off silently would change
+    /// how every scan looks. Unlike the geometry above they alter tone, not shape, so they were
+    /// not what made pages come out curved.</summary>
+    private const bool EnableAutomaticEnhancement = true;
+
     /// <summary>Fast, non-mutating boundary check for live-view auto-capture gating.</summary>
     public static bool IsDocumentDetected(byte[] encodedImage) => CheckLiveFrame(encodedImage).Detected;
 
@@ -1696,13 +1712,26 @@ public partial class ImageProcessor
         // residual global tilt corrupts the per-column curve sampling if left uncorrected
         // first (both now share the same text-line detection, so this is coarse-to-fine —
         // global rotation resolved before the finer per-column curve).
-        working = TryDeskew(working, result);
-        working = TryApplyDewarp(working, result, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint);
-        // Not gated behind dewarpEnabled (the book-curve toggle): the residual bow this fixes
-        // shows up on flat trapezoid/keystone photos as much as curved book pages — confirmed
-        // on the user's own annotated Trapezoid_Image001 screenshot, which has no book
-        // curvature at all. See TryApplyLineMesh's own doc comment.
-        working = TryApplyLineMesh(working, result) ?? working;
+        // Every geometric correction on this path is now behind the Book Curve Correction
+        // toggle, including the two that weren't.
+        //
+        // This path is reached by far more than manual crop-quad edits: a fixed-frame capture is
+        // marked ManualOverrideApplied so it can carry a crop box (see
+        // CaptureQueueService.EnqueueCaptureAsync), which routes EVERY framed capture through
+        // here. Deskew was ungated and line-mesh was deliberately ungated, so both silently
+        // rotated and bowed ordinary captures with the toggle switched off — pages came out
+        // visibly curved with nothing in the UI admitting to it.
+        //
+        // The line mesh was left ungated because the residual bow it corrects also appears on
+        // flat keystone photos, which is true — but an unrequested warp that can't be turned off
+        // is worse than an uncorrected bow the operator can see and decide about. It goes back
+        // under the toggle that claims to control curvature.
+        if (dewarpEnabled)
+        {
+            working = TryDeskew(working, result);
+            working = TryApplyDewarp(working, result, dewarpEnabled, savedDewarp, dewarpManualOverride, spineXHint);
+            working = TryApplyLineMesh(working, result) ?? working;
+        }
 
         return FinishPageProcessing(working, result, binarizeEnabled, dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
     }
@@ -1717,13 +1746,21 @@ public partial class ImageProcessor
     /// for the caller to write out.</summary>
     private Mat FinishPageProcessing(Mat working, ProcessingResult result, bool binarizeEnabled, int dpi, double measuredDpi, bool bleedthroughEnabled, bool hasManualAdjustments, int rotationDegrees, bool flipHorizontal, bool flipVertical, double brightness, double contrast, double saturation, double sharpness, double whiteBalance)
     {
-        working = TryRemoveFingers(working, result) ?? working;
+        // Finger removal INPAINTS — it permanently paints over whatever it decided was a finger,
+        // and a misfire destroys real page content rather than merely looking wrong. It ran on
+        // every capture with no way to switch it off, so it is now opt-in and off. Nothing in the
+        // UI offers it yet; when it is offered, this is what that switch should set.
+        if (EnableAutomaticFingerRemoval)
+            working = TryRemoveFingers(working, result) ?? working;
         // Before enhancement/sharpen so a sharpen pass doesn't crisp up leftover ghosting, and
         // before binarization so Sauvola's own local threshold isn't skewed by it either.
         working = TryRemoveBleedthrough(working, result, bleedthroughEnabled);
 
-        working = ApplyEnhancement(working);
-        working = Sharpen(working);
+        if (EnableAutomaticEnhancement)
+        {
+            working = ApplyEnhancement(working);
+            working = Sharpen(working);
+        }
         // Manual (operator-driven) adjustments layer on top of the automatic CLAHE
         // enhancement/sharpen above rather than replacing them — see
         // ApplyManualAdjustments's own doc comment for the fixed operation order. Skipped
