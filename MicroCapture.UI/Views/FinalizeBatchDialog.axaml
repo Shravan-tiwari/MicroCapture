@@ -28,10 +28,16 @@
                                         <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="13"
                                                    Foreground="{StaticResource InkBrush}"
                                                    Text="{Binding PageNumber, StringFormat='Page {0}'}"/>
-                                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                            <Button Content="↑" Width="28" Click="OnMoveUpClick" Classes="secondary"/>
-                                            <Button Content="↓" Width="28" Click="OnMoveDownClick" Classes="secondary"/>
-                                            <Button Content="✕" Width="28" Click="OnDeletePageClick" Classes="iconDanger"/>
+                                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                                            <Button Content="↑" Width="30" Height="28" Padding="0" Click="OnMoveUpClick"
+                                                    Classes="secondary" HorizontalContentAlignment="Center"
+                                                    ToolTip.Tip="Move this page earlier"/>
+                                            <Button Content="↓" Width="30" Height="28" Padding="0" Click="OnMoveDownClick"
+                                                    Classes="secondary" HorizontalContentAlignment="Center"
+                                                    ToolTip.Tip="Move this page later"/>
+                                            <Button Content="Remove" Height="28" Padding="9,0" FontSize="11"
+                                                    Click="OnDeletePageClick" Classes="iconDanger"
+                                                    ToolTip.Tip="Leave this page out of the export. The page itself is not deleted."/>
                                         </StackPanel>
                                     </Grid>
                                 </Border>

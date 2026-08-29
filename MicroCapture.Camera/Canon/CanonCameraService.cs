@@ -30,8 +30,9 @@ public sealed class CanonCameraService : ICameraService, IDisposable
         new("ISO", "ISO", EDSDK.PropID_ISOSpeed),
         new("ExposureCompensation", "Exposure compensation", EDSDK.PropID_ExposureCompensation),
         new("WhiteBalance", "White balance", EDSDK.PropID_WhiteBalance),
-        new("ImageQuality", "Image quality", EDSDK.PropID_ImageQuality),
-        new("DriveMode", "Drive mode", EDSDK.PropID_DriveMode),
+        // Image quality and drive mode are deliberately not offered. Both change how the camera
+        // captures in ways the batch's own settings already govern, and an operator changing
+        // either mid-batch produces pages that don't match the rest of it.
         new("AFMode", "Focus mode", EDSDK.PropID_AFMode),
         new("ColorSpace", "Color space", EDSDK.PropID_ColorSpace)
     };

@@ -276,6 +276,15 @@ public partial class MainWindow : Window
         }
     }
 
+    private void OnInsertPointClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button { DataContext: ThumbnailItem item }
+            && DataContext is MainWindowViewModel vm)
+        {
+            vm.SetInsertPointCommand.Execute(item.PageNumber);
+        }
+    }
+
     private async void OnDeleteThumbnailClick(object? sender, RoutedEventArgs e)
     {
         try

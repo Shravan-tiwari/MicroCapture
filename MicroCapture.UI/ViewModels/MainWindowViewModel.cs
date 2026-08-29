@@ -125,6 +125,91 @@ public partial class MainWindowViewModel : ViewModelBase
             ? MicroCapture.Processing.ThumbnailPaths.DirectoryFor(_outputDirectory, batchCode)
             : BatchFolder.ThumbnailsPath(_currentBatchFolder);
 
+    // ---------- Insert point ----------
+
+    /// <summary>Where the next capture lands, when the operator has chosen a spot in the cart
+    /// rather than the end. Null means the normal behaviour of appending.</summary>
+    private int? _insertBeforePage;
+
+    [ObservableProperty] private bool _hasInsertPoint;
+    [ObservableProperty] private string _insertPointLabel = string.Empty;
+
+    private void UpdateInsertPointLabel()
+    {
+        HasInsertPoint = _insertBeforePage.HasValue;
+        InsertPointLabel = _insertBeforePage is { } page
+            ? $"Next capture will be inserted as page {page}. Later pages shift down to make room."
+            : string.Empty;
+        UpdateCaptureReadiness();
+    }
+
+    /// <summary>Sets the cart position the next capture will be inserted at.</summary>
+    [RelayCommand]
+    private void SetInsertPoint(object? pageNumber)
+    {
+        var page = pageNumber switch
+        {
+            int i => i,
+            string str when int.TryParse(str, out var parsed) => parsed,
+            _ => -1
+        };
+        if (page < 1) return;
+
+        _insertBeforePage = page;
+        UpdateInsertPointLabel();
+        StatusText = $"Capturing will insert at page {page}. Press Insert point off to go back to adding at the end.";
+    }
+
+    [RelayCommand]
+    private void ClearInsertPoint()
+    {
+        if (_insertBeforePage == null) return;
+        _insertBeforePage = null;
+        UpdateInsertPointLabel();
+        StatusText = "Capturing will add pages at the end again.";
+    }
+
+    /// <summary>Makes room at <paramref name="insertAt"/> by moving that page and every later one
+    /// down by <paramref name="count"/>.
+    ///
+    /// <para>Every job sharing a page number moves together, retired recapture attempts included —
+    /// leaving one behind would attach it to whichever page later took its number. Thumbnails are
+    /// renamed to match, highest first so a page never overwrites one that hasn't moved yet.</para></summary>
+    private async Task ShiftPagesForInsertAsync(int insertAt, int count)
+    {
+        if (_currentBatchId == null || count <= 0) return;
+        try
+        {
+            _dbContext.ChangeTracker.Clear();
+            var toShift = await _dbContext.CaptureJobs
+                .Where(j => j.BatchId == _currentBatchId && j.PageNumber >= insertAt)
+                .ToListAsync();
+            if (toShift.Count == 0) return;
+
+            foreach (var job in toShift) job.PageNumber += count;
+            await _dbContext.SaveChangesAsync();
+
+            // Descending, so each rename targets a number nothing still occupies.
+            foreach (var page in toShift.Select(j => j.PageNumber - count).Distinct().OrderByDescending(p => p))
+            {
+                var from = ThumbnailFileFor(_activeBatchCode, page);
+                var to = ThumbnailFileFor(_activeBatchCode, page + count);
+                try { if (File.Exists(from)) File.Move(from, to, overwrite: true); }
+                catch (IOException) { /* A thumbnail is a cache; losing one costs a re-render. */ }
+            }
+
+            foreach (var thumbnail in RecentCaptures.Where(t => t.PageNumber >= insertAt).ToList())
+                thumbnail.PageNumber += count;
+
+            PageCount += count;
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not make room for the inserted page: {ex.Message}";
+            throw;
+        }
+    }
+
     /// <summary>Raised when a page is appended to the cart, so the view can scroll to it. The
     /// cart is in page order, so the newest capture is at the far end rather than in view.</summary>
     public event EventHandler? CartAppended;
@@ -1314,6 +1399,71 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Closes the open batch and returns the app to an empty state, so another batch can
+    /// be created or opened. Without this the only way back to a clean slate was restarting, since
+    /// every path into the app either creates a batch or opens one.</summary>
+    [RelayCommand]
+    private async Task CloseBatchAsync(Avalonia.Controls.Window? owner)
+    {
+        if (_currentBatchId == null)
+        {
+            StatusText = "No batch is open.";
+            return;
+        }
+
+        if (owner != null)
+        {
+            var proceed = await MicroCapture.UI.Views.ConfirmDialog.AskAsync(owner,
+                $"Close batch '{_activeBatchCode}'?\n\n" +
+                "Nothing is deleted — every page stays in the batch folder and you can open it " +
+                "again at any time. Pages still processing will finish in the background.",
+                "Close batch");
+            if (!proceed) return;
+        }
+
+        try
+        {
+            // Publish before letting go, so the folder carries everything captured in this
+            // session rather than whatever the last incidental publish happened to include.
+            await PublishManifestAsync();
+            ReleaseCurrentBatchLock();
+            _batchLockHeartbeat?.Stop();
+
+            var closed = _activeBatchCode;
+            _currentBatchId = null;
+            _currentBatchFolder = null;
+            _activeBatchCode = string.Empty;
+            _activeProjectCode = string.Empty;
+            ProjectCode = string.Empty;
+            BatchCode = string.Empty;
+            PageCount = 0;
+
+            foreach (var thumbnail in RecentCaptures) thumbnail.Thumbnail?.Dispose();
+            RecentCaptures.Clear();
+            OnPropertyChanged(nameof(SelectedCount));
+            OnPropertyChanged(nameof(HasSelection));
+
+            // A new batch starts with a clean history; undoing into a batch that is no longer
+            // open would reprocess pages the operator can't see.
+            _undoStack.Clear();
+            _redoStack.Clear();
+            RefreshHistoryState();
+
+            _lastCapturedSignature = null;
+            _previousFrameSignature = null;
+            _sawPageTurnSinceCapture = false;
+            _stableFrameCount = 0;
+
+            UpdateOpenBatchLabels(null);
+            UpdateCaptureReadiness();
+            StatusText = $"Closed batch '{closed}'. Create a new batch or open an existing one.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not close the batch: {ex.Message}";
+        }
+    }
+
     /// <summary>Creates a batch: its folder, its manifest, and the local database rows that track
     /// it while it's being worked. The folder is the batch — the database row is this machine's
     /// working copy of it, which is why the manifest is written before anything else.</summary>
@@ -1701,8 +1851,27 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_currentBatchId == null) { StatusText = "Start a batch first"; return; }
 
         var frameCount = Frames.Count;
-        var firstPageNumber = PageCount + 1;
-        PageCount += frameCount > 0 ? frameCount : 1;
+        var pagesThisShot = frameCount > 0 ? frameCount : 1;
+
+        // Normally the next page goes on the end. With an insert point set, it goes where the
+        // operator put it instead and everything from there on shifts down to make room — which
+        // is what lets someone who shot 400 pages go back and add the ones they missed at 350
+        // without renumbering the batch by hand or recapturing the rest.
+        int firstPageNumber;
+        if (_insertBeforePage is { } insertAt)
+        {
+            firstPageNumber = insertAt;
+            await ShiftPagesForInsertAsync(insertAt, pagesThisShot);
+            // The insert point advances with the shot, so a run of pages inserts in order rather
+            // than each one landing on top of the last.
+            _insertBeforePage = insertAt + pagesThisShot;
+            UpdateInsertPointLabel();
+        }
+        else
+        {
+            firstPageNumber = PageCount + 1;
+            PageCount += pagesThisShot;
+        }
         var pageStr = firstPageNumber.ToString("D6");
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}";
 
@@ -2610,10 +2779,18 @@ public partial class MainWindowViewModel : ViewModelBase
         // thumbnails that never advance past "Processing"). Inserting the row here, before this
         // method returns, guarantees it already exists by the time any worker callback for this
         // job can possibly run.
-        // Appended, not inserted at 0: the cart is in page order, so a new page belongs at the
-        // end. CartChanged tells the view to scroll there so the newest capture stays in sight.
-        RecentCaptures.Add(thumbnail);
-        CartAppended?.Invoke(this, EventArgs.Empty);
+        // The cart is in page order, so a page normally belongs at the end — but an inserted page
+        // belongs where its number puts it, or the strip would disagree with the page numbers
+        // printed on its own tiles.
+        var insertIndex = RecentCaptures.Count;
+        for (var i = 0; i < RecentCaptures.Count; i++)
+        {
+            if (RecentCaptures[i].PageNumber <= pageNumber) continue;
+            insertIndex = i;
+            break;
+        }
+        RecentCaptures.Insert(insertIndex, thumbnail);
+        if (insertIndex == RecentCaptures.Count - 1) CartAppended?.Invoke(this, EventArgs.Empty);
         var placeholders = new List<ThumbnailItem> { thumbnail };
 
         // Trim from the FRONT. The cart is in page order and new pages are appended, so the

@@ -66,27 +66,23 @@
                         </StackPanel>
                     </Grid>
 
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="FINAL OUTPUT FORMAT" Classes="sectionLabel"/>
-                        <ComboBox ItemsSource="{Binding AvailableExportFormats}" SelectedItem="{Binding SelectedExportFormat}"
-                                  HorizontalAlignment="Stretch"
-                                  ToolTip.Tip="What Finalize produces for the whole batch. Can still be changed at Finalize time."/>
-                    </StackPanel>
-
                     <StackPanel Spacing="8" Margin="0,4,0,0">
                         <TextBlock Text="PROCESSING" Classes="sectionLabel"/>
-                        <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction"
-                                  ToolTip.Tip="Corrects spine-curvature distortion on bound-book captures — flattens the bulge near the gutter so text lines come out straight."
-                                  Foreground="{StaticResource InkMutedBrush}"/>
-                        <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split book pages"
-                                  ToolTip.Tip="Splits a photographed two-page spread into two output pages at the gutter."
-                                  Foreground="{StaticResource InkMutedBrush}"/>
-                        <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (black &amp; white)"
-                                  ToolTip.Tip="Thresholds every page to pure black-and-white as a 1-bit CCITT G4 TIFF — much smaller files and crisper OCR, but loses all colour and greyscale. Not reversible after export."
-                                  Foreground="{StaticResource InkMutedBrush}"/>
-                        <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough suppression"
-                                  ToolTip.Tip="Softens show-through from the reverse side of a thin page. Effective on greyscale and text show-through only, not coloured images."
-                                  Foreground="{StaticResource InkMutedBrush}"/>
+                        <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{StaticResource InkTertiaryBrush}"
+                                   Text="These are being built and can't be switched on yet. They're listed here so you can see what's coming."/>
+                        <!-- Shown but not operable. Listing them communicates the roadmap; leaving
+                             them clickable would let an operator set an option that silently does
+                             nothing to their batch. -->
+                        <StackPanel Spacing="8" IsEnabled="False" Opacity="0.55">
+                            <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction  (in development)"
+                                      Foreground="{StaticResource InkMutedBrush}"/>
+                            <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split book pages  (in development)"
+                                      Foreground="{StaticResource InkMutedBrush}"/>
+                            <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (black &amp; white)  (in development)"
+                                      Foreground="{StaticResource InkMutedBrush}"/>
+                            <CheckBox IsChecked="{Binding BleedthroughEnabled}" Content="Bleedthrough suppression  (in development)"
+                                      Foreground="{StaticResource InkMutedBrush}"/>
+                        </StackPanel>
                     </StackPanel>
 
                 </StackPanel>

@@ -131,23 +131,54 @@
     <Setter Property="Cursor" Value="Hand"/>
   </Style>
 
-  <!-- Small circular icon button — delete affordance on a thumbnail tile. Hidden until the
-       tile is hovered so it doesn't compete with "click to review" at rest. -->
+  <!-- Destructive action button.
+       This used to default to Opacity 0 and only become visible inside a hovered cart tile, on
+       the assumption it was only ever used there. It wasn't: the Finalize dialog's per-page
+       delete and the cart's own "Delete Selected" both use it and sit nowhere near a tile, so
+       both were permanently invisible — present, clickable, and impossible to see. The cart tile
+       now has its own hover-revealed control (Button.tileAction.danger), so this one is simply
+       always visible, which is what a destructive action should be. -->
   <Style Selector="Button.iconDanger">
     <Setter Property="Background" Value="{StaticResource FailBrush}"/>
     <Setter Property="Foreground" Value="White"/>
     <Setter Property="BorderThickness" Value="0"/>
-    <Setter Property="CornerRadius" Value="99"/>
+    <Setter Property="CornerRadius" Value="6"/>
+    <Setter Property="Padding" Value="10,6"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+  </Style>
+  <Style Selector="Button.iconDanger:pointerover">
+    <Setter Property="Opacity" Value="0.85"/>
+  </Style>
+
+  <!-- Insert-point control between cart tiles. Deliberately quiet: with hundreds of pages there
+       is one of these per tile, and at full strength they would read as more important than the
+       pages. Widens and brightens on hover so the target is easy to hit once sought. -->
+  <Style Selector="Button.insertPoint">
+    <Setter Property="Width" Value="14"/>
+    <Setter Property="MinWidth" Value="14"/>
     <Setter Property="Padding" Value="0"/>
-    <Setter Property="Opacity" Value="0"/>
+    <Setter Property="Margin" Value="0"/>
+    <Setter Property="FontSize" Value="13"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="CornerRadius" Value="4"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Foreground" Value="{StaticResource InkTertiaryBrush}"/>
+    <Setter Property="Opacity" Value="0.35"/>
+    <Setter Property="VerticalAlignment" Value="Stretch"/>
+    <Setter Property="HorizontalContentAlignment" Value="Center"/>
     <Setter Property="Transitions">
       <Transitions>
-        <DoubleTransition Property="Opacity" Duration="0:0:0.12"/>
+        <DoubleTransition Property="Opacity" Duration="0:0:0.1"/>
       </Transitions>
     </Setter>
   </Style>
-  <Style Selector="Grid.thumb:pointerover Button.iconDanger">
+  <Style Selector="Button.insertPoint:pointerover">
     <Setter Property="Opacity" Value="1"/>
+    <Setter Property="Background" Value="{StaticResource PrimaryHoverBrush}"/>
+    <Setter Property="Foreground" Value="White"/>
   </Style>
 
   <!-- ───────────── Cart tile actions ─────────────

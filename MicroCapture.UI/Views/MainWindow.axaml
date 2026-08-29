@@ -55,10 +55,10 @@
                     <Button Classes="primary" Command="{Binding OpenFinalizeBatchCommand}"
                             CommandParameter="{Binding $parent[Window]}" Content="Finalize Batch"
                             ToolTip.Tip="Review, reorder, and export this batch's pages — choose format, OCR, filename and destination"/>
-                    <Button Classes="secondary" Command="{Binding CalibrateLensCommand}"
-                            Content="Calibrate Lens"
-                            ToolTip.Tip="One-time camera lens distortion calibration against a printed ChArUco board — corrects barrel/pincushion distortion before any other geometric correction runs"
-                            IsVisible="{Binding IsConnected}"/>
+                    <Button Classes="secondary" Command="{Binding CloseBatchCommand}"
+                            CommandParameter="{Binding $parent[Window]}" Content="Close Batch"
+                            IsVisible="{Binding HasOpenBatch}"
+                            ToolTip.Tip="Put this batch down and return to an empty screen. Nothing is deleted — reopen it any time."/>
                 </StackPanel>
 
                 <!-- Current batch and page count. Read-only: these describe the open batch rather
@@ -212,25 +212,17 @@
                             </StackPanel>
                         </Border>
 
-                        <TextBlock Text="CAMERA CONTROLS" Classes="sectionLabel" Margin="0,4,0,0"/>
-                        <ItemsControl ItemsSource="{Binding CameraControls}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate x:DataType="vm:CameraControlItem">
-                                    <Grid ColumnDefinitions="*, 120" Margin="0,3">
-                                        <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkSubtleBrush}"
-                                                   VerticalAlignment="Center" FontSize="13"/>
-                                        <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
-                                                  IsEnabled="{Binding !IsBusy}" HorizontalAlignment="Stretch">
-                                            <ComboBox.ItemTemplate>
-                                                <DataTemplate x:DataType="core:CameraSettingOption">
-                                                    <TextBlock Text="{Binding DisplayName}" FontSize="13"/>
-                                                </DataTemplate>
-                                            </ComboBox.ItemTemplate>
-                                        </ComboBox>
-                                    </Grid>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
+                        <!-- Capture Button -->
+                        <Button Classes="primary" Command="{Binding CaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                Padding="0,15" FontSize="16" Margin="0,6,0,0">
+                            CAPTURE
+                        </Button>
+                        <Button Classes="secondary" Command="{Binding RecaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                Padding="0,11">
+                            RECAPTURE
+                        </Button>
 
                         <TextBlock Text="FOCUS" Classes="sectionLabel" Margin="0,4,0,0"/>
                         <!-- Disabled as a group whenever live view isn't streaming: the camera
@@ -274,17 +266,25 @@
                                    HorizontalAlignment="Center" Margin="0,2,0,0"
                                    IsVisible="{Binding !IsLiveViewActive}"/>
 
-                        <!-- Capture Button -->
-                        <Button Classes="primary" Command="{Binding CaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
-                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
-                                Padding="0,15" FontSize="16" Margin="0,6,0,0">
-                            CAPTURE
-                        </Button>
-                        <Button Classes="secondary" Command="{Binding RecaptureCommand}" IsEnabled="{Binding !IsCalibrating}"
-                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
-                                Padding="0,11">
-                            RECAPTURE
-                        </Button>
+                        <TextBlock Text="CAMERA CONTROLS" Classes="sectionLabel" Margin="0,4,0,0"/>
+                        <ItemsControl ItemsSource="{Binding CameraControls}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:CameraControlItem">
+                                    <Grid ColumnDefinitions="*, 120" Margin="0,3">
+                                        <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkSubtleBrush}"
+                                                   VerticalAlignment="Center" FontSize="13"/>
+                                        <ComboBox Grid.Column="1" ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
+                                                  IsEnabled="{Binding !IsBusy}" HorizontalAlignment="Stretch">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate x:DataType="core:CameraSettingOption">
+                                                    <TextBlock Text="{Binding DisplayName}" FontSize="13"/>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
 
                         <!-- Keyboard Shortcuts -->
                         <TextBlock Text="SHORTCUTS" Classes="sectionLabel" Margin="0,4,0,0" />
@@ -349,6 +349,21 @@
                                    IsVisible="{Binding !HasSelection}"
                                    Text="Click a page to adjust it · drag to reorder · ctrl-click to select several"/>
 
+                        <!-- Where the next capture will land, shown only while it isn't the end.
+                             Capturing into the middle of a batch is surprising enough that it has
+                             to be stated and easy to turn off. -->
+                        <Border Grid.Column="1" IsVisible="{Binding HasInsertPoint}" Margin="12,0"
+                                Background="{StaticResource Surface1Brush}" CornerRadius="6" Padding="10,4"
+                                BorderBrush="{StaticResource PrimaryHoverBrush}" BorderThickness="1"
+                                HorizontalAlignment="Left" VerticalAlignment="Center">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <TextBlock Text="{Binding InsertPointLabel}" FontSize="11.5"
+                                           Foreground="{StaticResource InkBrush}" VerticalAlignment="Center"/>
+                                <Button Content="Add at end instead" Classes="secondary" FontSize="11" Padding="8,3"
+                                        Command="{Binding ClearInsertPointCommand}"/>
+                            </StackPanel>
+                        </Border>
+
                         <!-- Undo/redo apply to adjustments, which are reprocessed from the
                              preserved original — so stepping back costs only the reprocessing
                              time and never the image. -->
@@ -373,11 +388,24 @@
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
-                            <StackPanel Orientation="Horizontal" Spacing="8" />
+                            <StackPanel Orientation="Horizontal" Spacing="0" />
                         </ItemsPanelTemplate>
                     </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:ThumbnailItem">
+                            <StackPanel Orientation="Horizontal">
+                            <!-- Insert point. Sits before each tile and means "start capturing
+                                 here", so someone who shot 400 pages can go back and add the ones
+                                 they missed at 350 without recapturing the rest. Faint until
+                                 hovered so 400 of them don't shout over the pages themselves. -->
+                            <!-- Click handler, not a $parent[ItemsControl] compiled binding: that
+                                 pattern threw "unable to resolve type" at runtime on the target
+                                 machine despite building cleanly — see RecentBatchesDialog's own
+                                 note. Every per-row control in this app uses the code-behind
+                                 idiom for that reason. -->
+                            <Button Classes="insertPoint" Content="+"
+                                    Click="OnInsertPointClick"
+                                    ToolTip.Tip="Start capturing here — this page and the ones after it shift down"/>
                             <Grid Classes="thumb" Width="104" DragDrop.AllowDrop="True">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="*"/>
@@ -433,6 +461,7 @@
                                             Content="✕"/>
                                 </Grid>
                             </Grid>
+                            </StackPanel>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
