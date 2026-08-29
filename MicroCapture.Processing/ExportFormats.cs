@@ -59,8 +59,11 @@ public sealed record ExportFormat(
         new ExportFormat("PDF", ExportKind.Pdf, ".pdf"),
         new ExportFormat("Searchable PDF", ExportKind.Pdf, ".pdf", EmbedsText: true),
         new ExportFormat("PDF/A", ExportKind.Pdf, ".pdf", EmbedsText: true, RequiresPdfA: true),
-        new ExportFormat("TIFF", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
-        new ExportFormat("TIFF Uncompressed", ExportKind.ImagePerPage, ".tif", Compression: "None"),
+        // "TIFF" means the raw, uncompressed archival master — the plain name is what an
+        // operator reaches for when they want nothing done to the file. Compression is the
+        // variant, and says so in its name.
+        new ExportFormat("TIFF", ExportKind.ImagePerPage, ".tif", Compression: "None"),
+        new ExportFormat("TIFF LZW", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
         new ExportFormat("TIFF-Multipage", ExportKind.MultipageTiff, ".tif", Compression: "LZW"),
         new ExportFormat("JPEG", ExportKind.ImagePerPage, ".jpg"),
         new ExportFormat("PNG", ExportKind.ImagePerPage, ".png"),
@@ -74,7 +77,7 @@ public sealed record ExportFormat(
         // that changes nothing invites the operator to hunt for a difference that doesn't exist.
         // "JPG" is the short form already persisted on existing jobs.
         new ExportFormat("PDF-Multipage", ExportKind.Pdf, ".pdf"),
-        new ExportFormat("TIFF LZW", ExportKind.ImagePerPage, ".tif", Compression: "LZW"),
+        new ExportFormat("TIFF Uncompressed", ExportKind.ImagePerPage, ".tif", Compression: "None"),
         new ExportFormat("JPG", ExportKind.ImagePerPage, ".jpg")
     };
 
@@ -82,7 +85,9 @@ public sealed record ExportFormat(
     /// still resolve, so a batch or manifest that stored one keeps working.</summary>
     private static readonly HashSet<string> Aliases = new(StringComparer.OrdinalIgnoreCase)
     {
-        "PDF-Multipage", "TIFF LZW", "JPG"
+        // "TIFF Uncompressed" is the previous name for what is now plainly "TIFF"; kept so a
+        // batch that stored it still resolves.
+        "PDF-Multipage", "TIFF Uncompressed", "JPG"
     };
 
     /// <summary>Names offered in the UI — every format that produces a genuinely different file,

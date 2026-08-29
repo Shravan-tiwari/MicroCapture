@@ -196,14 +196,24 @@ public partial class WatermarkEditorViewModel : ViewModelBase
 
         Task.Run(() =>
         {
-            var bytes = WatermarkPreviewRenderer.RenderPreview(_samplePageImagePath, snapshot);
-            if (bytes == null) return;
+            var frame = WatermarkPreviewRenderer.RenderPreviewPixels(_samplePageImagePath, snapshot);
+            if (frame == null) return;
             Dispatcher.UIThread.Post(() =>
             {
                 try
                 {
-                    using var ms = new MemoryStream(bytes);
-                    var bitmap = new Bitmap(ms);
+                    // Blitted straight into a WriteableBitmap. Encoding the preview to PNG and
+                    // decoding it again was pure overhead on every slider tick — the image never
+                    // leaves the process, so there is nothing to encode it for.
+                    var bitmap = new WriteableBitmap(
+                        new Avalonia.PixelSize(frame.Width, frame.Height),
+                        new Avalonia.Vector(96, 96),
+                        Avalonia.Platform.PixelFormat.Bgra8888,
+                        Avalonia.Platform.AlphaFormat.Premul);
+                    using (var buffer = bitmap.Lock())
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(frame.Pixels, 0, buffer.Address, frame.Pixels.Length);
+                    }
                     var old = PreviewImage;
                     PreviewImage = bitmap;
                     old?.Dispose();

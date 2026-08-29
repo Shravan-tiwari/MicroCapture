@@ -339,15 +339,23 @@
                                     ToolTip.Tip="Set adjustments on one page and apply them to every selected page"/>
                             <Button Content="Delete Selected" Command="{Binding DeleteSelectedCommand}"
                                     CommandParameter="{Binding $parent[Window]}" Classes="iconDanger"/>
+                            <Button Content="{Binding SelectAllLabel}" Classes="secondary"
+                                    Command="{Binding ToggleSelectAllCommand}"
+                                    ToolTip.Tip="Select every page in the cart, or clear the selection if they all are"/>
                             <Button Content="Clear Selection" Click="OnClearSelectionClick" Classes="secondary"/>
                         </StackPanel>
 
                         <!-- Hint shown in place of the actions when nothing is selected, so the
                              bar teaches the interaction instead of sitting empty. -->
-                        <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="12"
-                                   Foreground="{StaticResource InkTertiaryBrush}"
-                                   IsVisible="{Binding !HasSelection}"
-                                   Text="Click a page to adjust it · drag to reorder · ctrl-click to select several"/>
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center"
+                                    IsVisible="{Binding !HasSelection}">
+                            <Button Content="{Binding SelectAllLabel}" Classes="secondary"
+                                    Command="{Binding ToggleSelectAllCommand}"
+                                    ToolTip.Tip="Select every page in the cart"/>
+                            <TextBlock VerticalAlignment="Center" FontSize="12"
+                                       Foreground="{StaticResource InkTertiaryBrush}"
+                                       Text="Click a page to adjust it · drag to reorder · ctrl-click to select several"/>
+                        </StackPanel>
 
                         <!-- Where the next capture will land, shown only while it isn't the end.
                              Capturing into the middle of a batch is surprising enough that it has

@@ -56,7 +56,13 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     public ObservableCollection<WatermarkPreset> WatermarkPresets { get; } = new();
 
     [ObservableProperty] private string _selectedFormat = "PDF";
-    [ObservableProperty] private bool _embedSearchableText = true;
+    /// <summary>Whether this export needs OCR text. Decided entirely by the chosen format now:
+    /// "Searchable PDF" and "PDF/A" mean searchable by definition, and "OCR Text" is nothing but
+    /// text. A separate checkbox could contradict the format's own name, which left an operator
+    /// choosing Searchable PDF and unchecking the very thing that makes it searchable.</summary>
+    public bool NeedsOcr =>
+        MicroCapture.Processing.ExportFormat.Resolve(SelectedFormat) is { } f
+        && (f.EmbedsText || f.Kind == MicroCapture.Processing.ExportKind.TextOnly);
     [ObservableProperty] private string _fileName = string.Empty;
     [ObservableProperty] private string _destinationDirectory = string.Empty;
     [ObservableProperty] private bool _isBusy;
@@ -90,6 +96,7 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     {
         OnPropertyChanged(nameof(IsPdfFormat));
         OnPropertyChanged(nameof(SupportsWatermark));
+        OnPropertyChanged(nameof(NeedsOcr));
     }
 
     // Unlike MainWindowViewModel's PersistBatchSettingAsync (immediate persistence during a
@@ -303,10 +310,16 @@ public partial class FinalizeBatchViewModel : ViewModelBase
     [RelayCommand]
     private async Task EditWatermarkAsync(Avalonia.Controls.Window? owner)
     {
+        try
+        {
         // Nullable because the command parameter can resolve to null before the window is fully
         // in the visual tree; a non-nullable parameter turned that into a hard failure with no
         // explanation rather than a no-op.
-        if (owner == null) return;
+        if (owner == null)
+        {
+            StatusText = "Could not open the watermark editor — try again once the window has finished opening.";
+            return;
+        }
 
         if (Pages.Count == 0)
         {
@@ -315,7 +328,14 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         }
 
         var job = await _dbContext.CaptureJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == Pages[0].JobId);
-        if (job == null) return;
+        if (job == null)
+        {
+            // Previously a bare return. The button appeared to do nothing at all, with no message
+            // and no dialog — indistinguishable from a dead control.
+            StatusText = "Could not load a page to design the watermark against.";
+            return;
+        }
+
         var samplePath = BatchExportService.GetProcessedFilesForJob(job).FirstOrDefault();
         if (samplePath == null)
         {
@@ -327,7 +347,30 @@ public partial class FinalizeBatchViewModel : ViewModelBase
         if (saved == null) return;
 
         await LoadWatermarkPresetsAsync(saved.Id);
+
+        // LoadWatermarkPresetsAsync assigns the backing field directly so that RESTORING a saved
+        // choice doesn't re-persist it. That is right on load and wrong here: the operator just
+        // created or edited a preset, so the batch has to be told which one to use. Without this
+        // the batch kept its previous (often null) WatermarkPresetId, export re-queried it, found
+        // no preset, and drew nothing — a watermark the operator had just designed and saved
+        // simply did not appear.
+        PersistWatermarkSetting(b =>
+        {
+            b.WatermarkPresetId = saved.Id;
+            b.WatermarkEnabled = true;
+        });
+
         WatermarkEnabled = true; // opening the editor and saving implies the operator wants it applied
+        StatusText = $"Watermark '{saved.Name}' will be applied to this export.";
+        }
+        catch (Exception ex)
+        {
+            // An exception escaping here leaves the AsyncRelayCommand permanently disabled for
+            // the rest of the session — the button stops responding entirely and nothing says
+            // why, which is exactly how a one-off failure becomes "the button doesn't work".
+            StatusText = $"Could not open the watermark editor: {ex.Message}";
+            Console.Error.WriteLine($"[FinalizeBatchViewModel] EditWatermark failed: {ex}");
+        }
     }
 
     private bool CanExport() => !IsBusy && Pages.Count > 0;
@@ -394,7 +437,7 @@ public partial class FinalizeBatchViewModel : ViewModelBase
             var pageCount = Pages.Count;
             var missingOcrText = false;
 
-            if (IsPdfFormat && EmbedSearchableText)
+            if (NeedsOcr)
             {
                 // OCR is usually the long half — a page can take seconds — so it reports its own
                 // per-page progress rather than sitting behind one static message.
@@ -422,12 +465,10 @@ public partial class FinalizeBatchViewModel : ViewModelBase
                 progress: exportProgress,
                 token: token), token);
 
-            // Not exported as searchable text when the format isn't PDF or the toggle is off —
-            // export path itself always embeds whatever .txt sidecars happen to exist (see
-            // BatchExportService.DrawSearchText), which is only meaningful for PDF.
-            missingOcrText = missingOcrText || (IsPdfFormat && !EmbedSearchableText);
+            // Only a searchable format can be missing its text layer; a plain PDF was never
+            // meant to have one.
 
-            Result = new FinalizeResult(exportPath, missingOcrText && IsPdfFormat);
+            Result = new FinalizeResult(exportPath, missingOcrText && NeedsOcr);
             _refreshTimer?.Stop();
             CloseRequested?.Invoke(this, EventArgs.Empty);
         }

@@ -586,11 +586,32 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>Called from MainWindow.axaml.cs's ctrl/shift-click handling on a thumbnail —
     /// toggles that thumbnail's selection and refreshes the computed selection properties the
     /// action bar binds to.</summary>
+    /// <summary>Selects every page in the cart, or clears the selection when all are already
+    /// selected — one control for both directions, since needing "select all" is almost always
+    /// followed by needing to undo it.</summary>
+    [RelayCommand]
+    private void ToggleSelectAll()
+    {
+        var selectAll = RecentCaptures.Any(t => !t.IsSelected);
+        foreach (var thumbnail in RecentCaptures) thumbnail.IsSelected = selectAll;
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(HasSelection));
+        OnPropertyChanged(nameof(SelectAllLabel));
+        OnPropertyChanged(nameof(SelectAllLabel));
+        StatusText = selectAll
+            ? $"Selected all {RecentCaptures.Count} page(s) in the cart."
+            : "Selection cleared.";
+    }
+
+    public string SelectAllLabel =>
+        RecentCaptures.Count > 0 && RecentCaptures.All(t => t.IsSelected) ? "Select None" : "Select All";
+
     public void ToggleThumbnailSelection(ThumbnailItem item)
     {
         item.IsSelected = !item.IsSelected;
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(HasSelection));
+        OnPropertyChanged(nameof(SelectAllLabel));
     }
 
     public void ClearSelection()
@@ -598,6 +619,7 @@ public partial class MainWindowViewModel : ViewModelBase
         foreach (var t in RecentCaptures) t.IsSelected = false;
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(HasSelection));
+        OnPropertyChanged(nameof(SelectAllLabel));
     }
 
     public MainWindowViewModel()
@@ -2300,6 +2322,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(HasSelection));
+        OnPropertyChanged(nameof(SelectAllLabel));
     }
 
     // Non-null while Crop Review is open — MainWindow.axaml hosts a CropReviewWindow view bound

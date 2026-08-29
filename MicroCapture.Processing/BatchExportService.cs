@@ -219,7 +219,7 @@ public class BatchExportService
                     {
                         if (watermarked != null)
                         {
-                            if (!WriteWatermarkedWithOpenCv(watermarked, targetPath))
+                            if (!WriteWatermarkedWithOpenCv(watermarked, targetPath, exportFormat))
                                 throw new IOException($"Could not write watermarked {exportFormat.Name} export: {targetPath}");
                             if (!File.Exists(targetPath) || new FileInfo(targetPath).Length == 0)
                                 throw new IOException($"Export output was not created: {targetPath}");
@@ -244,7 +244,7 @@ public class BatchExportService
                         // A watermarked TIFF has to be re-encoded rather than copied — the point
                         // of the copy below is preserving the source bytes, which no longer
                         // represent what should be exported once a mark is burned in.
-                        if (!WriteWatermarkedWithOpenCv(watermarked, targetPath))
+                        if (!WriteWatermarkedWithOpenCv(watermarked, targetPath, exportFormat))
                             throw new IOException($"Could not write watermarked TIFF export: {targetPath}");
                     }
                     else if (Path.GetExtension(f).ToLowerInvariant() is ".tif" or ".tiff"
@@ -328,10 +328,21 @@ public class BatchExportService
     /// others), and assuming one produced silently colour-swapped output — a red watermark came
     /// out blue, and the mark looked absent to anything checking for red. PNG is lossless, so the
     /// round-trip costs a little time at export and nothing in fidelity.</para></summary>
-    private static bool WriteWatermarkedWithOpenCv(SKBitmap bitmap, string targetPath)
+    private static bool WriteWatermarkedWithOpenCv(SKBitmap bitmap, string targetPath, ExportFormat? format = null)
     {
         using var mat = WatermarkedToMat(bitmap);
-        return !mat.Empty() && Cv2.ImWrite(targetPath, mat);
+        if (mat.Empty()) return false;
+
+        // A watermarked page is re-encoded rather than copied, so the format's compression has to
+        // be applied here too. Without it, "TIFF" and "TIFF LZW" produced byte-identical files
+        // the moment a watermark was switched on — the compression choice silently stopped
+        // meaning anything.
+        if (Path.GetExtension(targetPath).Equals(".tif", StringComparison.OrdinalIgnoreCase) && format != null)
+        {
+            var compression = format.Compression == "None" ? 1 : 5; // 1 = none, 5 = LZW
+            return Cv2.ImWrite(targetPath, mat, new[] { (int)ImwriteFlags.TiffCompression, compression });
+        }
+        return Cv2.ImWrite(targetPath, mat);
     }
 
     /// <summary>Writes every page of the batch into one multi-page TIFF.
@@ -514,9 +525,14 @@ public class BatchExportService
                 var text = File.Exists(sidecar) ? await File.ReadAllTextAsync(sidecar) : string.Empty;
                 if (!string.IsNullOrWhiteSpace(text)) pagesWithText++;
 
-                await File.WriteAllTextAsync(Path.Combine(exportDir, $"{batchPrefix}_Page_{pageIndex:D6}.txt"), text);
+                // Only write a file for a page that actually has text. Writing one regardless
+                // scattered empty .txt files through the export folder, which read as broken
+                // output rather than as "this page had nothing on it".
+                if (!string.IsNullOrWhiteSpace(text))
+                    await File.WriteAllTextAsync(Path.Combine(exportDir, $"{batchPrefix}_Page_{pageIndex:D6}.txt"), text);
+
                 combined.AppendLine($"--- Page {pageIndex} ---");
-                combined.AppendLine(text);
+                combined.AppendLine(string.IsNullOrWhiteSpace(text) ? "(no text recognised on this page)" : text);
                 combined.AppendLine();
                 pageIndex++;
             }
@@ -525,9 +541,13 @@ public class BatchExportService
 
         await File.WriteAllTextAsync(Path.Combine(exportDir, $"{batchPrefix}_AllPages.txt"), combined.ToString());
 
+        // Deliberately no longer throws when a page has no text. An OCR export whose job is to
+        // produce text files should produce them; a page that genuinely holds no readable text
+        // is a real result, not a failure. Refusing also left the export half-done — the
+        // per-page files had already been written by this point, so the operator got both an
+        // error and a folder of files.
         if (pagesWithText == 0)
-            throw new InvalidOperationException(
-                "No OCR text was found for this batch. Run OCR first, then export again.");
+            Console.Error.WriteLine("OCR text export: no page carried any recognised text.");
 
         batch.Status = "Exported";
         AttachOrUpdateBatch(batch);

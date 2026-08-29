@@ -22,7 +22,10 @@ public static class WatermarkPreviewRenderer
     /// unresponsive. The watermark's geometry is stored as fractions of the page (see
     /// WatermarkRenderer), so it lands in the same proportional place at any scale: previewing at
     /// full capture resolution bought nothing a preview-sized render doesn't already show.</para></summary>
-    private const int PreviewMaxEdge = 1400;
+    private const int PreviewMaxEdge = 1000;
+
+    /// <summary>A rendered preview as raw BGRA pixels, ready to blit straight into the UI.</summary>
+    public sealed record PreviewFrame(byte[] Pixels, int Width, int Height);
 
     private static readonly object SampleLock = new();
     private static string? _cachedSamplePath;
@@ -74,6 +77,38 @@ public static class WatermarkPreviewRenderer
             _cachedSample = null;
             _cachedSamplePath = null;
         }
+    }
+
+    /// <summary>Renders the preview and returns its raw pixels.
+    ///
+    /// <para>The PNG path below encodes the composited page and the caller then decodes it again,
+    /// twice the work per slider tick for no benefit — the bitmap never leaves the process. This
+    /// hands the pixels over directly, which is what made the editor feel sluggish to drag.</para></summary>
+    public static PreviewFrame? RenderPreviewPixels(string pageImagePath, WatermarkPreset preset)
+    {
+        var bitmap = GetScaledSamplePage(pageImagePath);
+        if (bitmap == null) return null;
+
+        var info = new SKImageInfo(bitmap.Width, bitmap.Height, SKColorType.Bgra8888, SKAlphaType.Premul);
+        using var surface = SKSurface.Create(info);
+        if (surface == null) return null;
+
+        var canvas = surface.Canvas;
+        canvas.DrawBitmap(bitmap, 0, 0, SKSamplingOptions.Default);
+        WatermarkRenderer.Draw(canvas, bitmap, preset);
+        canvas.Flush();
+
+        var pixels = new byte[info.BytesSize];
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(pixels, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            if (!surface.ReadPixels(info, handle.AddrOfPinnedObject(), info.RowBytes, 0, 0)) return null;
+        }
+        finally
+        {
+            handle.Free();
+        }
+        return new PreviewFrame(pixels, info.Width, info.Height);
     }
 
     public static byte[]? RenderPreview(string pageImagePath, WatermarkPreset preset)
