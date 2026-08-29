@@ -30,6 +30,13 @@ public class AppPreferences
     /// under a bright window and one in a dim studio should not be arguing over a batch file.</summary>
     public string ThemeMode { get; set; } = "Dark";
 
+    /// <summary>How far the live view (and every new capture) is rotated clockwise: 0, 90, 180
+    /// or 270. Kept per machine because that is what it describes — a camera bolted to this rig
+    /// at this angle, or a copy stand where the book sits sideways. It would be wrong in a batch
+    /// manifest, where it would follow the images onto a workstation whose rig is set up
+    /// differently.</summary>
+    public int LiveViewRotation { get; set; }
+
     /// <summary>Folders scanned to list available batches — typically the shared drive batches are
     /// kept on. Scanning is read-only, so several machines pointed at one share can't conflict.</summary>
     public List<string> BatchSearchRoots { get; set; } = new();

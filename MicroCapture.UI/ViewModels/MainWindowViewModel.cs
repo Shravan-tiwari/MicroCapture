@@ -64,6 +64,37 @@ public partial class MainWindowViewModel : ViewModelBase
         AppTheme.ApplyAndSave(ThemeMode, _preferences);
     }
 
+    // ───────────── Live view orientation ─────────────
+    // Degrees clockwise, 0/90/180/270. Applied to the live view for the operator and stamped onto
+    // each capture as it is queued, so what is on screen is what lands in the batch.
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsLiveViewRotated))]
+    [NotifyPropertyChangedFor(nameof(LiveViewRotationLabel))]
+    private int _liveViewRotation;
+
+    public bool IsLiveViewRotated => LiveViewRotation != 0;
+
+    public string LiveViewRotationLabel => $"{LiveViewRotation}°";
+
+    [RelayCommand]
+    private void RotateLiveViewLeft() => SetLiveViewRotation(LiveViewRotation - 90);
+
+    [RelayCommand]
+    private void RotateLiveViewRight() => SetLiveViewRotation(LiveViewRotation + 90);
+
+    private void SetLiveViewRotation(int degrees)
+    {
+        LiveViewRotation = ((degrees % 360) + 360) % 360;
+
+        // Remembered per machine, not per batch: it describes how the camera sits on this rig, so
+        // it should still be right after a restart mid-book. A batch that spans a restart would
+        // otherwise change orientation partway through — the one thing "only applies to upcoming
+        // captures" must not turn into.
+        _preferences.LiveViewRotation = LiveViewRotation;
+        _preferences.Save();
+    }
+
     // Refreshes this machine's claim on the open batch. Without it the lock ages past
     // BatchLockService.StaleAfter while the batch is still being worked, so a second workstation
     // opening the same folder sees an abandoned lock and is never warned — which is the one
@@ -720,6 +751,9 @@ public partial class MainWindowViewModel : ViewModelBase
     public MainWindowViewModel(ICameraService cameraService, string? dbPath)
     {
         _cameraService = cameraService;
+        // Restored before any capture can happen, so a batch resumed after a restart keeps
+        // shooting the same way up as the pages already in it.
+        _liveViewRotation = ((_preferences.LiveViewRotation % 360) + 360) % 360;
         _dbContext = dbPath == null ? new AppDbContext() : new AppDbContext(dbPath);
         _queueService = new CaptureQueueService(_dbContext);
         _manifests = new BatchManifestService();
@@ -2007,13 +2041,13 @@ public partial class MainWindowViewModel : ViewModelBase
                     var pw = (int)Math.Round(frame.Width * scaleX);
                     var ph = (int)Math.Round(frame.Height * scaleY);
                     var cropBox = FormattableString.Invariant($"{px},{py},{pw},{ph}");
-                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox);
+                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox, LiveViewRotation);
                     AddThumbnail(frameJob.Id, filePath, pageNumber, frameIndex: i, cropRect: (px, py, pw, ph));
                 }
             }
             else
             {
-                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi, rotationDegrees: LiveViewRotation);
                 AddThumbnail(job.Id, filePath, PageCount);
             }
 
@@ -2099,13 +2133,13 @@ public partial class MainWindowViewModel : ViewModelBase
                     var pw = (int)Math.Round(frame.Width * scaleX);
                     var ph = (int)Math.Round(frame.Height * scaleY);
                     var cropBox = FormattableString.Invariant($"{px},{py},{pw},{ph}");
-                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox);
+                    var frameJob = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, pageNumber, SelectedCaptureFormat, SelectedDpi, cropBox, LiveViewRotation);
                     AddThumbnail(frameJob.Id, filePath, pageNumber, isRecapture: true, frameIndex: i, cropRect: (px, py, pw, ph));
                 }
             }
             else
             {
-                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi);
+                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi, rotationDegrees: LiveViewRotation);
                 AddThumbnail(job.Id, filePath, PageCount, isRecapture: true);
             }
             _ = RefreshFrameEditPermissionAsync();

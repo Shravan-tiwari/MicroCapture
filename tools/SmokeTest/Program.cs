@@ -19,6 +19,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Threading;
+using MicroCapture.UI;
 using MicroCapture.UI.Theming;
 using MicroCapture.UI.ViewModels;
 using MicroCapture.UI.Views;
@@ -67,6 +68,7 @@ TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
+await TestLiveViewRotationAppliesToNewCapturesOnly();
 TestPdfEncodingQuality();
 TestEveryCaptureFormatIsDecodableForExport();
 TestCapturesLiveInTempAndOutputsInOutput();
@@ -1844,6 +1846,100 @@ void AppendTiffPageForTest(BitMiracle.LibTiff.Classic.Tiff output, string source
         output.WriteScanline(row, y);
     }
     output.WriteDirectory();
+}
+
+async Task TestLiveViewRotationAppliesToNewCapturesOnly()
+{
+    Console.WriteLine("\n-- Rotating the live view applies to new captures only --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "rotate.db");
+
+    // The orientation is remembered in this machine's real preferences file, so put the
+    // operator's own setting back afterwards rather than leaving a test's rotation behind.
+    var savedRotation = AppPreferences.Load().LiveViewRotation;
+    try
+    {
+        var camera = new MicroCapture.Camera.MockCameraService();
+        var vm = new MainWindowViewModel(camera, dbPath);
+        await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+        vm.ProjectCode = "ROT";
+        vm.BatchCode = "ROT";
+        await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+        // Right cycles forward, left cycles back, and both wrap — no 360°, no -90.
+        vm.RotateLiveViewLeftCommand.Execute(null);
+        Check($"Rotating left from upright wraps to 270 (got {vm.LiveViewRotation})", vm.LiveViewRotation == 270);
+        vm.RotateLiveViewRightCommand.Execute(null);
+        Check($"Rotating right returns to upright (got {vm.LiveViewRotation})", vm.LiveViewRotation == 0);
+        Check("No badge is shown while upright", !vm.IsLiveViewRotated);
+
+        // Two pages shot upright.
+        for (var i = 0; i < 2; i++)
+            await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+        PumpUntil(() => vm.RecentCaptures.Count == 2, timeoutMs: 30000);
+
+        // Turn the rig, then two more.
+        vm.RotateLiveViewRightCommand.Execute(null);
+        Check($"The live view is now at 90 (got {vm.LiveViewRotation})", vm.LiveViewRotation == 90);
+        Check($"The rotated state is labelled for the operator ({vm.LiveViewRotationLabel})",
+            vm.IsLiveViewRotated && vm.LiveViewRotationLabel == "90°");
+
+        for (var i = 0; i < 2; i++)
+            await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+        PumpUntil(() => vm.RecentCaptures.Count == 4, timeoutMs: 30000);
+
+        // This is the whole point of stamping the angle onto the job at capture time instead of
+        // reading a live setting when the page is processed: turning the rig at page 3 must not
+        // reach back and rotate pages 1 and 2.
+        using (var db = new AppDbContext(dbPath))
+        {
+            var jobs = db.CaptureJobs.OrderBy(j => j.PageNumber).ToList();
+            Check($"Four pages were queued (got {jobs.Count})", jobs.Count == 4);
+            Check($"Pages captured before the rotation are untouched (got {jobs[0].RotationDegrees}, {jobs[1].RotationDegrees})",
+                jobs[0].RotationDegrees == 0 && jobs[1].RotationDegrees == 0);
+            Check($"Pages captured after it carry the new orientation (got {jobs[2].RotationDegrees}, {jobs[3].RotationDegrees})",
+                jobs[2].RotationDegrees == 90 && jobs[3].RotationDegrees == 90);
+            // RotationDegrees alone does nothing — this flag is what makes the processor apply it.
+            Check("A rotated page is marked as carrying an adjustment, or the processor would ignore the angle",
+                jobs[2].HasManualAdjustments && jobs[3].HasManualAdjustments && !jobs[0].HasManualAdjustments);
+        }
+
+        // Frames are not touched by rotation: the image and the overlay rotate together as one
+        // view, so nothing about a drawn frame's position, size or order changes.
+        vm.LiveViewRotation = 0;
+        vm.AddFrameCommand.Execute(null);
+        vm.AddFrameCommand.Execute(null);
+        var before = vm.Frames.Select(f => (f.X, f.Y, f.Width, f.Height)).ToList();
+        vm.RotateLiveViewRightCommand.Execute(null);
+        vm.RotateLiveViewRightCommand.Execute(null);
+        var after = vm.Frames.Select(f => (f.X, f.Y, f.Width, f.Height)).ToList();
+        Check($"Rotating leaves every drawn frame exactly as it was ({before.Count} frames)",
+            before.Count == 2 && after.SequenceEqual(before));
+
+        // The angle survives a restart. Without this, a batch interrupted overnight would resume
+        // shooting upright while its earlier pages are on their side.
+        vm.LiveViewRotation = 0;
+        vm.RotateLiveViewRightCommand.Execute(null);
+        var reopened = new MainWindowViewModel(camera, Path.Combine(workDir, "rotate2.db"));
+        Check($"The orientation is remembered across a restart (got {reopened.LiveViewRotation})",
+            reopened.LiveViewRotation == 90);
+
+        // And the angle actually reaches pixels, not just the database row.
+        var src = WriteSolidImage(Path.Combine(workDir, "portrait.png"), 400, 900);
+        var outDir = Path.Combine(workDir, "rotated-out");
+        Directory.CreateDirectory(outDir);
+        var result = new ImageProcessor().Process(src, outDir, hasManualAdjustments: true, rotationDegrees: 90, captureFormat: "PNG");
+        var produced = result.OutputFilePaths.FirstOrDefault();
+        var size = produced == null ? null : MicroCapture.Processing.ImageDecodeHelper.GetPixelSize(produced);
+        Check($"A page queued at 90° comes out on its side ({size?.Width}x{size?.Height} from 400x900)",
+            size is { } px && px.Width > px.Height);
+    }
+    finally
+    {
+        var preferences = AppPreferences.Load();
+        preferences.LiveViewRotation = savedRotation;
+        preferences.Save();
+    }
 }
 
 async Task TestCartReorderKeepsRecapturesWithTheirPage()

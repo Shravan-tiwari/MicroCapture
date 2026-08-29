@@ -193,7 +193,7 @@ public class CaptureQueueService
         }
     }
 
-    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF", int dpi = 150, string? leftCropBox = null)
+    public async Task<CaptureJob> EnqueueCaptureAsync(string batchId, string originalFilePath, int pageNumber, string captureFormat = "TIFF", int dpi = 150, string? leftCropBox = null, int rotationDegrees = 0)
     {
         var job = new CaptureJob
         {
@@ -205,6 +205,25 @@ public class CaptureQueueService
             CaptureFormat = captureFormat,
             Dpi = dpi
         };
+
+        // Orientation is recorded on the job at the moment of capture rather than read from a
+        // setting at processing time. That is what makes rotating mid-batch safe: pages already
+        // queued keep the angle they were actually shot at, so turning the rig 90° at page 200
+        // cannot retroactively rotate the first 199.
+        //
+        // It rides the same RotationDegrees field Crop Review writes, so the operator can still
+        // rotate an individual page afterwards and the two cannot disagree — there is only ever
+        // one rotation per page. HasManualAdjustments is the switch that makes the processor
+        // apply it at all; every other adjustment stays at its default and no-ops.
+        // Normalised here rather than through Processing's AdjustmentGeometry: Core is the lower
+        // layer and doesn't reference Processing. Same rule — wrap into [0, 360) in 90° steps.
+        var rotation = ((rotationDegrees % 360) + 360) % 360;
+        rotation -= rotation % 90;
+        if (rotation != 0)
+        {
+            job.RotationDegrees = rotation;
+            job.HasManualAdjustments = true;
+        }
 
         // A pre-supplied crop box means this job is one frame of a fixed-frame capture — the
         // same source image shared by several sibling jobs (one per frame), each cropped to its

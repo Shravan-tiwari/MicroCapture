@@ -77,6 +77,28 @@
 
                 <!-- Right: Auto Capture & Camera Model -->
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <!-- Orientation. Lives with AUTO and PAGE rather than in the camera panel
+                         because nothing about the camera changes — the rig is bolted down; it is
+                         the book that is sideways. Applies to the live view and to every capture
+                         taken from here on; pages already in the cart keep the orientation they
+                         were shot at. -->
+                    <StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
+                        <Button Classes="ghost" Content="↺" FontSize="18" Padding="9,2"
+                                Command="{Binding RotateLiveViewLeftCommand}"
+                                ToolTip.Tip="Rotate the live view 90° left. New captures are saved this way up; pages already captured are left alone."/>
+                        <Button Classes="ghost" Content="↻" FontSize="18" Padding="9,2"
+                                Command="{Binding RotateLiveViewRightCommand}"
+                                ToolTip.Tip="Rotate the live view 90° right. New captures are saved this way up; pages already captured are left alone."/>
+                        <!-- Shown only when rotated, so an orientation that silently applies to
+                             every capture can never be an invisible mode. -->
+                        <Border Background="{DynamicResource PrimaryWashBrush}" CornerRadius="5"
+                                Padding="6,2" VerticalAlignment="Center" Margin="2,0,0,0"
+                                IsVisible="{Binding IsLiveViewRotated}">
+                            <TextBlock Text="{Binding LiveViewRotationLabel}" FontSize="11"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource PrimaryHoverBrush}"/>
+                        </Border>
+                    </StackPanel>
+
                     <Button Classes="toggle" Classes.active="{Binding IsAutoCapture}"
                             Command="{Binding ToggleAutoCaptureCommand}"
                             Content="AUTO" FontWeight="SemiBold"
@@ -102,17 +124,36 @@
                     BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding IsShowingLiveView}">
                 <Grid Name="LiveViewContainer">
-                    <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
-                    <!-- Overlay: interactive fixed frames drawn straight onto the live view.
-                         Drag empty space to create one, drag a frame to move it, its handles to
-                         resize, and the × badge (or DEL) to remove it — no modal, no calibration
-                         shot, editable at any time. -->
-                    <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
-                            Frames="{Binding Frames}"
-                            SourceImageSize="{Binding FrameReferenceSize}"
-                            CaptureImageSize="{Binding CaptureImageSize}"
-                            SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
-                            IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
+                    <!-- The image and the frame overlay rotate as one unit, inside a single
+                         LayoutTransformControl. Rotating them separately would be worse than not
+                         rotating at all: the frames are stored in unrotated capture coordinates
+                         and the crop happens before the rotation is applied, so a frame that
+                         stayed put on screen while the page turned under it would quietly select
+                         a different part of the page than the one it was drawn over. Rotating the
+                         pair keeps every frame glued to the same physical region — no frame's
+                         position, size or order changes, which is the point.
+
+                         LayoutTransformControl rather than a RenderTransform because layout has
+                         to follow: at 90° the view is measured tall-in-a-wide-box, so a portrait
+                         page fills the area instead of overflowing and being clipped. -->
+                    <LayoutTransformControl Name="LiveViewRotator">
+                        <LayoutTransformControl.LayoutTransform>
+                            <RotateTransform Angle="{Binding LiveViewRotation}"/>
+                        </LayoutTransformControl.LayoutTransform>
+                        <Grid>
+                            <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
+                            <!-- Overlay: interactive fixed frames drawn straight onto the live view.
+                                 Drag empty space to create one, drag a frame to move it, its handles to
+                                 resize, and the × badge (or DEL) to remove it — no modal, no calibration
+                                 shot, editable at any time. -->
+                            <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
+                                    Frames="{Binding Frames}"
+                                    SourceImageSize="{Binding FrameReferenceSize}"
+                                    CaptureImageSize="{Binding CaptureImageSize}"
+                                    SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
+                                    IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
+                        </Grid>
+                    </LayoutTransformControl>
                     <!-- Overlay: readiness badge -->
                     <Border Background="{DynamicResource ScrimBrush}" HorizontalAlignment="Left" VerticalAlignment="Top"
                             Padding="12,7" Margin="16" CornerRadius="8" IsHitTestVisible="False"
