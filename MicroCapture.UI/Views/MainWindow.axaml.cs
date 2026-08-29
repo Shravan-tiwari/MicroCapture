@@ -276,6 +276,27 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Turns a vertical wheel into horizontal movement over the filmstrip.
+    ///
+    /// <para>Avalonia's ScrollViewer maps the wheel to vertical scrolling, and the filmstrip
+    /// scrolls horizontally only — so the wheel did nothing over it and the strip appeared stuck
+    /// at whichever pages were on screen. A mouse without a horizontal wheel had no way to reach
+    /// the rest of the batch except by dragging the scrollbar.</para></summary>
+    private void OnFilmstripWheel(object? sender, PointerWheelEventArgs e)
+    {
+        if (sender is not ScrollViewer scroller) return;
+
+        // Either axis moves the strip, so a trackpad's horizontal gesture works too.
+        var delta = e.Delta.Y != 0 ? e.Delta.Y : e.Delta.X;
+        if (delta == 0) return;
+
+        const double step = 90; // a little under one tile, so a notch moves without overshooting
+        var target = scroller.Offset.X - delta * step;
+        var maximum = Math.Max(0, scroller.Extent.Width - scroller.Viewport.Width);
+        scroller.Offset = scroller.Offset.WithX(Math.Clamp(target, 0, maximum));
+        e.Handled = true;
+    }
+
     private void OnInsertPointClick(object? sender, RoutedEventArgs e)
     {
         if (sender is Button { DataContext: ThumbnailItem item }

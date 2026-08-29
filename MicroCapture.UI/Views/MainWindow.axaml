@@ -21,14 +21,14 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <!-- Filmstrip row (3rd) was 112px — barely enough for the thumbnail image row alone. With
-         the status dot+text row added below the page-number row, total content height (image +
-         two text rows + button/border padding) runs to ~140px, and since the inner ScrollViewer
-         only allows horizontal scrolling (see the filmstrip below), whatever didn't fit was
-         silently clipped from the bottom — the status Ellipse/TextBlock specifically, since they
-         sit last in each tile's StackPanel. Confirmed cause of "no status text/dot shown at all"
-         despite Status actually being set correctly. -->
-    <Grid RowDefinitions="Auto, *, 140, Auto">
+    <!-- Filmstrip row (3rd). This row has to hold three things, and was repeatedly sized for
+         only some of them: the selection/undo action bar, a tile tall enough for its image plus
+         the page-number and status lines, and the horizontal scrollbar underneath. At 140px the
+         tile's lower rows were clipped away — which is why page numbers and status text appeared
+         missing even though both were bound correctly. Sized for all three now; the inner
+         ScrollViewer scrolls horizontally only, so anything that doesn't fit vertically is lost
+         rather than reachable. -->
+    <Grid RowDefinitions="Auto, *, 200, Auto">
 
         <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
         <Border Grid.Row="0" Background="{StaticResource Surface1Brush}" Padding="14,10"
@@ -231,33 +231,36 @@
                              three step sizes are exposed (the medium steps existed in FocusStep but
                              were never surfaced), giving coarse-to-fine control without a slider —
                              the EDSDK offers no continuous focus-distance control to bind one to. -->
-                        <Grid ColumnDefinitions="*,*,*,*,*,*,*"
+                        <!-- Sized to the panel rather than squeezed into it: seven controls
+                             across 280px left each one smaller than every other button in the
+                             app, which is both hard to hit and visually out of step. -->
+                        <Grid ColumnDefinitions="*,*,*,*,*,*,*" Height="40"
                               IsEnabled="{Binding IsLiveViewActive}">
-                            <Button Grid.Column="0" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="0" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="FarLarge"
                                     ToolTip.Tip="Focus farther — large step" Content="⏪"/>
-                            <Button Grid.Column="1" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="1" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="FarMedium"
                                     ToolTip.Tip="Focus farther — medium step" Content="◀◀"/>
-                            <Button Grid.Column="2" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="2" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="FarSmall"
                                     ToolTip.Tip="Focus farther — small step" Content="◀"/>
-                            <Button Grid.Column="3" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="3" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding TriggerAutoFocusCommand}"
                                     ToolTip.Tip="Trigger one autofocus attempt now" Content="AF"/>
-                            <Button Grid.Column="4" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="4" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="NearSmall"
                                     ToolTip.Tip="Focus nearer — small step" Content="▶"/>
-                            <Button Grid.Column="5" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="5" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="NearMedium"
                                     ToolTip.Tip="Focus nearer — medium step" Content="▶▶"/>
-                            <Button Grid.Column="6" Classes="secondary" Padding="0,7" FontSize="11" Margin="1,0"
+                            <Button Grid.Column="6" Classes="secondary" Padding="0" FontSize="14" Margin="1,0"
                                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
                                     Command="{Binding NudgeFocusCommand}" CommandParameter="NearLarge"
                                     ToolTip.Tip="Focus nearer — large step" Content="⏩"/>
@@ -391,8 +394,13 @@
                  AllowDrop only on the Grid the drop was rejected before it could reach a target,
                  which is why dragging appeared to do nothing. One drop zone over the whole strip
                  also means a drop between two tiles still lands somewhere sensible. -->
+            <!-- PointerWheelChanged is handled in code-behind: a wheel over a horizontal-only
+                 scroller does nothing by default in Avalonia, so the strip looked stuck even
+                 though its scrollbar worked. -->
             <ScrollViewer Grid.Row="1" Name="FilmstripScroller" DragDrop.AllowDrop="True"
-                          HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                          PointerWheelChanged="OnFilmstripWheel"
+                          HorizontalScrollBarVisibility="Visible" VerticalScrollBarVisibility="Disabled">
+                <StackPanel Orientation="Horizontal">
                 <ItemsControl ItemsSource="{Binding RecentCaptures}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -432,11 +440,13 @@
                                         Tag="{Binding JobId}">
                                     <StackPanel Spacing="5">
                                         <Border CornerRadius="5" ClipToBounds="True" Background="{StaticResource Surface1Brush}">
-                                            <Image Source="{Binding Thumbnail}" Height="60" Stretch="Uniform"/>
+                                            <Image Source="{Binding Thumbnail}" Height="64" Stretch="Uniform"/>
                                         </Border>
-                                        <TextBlock Text="{Binding PageNumber, StringFormat='PAGE {0}'}"
-                                                   HorizontalAlignment="Center" FontSize="10" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource InkMutedBrush}"/>
+                                        <!-- The page number is what the operator navigates by, so
+                                             it reads as the tile's label rather than a caption. -->
+                                        <TextBlock Text="{Binding PageNumber, StringFormat='Page {0}'}"
+                                                   HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource InkBrush}"/>
                                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="4">
                                             <Ellipse Width="6" Height="6" VerticalAlignment="Center"
                                                      Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
@@ -473,6 +483,15 @@
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
+
+                <!-- The trailing insert point. Every other "+" means "insert before this page";
+                     this one means "carry on at the end", which is also how to cancel an insert
+                     point you set earlier without hunting for the banner's button. -->
+                <Button Classes="insertPoint" Content="+"
+                        Command="{Binding ClearInsertPointCommand}"
+                        IsVisible="{Binding HasOpenBatch}"
+                        ToolTip.Tip="Capture at the end of the batch"/>
+                </StackPanel>
             </ScrollViewer>
             </Grid>
         </Border>
