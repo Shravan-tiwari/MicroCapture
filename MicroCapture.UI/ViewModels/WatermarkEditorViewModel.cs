@@ -84,10 +84,22 @@ public partial class WatermarkEditorViewModel : ViewModelBase
         _isNewPreset = existingPreset == null;
         _presetId = existingPreset?.Id ?? Guid.NewGuid().ToString();
 
+        // The timer MUST exist before any property is assigned below. Each assignment fires its
+        // generated On<Property>Changed, several of which call SchedulePreviewUpdate() and
+        // dereference _previewTimer — so loading an existing preset threw a
+        // NullReferenceException before the editor could open. It only ever happened when
+        // editing a saved watermark, since creating a new one skips the block entirely.
+        _previewTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        _previewTimer.Tick += (_, _) =>
+        {
+            _previewTimer.Stop();
+            RenderPreview();
+        };
+
         if (existingPreset != null)
         {
             PresetName = existingPreset.Name;
-            WatermarkType = existingPreset.WatermarkType;
+            WatermarkType = string.IsNullOrWhiteSpace(existingPreset.WatermarkType) ? "Text" : existingPreset.WatermarkType;
             TextContent = existingPreset.TextContent ?? string.Empty;
             FontSize = existingPreset.FontSize;
             TextColor = existingPreset.TextColor ?? "#808080";
@@ -95,13 +107,6 @@ public partial class WatermarkEditorViewModel : ViewModelBase
             Opacity = existingPreset.Opacity;
             Transform = new WatermarkTransform(existingPreset.X, existingPreset.Y, existingPreset.Width, existingPreset.Height, existingPreset.RotationDegrees);
         }
-
-        _previewTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
-        _previewTimer.Tick += (_, _) =>
-        {
-            _previewTimer.Stop();
-            RenderPreview();
-        };
 
         LoadSamplePage();
         LoadLogoPreview();
@@ -184,6 +189,9 @@ public partial class WatermarkEditorViewModel : ViewModelBase
 
     private void SchedulePreviewUpdate()
     {
+        // Null-guarded as well as ordered correctly above: a preview that doesn't refresh is a
+        // cosmetic problem, while an exception here stops the editor opening at all.
+        if (_previewTimer == null) return;
         _previewTimer.Stop();
         _previewTimer.Start();
     }

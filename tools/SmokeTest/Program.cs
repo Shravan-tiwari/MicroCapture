@@ -74,6 +74,7 @@ await TestEveryExportFormatProducesOutput();
 await TestWatermarkAndQualityAcrossFormats();
 await TestExportReportsProgressAndCanBeCancelled();
 await TestCartAdjustmentUndoRedo();
+TestWatermarkEditorOpensWithExistingPreset();
 TestAutoCaptureWaitsForThePageTurnToFinish();
 await TestExportOutputsAreActuallyCorrect();
 TestMultipageTiffHasEveryPage();
@@ -1076,6 +1077,55 @@ async Task TestCartAdjustmentUndoRedo()
     }
     await RunPumped(() => vm.RecordAdjustmentEditAsync("page adjustment", new[] { jobId }, before2), timeoutMs: 20000);
     Check("A new edit discards the redo branch", !vm.CanRedoAdjustment);
+}
+
+void TestWatermarkEditorOpensWithExistingPreset()
+{
+    Console.WriteLine("\n-- The watermark editor opens for a saved preset --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "wmedit.db");
+    var sample = Path.Combine(workDir, "sample.tif");
+    using (var mat = new OpenCvSharp.Mat(400, 300, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(220, 220, 220)))
+        OpenCvSharp.Cv2.ImWrite(sample, mat);
+
+    using var db = new AppDbContext(dbPath);
+    _ = new CaptureQueueService(db);
+
+    // Constructing with an existing preset assigns its properties, and each assignment fires a
+    // generated On<Property>Changed that schedules a preview refresh. Those ran before the
+    // preview timer was created, so editing a SAVED watermark threw NullReferenceException and
+    // the editor never opened — while creating a new one worked, because it skips the
+    // assignments entirely.
+    var preset = new WatermarkPreset
+    {
+        Name = "Existing", WatermarkType = "Text", TextContent = "SPECIMEN",
+        TextColor = "#808080", Opacity = 0.5, FontSize = 48,
+        X = 0.1, Y = 0.4, Width = 0.8, Height = 0.2
+    };
+
+    try
+    {
+        var vm = new WatermarkEditorViewModel(db, preset, sample);
+        Check("Editing a saved preset does not throw", true);
+        Check("The editor loads the preset's text", vm.TextContent == "SPECIMEN");
+        Check("The editor loads the preset's name", vm.PresetName == "Existing");
+    }
+    catch (Exception ex)
+    {
+        Check($"Editing a saved preset does not throw ({ex.GetType().Name}: {ex.Message})", false);
+    }
+
+    // A preset with no type stored must not break it either.
+    try
+    {
+        var vm = new WatermarkEditorViewModel(db,
+            new WatermarkPreset { Name = "Bare", TextColor = "#000000", Opacity = 1 }, sample);
+        Check("A preset with no watermark type still opens", !string.IsNullOrWhiteSpace(vm.WatermarkType));
+    }
+    catch (Exception ex)
+    {
+        Check($"A preset with no watermark type still opens ({ex.GetType().Name})", false);
+    }
 }
 
 void TestAutoCaptureWaitsForThePageTurnToFinish()
