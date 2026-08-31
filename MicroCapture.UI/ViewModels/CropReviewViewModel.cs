@@ -388,11 +388,20 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         });
     }
 
+    // Bumped on every RenderPreview() call. Each render job runs on its own thread with no
+    // ordering guarantee, and there are several concurrent sources: the initial full-frame
+    // paint, the boundary-detection result that narrows to the real page, and every debounced
+    // slider/rotation change. Without this a stale job — typically the full-frame one — can
+    // finish encoding last and overwrite the correct preview, which is why the window sometimes
+    // showed the whole camera frame or a crop that didn't match the current corners.
+    private int _previewGeneration;
+
     private void RenderPreview()
     {
         var renderer = _previewRenderer;
         if (renderer == null) return;
 
+        var generation = ++_previewGeneration;
         var corners = _previewCorners;
         var adjustSnapshot = (RotationDegrees, FlipHorizontal, FlipVertical, Brightness, Contrast, Saturation, Sharpness, WhiteBalance);
 
@@ -405,6 +414,9 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
             if (bytes == null) return;
             Dispatcher.UIThread.Post(() =>
             {
+                // A newer render was requested (or is already on screen) while this one was
+                // encoding — drop it rather than let it clobber the current preview.
+                if (_disposed || generation != _previewGeneration) return;
                 try
                 {
                     using var ms = new MemoryStream(bytes);
