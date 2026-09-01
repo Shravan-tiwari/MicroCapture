@@ -518,10 +518,22 @@
                                     </StackPanel>
                                 </Button>
 
-                                <!-- Selection ring. Non-hit-testable so it never steals a click
-                                     from the tile underneath it. -->
+                                <!-- Selection treatment. All non-hit-testable so none of them
+                                     steals a click from the tile underneath.
+                                     · a faint primary wash over the whole tile body, so selection
+                                       reads from the tile and not only its edge
+                                     · a soft translucent halo just outside the tile
+                                     · a crisp solid primary edge hugging it
+                                     Together they read as "selected" from across the strip without
+                                     shouting. -->
+                                <Border IsVisible="{Binding IsSelected}" CornerRadius="6"
+                                        Margin="2" IsHitTestVisible="False"
+                                        Background="{DynamicResource PrimaryWashBrush}"/>
+                                <Border IsVisible="{Binding IsSelected}" CornerRadius="11"
+                                        Margin="-3" BorderThickness="3" IsHitTestVisible="False"
+                                        BorderBrush="{DynamicResource PrimaryWashBrush}"/>
                                 <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
-                                        BorderBrush="{DynamicResource PrimaryHoverBrush}"
+                                        BorderBrush="{DynamicResource PrimaryBrush}"
                                         BorderThickness="2.5" IsHitTestVisible="False"/>
 
                                 <!-- The arrow-key browse cursor. Deliberately a different mark
