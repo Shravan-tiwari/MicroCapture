@@ -19,14 +19,23 @@ public partial class NewBatchDialog : Window
     }
 
     /// <summary>Shows the dialog and returns the operator's settings, or null if they cancelled.
-    /// <paramref name="defaultLocation"/> seeds the location box so the common case is one click.</summary>
-    public static async Task<NewBatchViewModel?> ShowAsync(Window owner, string? defaultLocation, string? projectCode)
+    /// <paramref name="defaultLocation"/> seeds the location box so the common case is one click.
+    /// <paramref name="resolveExistingProjectLocation"/> maps a sanitized project code to the
+    /// folder that project's batches already live under (or null if it's a new project), so
+    /// picking a known project snaps the location to it.</summary>
+    public static async Task<NewBatchViewModel?> ShowAsync(
+        Window owner, string? defaultLocation, string? projectCode,
+        Func<string, string?>? resolveExistingProjectLocation = null)
     {
         var viewModel = new NewBatchViewModel
         {
-            BatchLocation = defaultLocation ?? string.Empty,
-            ProjectCode = projectCode ?? string.Empty
+            ResolveExistingProjectLocation = resolveExistingProjectLocation
         };
+        // Seed the project code first so the location snap below sees it, then seed the location
+        // as the fallback default without it counting as an operator choice.
+        viewModel.ProjectCode = projectCode ?? string.Empty;
+        viewModel.SeedDefaultLocation(defaultLocation ?? string.Empty);
+
         var dialog = new NewBatchDialog { DataContext = viewModel };
         viewModel.CloseRequested += (_, _) => dialog.Close();
         viewModel.BrowseRequested += async (_, _) => await dialog.PickFolderAsync(viewModel);

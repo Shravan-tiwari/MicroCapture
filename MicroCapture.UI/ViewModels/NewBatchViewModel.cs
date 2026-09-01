@@ -35,6 +35,13 @@ public partial class NewBatchViewModel : ObservableObject
     [ObservableProperty] private string _validationMessage = string.Empty;
     [ObservableProperty] private bool _hasValidationMessage;
 
+    /// <summary>Looks up an existing project by its (sanitized) code and returns the folder its
+    /// batches already live under, or null if the code isn't a known project. Set by the caller,
+    /// which owns the database; keeping the VM free of a DbContext dependency. When it returns a
+    /// path, typing that project code snaps <see cref="BatchLocation"/> to it so a project's
+    /// batches stay together — see <see cref="OnProjectCodeChanged"/>.</summary>
+    public Func<string, string?>? ResolveExistingProjectLocation { get; set; }
+
     /// <summary>Full DPI range from the requirements. 150 is the rig's native captured size —
     /// below that the image is downsampled, above it upsampled — see Batch.Dpi.</summary>
     public IReadOnlyList<int> AvailableDpiOptions { get; } = new[] { 50, 100, 150, 200, 300, 400, 600, 800, 1000, 1200 };
@@ -47,12 +54,17 @@ public partial class NewBatchViewModel : ObservableObject
     public IReadOnlyList<string> AvailableExportFormats { get; } =
         MicroCapture.Processing.ExportFormat.SelectableNames;
 
-    /// <summary>The folder the batch will be created in — the location the operator picked, with
-    /// the batch code as its own subfolder so several batches can share one parent.</summary>
+    /// <summary>The folder the batch will be created in: the location the operator picked, then
+    /// the project code, then the batch code. Nesting every batch under its project folder keeps
+    /// one project's batches together on disk and makes the project/batch split visible in the
+    /// directory tree rather than only in this dialog.</summary>
     public string ResolvedBatchFolder =>
-        string.IsNullOrWhiteSpace(BatchLocation) || string.IsNullOrWhiteSpace(BatchCode)
+        string.IsNullOrWhiteSpace(BatchLocation) || string.IsNullOrWhiteSpace(ProjectCode) || string.IsNullOrWhiteSpace(BatchCode)
             ? string.Empty
-            : Path.Combine(BatchLocation, MicroCapture.Core.FileNaming.Sanitize(BatchCode));
+            : Path.Combine(
+                BatchLocation,
+                MicroCapture.Core.FileNaming.Sanitize(ProjectCode),
+                MicroCapture.Core.FileNaming.Sanitize(BatchCode));
 
     public bool Confirmed { get; private set; }
     public event EventHandler? CloseRequested;
@@ -61,9 +73,65 @@ public partial class NewBatchViewModel : ObservableObject
     /// the storage-provider API needs the window.</summary>
     public event EventHandler? BrowseRequested;
 
-    partial void OnBatchLocationChanged(string value) => ClearValidation();
-    partial void OnBatchCodeChanged(string value) => ClearValidation();
-    partial void OnProjectCodeChanged(string value) => ClearValidation();
+    /// <summary>Set true once the operator has typed in or picked the location box by hand. From
+    /// then on, re-typing a project code no longer snaps the location, so it can't yank the batch
+    /// out from under a folder the operator deliberately chose. Suppressed while
+    /// <see cref="OnProjectCodeChanged"/> is doing the snap itself.</summary>
+    private bool _locationChosenByOperator;
+    private bool _snappingLocation;
+
+    partial void OnBatchLocationChanged(string value)
+    {
+        ClearValidation();
+        if (!_snappingLocation) _locationChosenByOperator = true;
+        OnPropertyChanged(nameof(ResolvedBatchFolder));
+    }
+
+    partial void OnBatchCodeChanged(string value)
+    {
+        ClearValidation();
+        OnPropertyChanged(nameof(ResolvedBatchFolder));
+    }
+
+    partial void OnProjectCodeChanged(string value)
+    {
+        ClearValidation();
+
+        // If this project already exists, drop its batch into the same parent its other batches
+        // live in — unless the operator has since picked a location by hand.
+        if (!_locationChosenByOperator && ResolveExistingProjectLocation is { } resolve
+            && !string.IsNullOrWhiteSpace(value))
+        {
+            var existing = resolve(MicroCapture.Core.FileNaming.Sanitize(value));
+            if (!string.IsNullOrWhiteSpace(existing) &&
+                !string.Equals(existing, BatchLocation, StringComparison.OrdinalIgnoreCase))
+            {
+                _snappingLocation = true;
+                try { BatchLocation = existing!; }
+                finally { _snappingLocation = false; }
+            }
+        }
+
+        OnPropertyChanged(nameof(ResolvedBatchFolder));
+    }
+
+    /// <summary>Seeds the location box with the caller's fallback default without it counting as
+    /// an operator choice, so a later known-project pick can still snap the location. If the
+    /// project code seeded before this call already resolves to an existing project's folder,
+    /// that wins over the fallback.</summary>
+    public void SeedDefaultLocation(string fallback)
+    {
+        var seed = fallback;
+        if (ResolveExistingProjectLocation is { } resolve && !string.IsNullOrWhiteSpace(ProjectCode))
+        {
+            var existing = resolve(MicroCapture.Core.FileNaming.Sanitize(ProjectCode));
+            if (!string.IsNullOrWhiteSpace(existing)) seed = existing!;
+        }
+
+        _snappingLocation = true;
+        try { BatchLocation = seed; }
+        finally { _snappingLocation = false; }
+    }
 
     private void ClearValidation()
     {

@@ -106,8 +106,9 @@ public partial class OpenBatchViewModel : ObservableObject
     }
 
     /// <summary>Finds batch folders under a root by looking for manifests. Bounded in depth: a
-    /// batch folder sits directly under a location the operator chose, so an unbounded walk of a
-    /// whole network share would cost far more than it could find.</summary>
+    /// batch folder sits at <c>&lt;chosen location&gt;/&lt;projectCode&gt;/&lt;batchCode&gt;</c>
+    /// (older flat batches one level shallower), so an unbounded walk of a whole network share
+    /// would cost far more than it could find.</summary>
     private static IEnumerable<string> FindBatchFolders(string root, int maxDepth = 3)
     {
         var results = new List<string>();
@@ -139,6 +140,15 @@ public partial class OpenBatchViewModel : ObservableObject
         }
     }
 
+    /// <summary>Best-guess project code for a folder we can't read a manifest from: the batch
+    /// folder now sits at <c>.../&lt;projectCode&gt;/&lt;batchCode&gt;</c>, so its parent's name is
+    /// the project. Empty for a flat (pre-nesting) batch folder or a drive root.</summary>
+    private static string ProjectFromParent(string folder)
+    {
+        var parent = Path.GetDirectoryName(folder.TrimEnd(Path.DirectorySeparatorChar));
+        return string.IsNullOrEmpty(parent) ? string.Empty : Path.GetFileName(parent);
+    }
+
     private OpenBatchRow Describe(string folder)
     {
         if (!Directory.Exists(folder))
@@ -147,6 +157,7 @@ public partial class OpenBatchViewModel : ObservableObject
             {
                 FolderPath = folder,
                 BatchCode = Path.GetFileName(folder.TrimEnd(Path.DirectorySeparatorChar)),
+                ProjectCode = ProjectFromParent(folder),
                 Subtitle = $"Unavailable — {folder}",
                 Status = "Offline",
                 IsUnavailable = true
@@ -160,6 +171,7 @@ public partial class OpenBatchViewModel : ObservableObject
             {
                 FolderPath = folder,
                 BatchCode = Path.GetFileName(folder.TrimEnd(Path.DirectorySeparatorChar)),
+                ProjectCode = ProjectFromParent(folder),
                 Subtitle = folder,
                 Status = "Not a batch",
                 IsUnavailable = true

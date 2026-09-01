@@ -1695,7 +1695,19 @@ public partial class MainWindowViewModel : ViewModelBase
             var defaultLocation = LastBatchLocation ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture");
 
-            var settings = await MicroCapture.UI.Views.NewBatchDialog.ShowAsync(owner, defaultLocation, ProjectCode);
+            // Lets the dialog snap its location box to an existing project's parent folder, so a
+            // project's batches stay together on disk. Returns the parent of the project's own
+            // folder — the dialog re-appends <projectCode>/<batchCode> itself.
+            Func<string, string?> resolveProjectLocation = code =>
+            {
+                var existing = _dbContext.Projects.AsNoTracking().FirstOrDefault(p => p.Name == code);
+                return string.IsNullOrWhiteSpace(existing?.OutputDirectory)
+                    ? null
+                    : Path.GetDirectoryName(existing!.OutputDirectory);
+            };
+
+            var settings = await MicroCapture.UI.Views.NewBatchDialog.ShowAsync(
+                owner, defaultLocation, ProjectCode, resolveProjectLocation);
             if (settings == null) return;
 
             var projectCode = MicroCapture.Core.FileNaming.Sanitize(settings.ProjectCode);
@@ -1712,10 +1724,12 @@ public partial class MainWindowViewModel : ViewModelBase
                     Customer = "",
                     Description = "Auto-created from scanning session",
                     CreatedBy = Environment.UserName,
-                    // Only a fallback for anything that still resolves against the project rather
-                    // than the batch folder; a batch with its own folder keeps everything inside it.
-                    OutputDirectory = Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture", projectCode)
+                    // The project's folder is <chosen location>/<projectCode> — the same parent
+                    // this batch is about to be created under, so future batches for this project
+                    // land beside it. Only a fallback for anything that still resolves against the
+                    // project rather than the batch folder; a batch with its own folder keeps
+                    // everything inside it.
+                    OutputDirectory = Path.Combine(settings.BatchLocation, projectCode)
                 };
                 _dbContext.Projects.Add(project);
                 await _dbContext.SaveChangesAsync();
@@ -1862,15 +1876,15 @@ public partial class MainWindowViewModel : ViewModelBase
             var project = _dbContext.Projects.FirstOrDefault(p => p.Name == projectCode);
             if (project == null)
             {
+                var projectParent = LastBatchLocation ?? Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture");
                 project = new Project
                 {
                     Name = projectCode,
                     Customer = "",
                     Description = "Auto-created from scanning session",
                     CreatedBy = Environment.UserName,
-                    OutputDirectory = Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
-                        "MicroCapture", projectCode)
+                    OutputDirectory = Path.Combine(projectParent, projectCode)
                 };
                 _dbContext.Projects.Add(project);
                 await _dbContext.SaveChangesAsync();
