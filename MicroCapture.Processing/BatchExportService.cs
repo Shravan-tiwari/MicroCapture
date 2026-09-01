@@ -48,6 +48,15 @@ public class BatchExportService
         var exportFormat = ExportFormat.Resolve(format)
             ?? throw new ArgumentException($"Unsupported export format: {format}", nameof(format));
         var normalizedFormat = exportFormat.Name.ToUpperInvariant();
+
+        // This same _dbContext instance has been tracking every CaptureJob for this batch since
+        // it was enqueued (see CaptureQueueService.EnqueueCaptureAsync), and the caller loaded
+        // the batch AsNoTracking. Without clearing first, AttachOrUpdateBatch/Jobs below try to
+        // Update() entities whose Id is already tracked and EF throws
+        // "another instance with the same key value is already being tracked". Nothing is lost:
+        // every write this method makes is an explicit AttachOrUpdate after the export succeeds.
+        _dbContext.ChangeTracker.Clear();
+
         // The capture worker updates a separate DbContext; use a no-tracking query so
         // export sees its latest statuses rather than stale navigation properties.
         var batch = await _dbContext.Batches
@@ -726,19 +735,28 @@ public class BatchExportService
         }
     }
 
+    /// <summary>Persists only <see cref="Batch.Status"/>. Never calls <c>Update(batch)</c> on the
+    /// detached graph — that cascades Modified onto every <see cref="CaptureJob"/> hanging off
+    /// <see cref="Batch.Captures"/>, which then collides with <see cref="AttachOrUpdateJobs"/>'s
+    /// own attach of those same jobs. Instead attach a bare stub and mark the one property.</summary>
     private void AttachOrUpdateBatch(Batch batch)
     {
         var tracked = _dbContext.ChangeTracker.Entries<Batch>().FirstOrDefault(entry => entry.Entity.Id == batch.Id)?.Entity;
         if (tracked != null)
         {
             tracked.Status = batch.Status;
+            return;
         }
-        else
-        {
-            _dbContext.Batches.Update(batch);
-        }
+
+        var stub = new Batch { Id = batch.Id, Status = batch.Status };
+        _dbContext.Batches.Attach(stub);
+        _dbContext.Entry(stub).Property(b => b.Status).IsModified = true;
     }
 
+    /// <summary>Persists only <see cref="CaptureJob.ExportStatus"/> per job, one property at a
+    /// time via a bare stub — same reasoning as <see cref="AttachOrUpdateBatch"/>. Skips any job
+    /// whose Id is already tracked (updating the tracked instance in place), so it's safe to call
+    /// even if some other query attached these jobs earlier in the context's life.</summary>
     private void AttachOrUpdateJobs(List<CaptureJob> jobs)
     {
         foreach (var job in jobs)
@@ -747,14 +765,12 @@ public class BatchExportService
             if (tracked != null)
             {
                 tracked.ExportStatus = job.ExportStatus;
+                continue;
             }
-            else
-            {
-                // Avoid attaching duplicate Batch navigation references when the job
-                // was loaded with a related Batch entity from another query/context.
-                job.Batch = null;
-                _dbContext.CaptureJobs.Update(job);
-            }
+
+            var stub = new CaptureJob { Id = job.Id, ExportStatus = job.ExportStatus };
+            _dbContext.CaptureJobs.Attach(stub);
+            _dbContext.Entry(stub).Property(j => j.ExportStatus).IsModified = true;
         }
     }
 
