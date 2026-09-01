@@ -3494,11 +3494,58 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>
     /// Called from MainWindow.axaml.cs when keyboard shortcuts are pressed.
     /// </summary>
+    /// <summary>The key a foot pedal sends, once learned (see <see cref="TryHandleFootPedalKey"/>).
+    /// Held here as well as in preferences so a match check doesn't hit disk.</summary>
+    private string? _footPedalGesture = null;
+    private bool _footPedalLoaded;
+
+    /// <summary>Handles a key the fixed shortcut table didn't claim, so a single-key USB foot
+    /// pedal works without the operator ever running the pedal vendor's config app.
+    ///
+    /// <para>If a pedal key is already learned and this is it, fire the shutter. Otherwise — the
+    /// first unclaimed key seen while a batch is open and the live view is up — adopt it as the
+    /// pedal and fire the shutter that same press, then remember it for good. Nav/modifier/menu
+    /// keys are never adopted. Returns true if the press was consumed.</para></summary>
+    public bool TryHandleFootPedalKey(string gesture, bool isBareModifierOrNav)
+    {
+        if (!_footPedalLoaded)
+        {
+            _footPedalGesture = string.IsNullOrWhiteSpace(_preferences.FootPedalKey) ? null : _preferences.FootPedalKey;
+            _footPedalLoaded = true;
+        }
+
+        // The pedal is the shutter — same gate as Space.
+        if (!IsShowingLiveView || _currentBatchId == null) return false;
+
+        if (_footPedalGesture != null)
+        {
+            if (!string.Equals(gesture, _footPedalGesture, StringComparison.OrdinalIgnoreCase)) return false;
+            if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
+            return true;
+        }
+
+        // Not learned yet — adopt this key, unless it's the kind of key that is never a pedal.
+        if (isBareModifierOrNav) return false;
+
+        _footPedalGesture = gesture;
+        _preferences.FootPedalKey = gesture;
+        _preferences.Save();
+        StatusText = $"Foot pedal set to '{gesture}'. It now works like the spacebar for capture.";
+        if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
+        return true;
+    }
+
     public void HandleKeyShortcut(string key)
     {
         switch (key)
         {
             case "Space":
+                // Space is the shutter — including a USB foot pedal that sends Space. It only
+                // acts while the live camera view is the surface on top; with Crop Review or
+                // calibration open it does nothing (CaptureAsync would reject it anyway, but
+                // bailing here keeps a stray pedal press from posting a rejection message over
+                // whatever the operator is doing in that panel).
+                if (!IsShowingLiveView) break;
                 if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
                 break;
             case "R":

@@ -41,6 +41,14 @@ public class AppPreferences
     /// kept on. Scanning is read-only, so several machines pointed at one share can't conflict.</summary>
     public List<string> BatchSearchRoots { get; set; } = new();
 
+    /// <summary>The key a USB foot pedal sends, learned automatically the first time an unknown
+    /// key is pressed while a batch and the live view are up — thereafter it triggers capture
+    /// exactly like the spacebar, so the operator never has to run the pedal vendor's config
+    /// tool. Stored as an Avalonia key-gesture string ("F13", "Ctrl+Shift+B", "MediaPlayPause");
+    /// null until learned. Per machine because the pedal is plugged into this workstation.
+    /// Delete this line from preferences.json to make the app re-learn.</summary>
+    public string? FootPedalKey { get; set; }
+
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "MicroCapture", "preferences.json");
