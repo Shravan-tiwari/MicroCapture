@@ -19,21 +19,31 @@
                          offers Adjust mode now — manual crop-quad/split-line/dewarp-curve
                          editing has been removed.
 
-                         The image sits in a ScrollViewer and is given an explicit pixel size by
-                         the code-behind rather than being stretched to fit, because that is what
-                         makes zoom mean something: at fit the size is the fitted size, and past
-                         it the scroller pans over an image genuinely larger than the viewport.
-                         Stretch is None for the same reason — the size is the zoom. -->
+                         Zoom is a LayoutTransformControl scale on the image, NOT an explicit
+                         Width/Height set from code. Explicit sizing fed a fit->viewport->
+                         scrollbar->fit feedback loop that never settled; a LayoutTransform
+                         reports its scaled size to the ScrollViewer directly, so the scroll
+                         extent and the scrollbars follow the zoom with no measurement cycle.
+                         Image Stretch stays None so one image DIP maps to one unscaled screen
+                         DIP and the scale factor is the whole story. -->
                     <ScrollViewer Name="PreviewScroller"
                                   HorizontalScrollBarVisibility="Auto"
-                                  VerticalScrollBarVisibility="Auto">
-                        <Grid Name="ZoomHost" Background="Transparent">
+                                  VerticalScrollBarVisibility="Auto"
+                                  PointerWheelChanged="OnPreviewWheel"
+                                  PointerPressed="OnPreviewPointerPressed"
+                                  PointerMoved="OnPreviewPointerMoved"
+                                  PointerReleased="OnPreviewPointerReleased">
+                        <LayoutTransformControl Name="ZoomHost"
+                                                HorizontalAlignment="Center"
+                                                VerticalAlignment="Center">
+                            <LayoutTransformControl.LayoutTransform>
+                                <ScaleTransform ScaleX="1" ScaleY="1"/>
+                            </LayoutTransformControl.LayoutTransform>
                             <Image Name="AdjustTargetImage"
                                    Source="{Binding PreviewImage}"
                                    Stretch="None"
-                                   HorizontalAlignment="Center"
-                                   VerticalAlignment="Center"/>
-                        </Grid>
+                                   SizeChanged="OnPreviewImageSizeChanged"/>
+                        </LayoutTransformControl>
                     </ScrollViewer>
 
                     <TextBlock Text="{Binding LoadErrorMessage}"
@@ -52,16 +62,16 @@
                             Padding="6,4">
                         <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                             <Button Name="ZoomOutButton" Classes="ghost" Content="−" FontSize="16" Padding="9,1"
-                                    ToolTip.Tip="Zoom out"/>
+                                    Click="OnZoomOutClick" ToolTip.Tip="Zoom out"/>
                             <TextBlock Name="ZoomLabel" Text="Fit" VerticalAlignment="Center"
                                        MinWidth="42" TextAlignment="Center" FontSize="12"
                                        Foreground="{DynamicResource InkMutedBrush}"/>
                             <Button Name="ZoomInButton" Classes="ghost" Content="+" FontSize="16" Padding="9,1"
-                                    ToolTip.Tip="Zoom in"/>
+                                    Click="OnZoomInClick" ToolTip.Tip="Zoom in"/>
                             <Rectangle Width="1" Height="16" Margin="4,0" VerticalAlignment="Center"
                                        Fill="{DynamicResource HairlineStrongBrush}"/>
                             <Button Name="ZoomFitButton" Classes="ghost" Content="Fit" FontSize="12" Padding="7,3"
-                                    ToolTip.Tip="Fit the whole page in the window"/>
+                                    Click="OnZoomFitClick" ToolTip.Tip="Fit the whole page in the window"/>
                         </StackPanel>
                     </Border>
                 </Grid>

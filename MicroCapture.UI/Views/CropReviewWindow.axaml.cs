@@ -4,28 +4,42 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
+using Avalonia.Media;
+using Avalonia.Media.Imaging;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
 using MicroCapture.UI.ViewModels;
 
 namespace MicroCapture.UI.Views;
 
 public partial class CropReviewWindow : UserControl
 {
-    // Zoom as a multiple of "fits the window", so 1.0 always means the whole page is visible
-    // whatever its size or the window's.
-    private const double FitZoom = 1.0;
-    private const double MaxZoom = 8.0;
-    // The + / − buttons take a deliberate jump; the wheel moves in small steps so it reads
-    // like a modern map/canvas zoom rather than lurching a quarter of the way in per notch.
-    private const double ZoomStep = 1.6;
-    private const double WheelZoomStep = 1.12;
+    // ---------- Zoom model ----------
+    //
+    // _scale is the ONE piece of zoom state: absolute image-DIP -> screen-DIP factor, applied
+    // as a LayoutTransformControl ScaleTransform. The scrollable extent and the scrollbars are
+    // derived from it by Avalonia's own layout, so there is no fit<->viewport feedback loop of
+    // the kind the old explicit-Width/Height approach stalled on.
+    //
+    // "Fit" is not a stored mode — it is _scale == _fitScale within an epsilon.
+    //
+    // All wiring is done via events declared in the .axaml (PointerWheelChanged, Click,
+    // SizeChanged). The earlier version resolved the named controls from the constructor / on
+    // Loaded and attached handlers in code; on macOS the name lookup came back null there and
+    // zoom got no handlers at all. Handlers declared in XAML don't have that timing problem,
+    // and by the time one fires the visual tree exists so FindControl below is safe.
 
-    private double _zoom = FitZoom;
-    private Size _lastAppliedSize;
+    private const double AbsoluteMaxScale = 8.0;   // 8x the image's own pixels, independent of fit
+    private const double ButtonZoomStep = 1.6;
 
-    // Drag-to-pan state. Only active once zoomed past fit — at fit there is nothing to pan, and
-    // treating every click as a pan-start would swallow clicks meant for whatever is behind the
-    // image (there is nothing there today, but the intent is "drag moves the view", not "the
-    // whole image is a button").
+    private double _scale = 1.0;
+    private double _fitScale = 1.0;
+    // True until the operator zooms to an explicit level. While true, a resize or a new image
+    // re-fits automatically; once false, those leave the chosen zoom alone.
+    private bool _followFit = true;
+    // Guards the re-entrancy a synchronous UpdateLayout() inside a zoom step can cause.
+    private bool _applyingZoom;
+
     private bool _isPanning;
     private Point _panPointerStart;
     private Vector _panOffsetStart;
@@ -34,201 +48,190 @@ public partial class CropReviewWindow : UserControl
     {
         InitializeComponent();
         DataContextChanged += OnDataContextChanged;
-        AttachZoomHandlers();
     }
 
-    private void AttachZoomHandlers()
-    {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
-        var image = this.FindControl<Image>("AdjustTargetImage");
-        var container = this.FindControl<Grid>("ContainerGrid");
-        if (scroller == null || image == null || container == null) return;
+    private ScrollViewer? Scroller => this.FindControl<ScrollViewer>("PreviewScroller");
+    private LayoutTransformControl? Host => this.FindControl<LayoutTransformControl>("ZoomHost");
+    private Image? TargetImage => this.FindControl<Image>("AdjustTargetImage");
+    private ScaleTransform? ScaleXf => Host?.LayoutTransform as ScaleTransform;
+    private TextBlock? ZoomLabelText => this.FindControl<TextBlock>("ZoomLabel");
 
-        // Tunnelling: ScrollViewer treats the wheel as scroll and marks it handled, so a
-        // bubbling handler would only ever see the wheel when the image already fits.
-        scroller.AddHandler(PointerWheelChangedEvent, OnPreviewWheel, RoutingStrategies.Tunnel);
-        scroller.PointerPressed += OnPreviewPointerPressed;
-        scroller.PointerMoved += OnPreviewPointerMoved;
-        scroller.PointerReleased += OnPreviewPointerReleased;
-        scroller.PointerCaptureLost += (_, _) => StopPanning();
+    // ---------- Fit / sizing ----------
 
-        // The fitted size is measured against the container, never the ScrollViewer or the image.
-        // Measuring it against either of those is what froze this window: sizing the image from
-        // its own container's bounds means every resize feeds the next one, and the layout pass
-        // never settles. The container's size comes from the window's column definition and does
-        // not depend on what is inside it, so nothing here can loop. Panning below only ever
-        // touches scroller.Offset, which the container's bounds don't depend on either.
-        container.PropertyChanged += (_, args) =>
-        {
-            if (args.Property == BoundsProperty) ApplyZoom();
-        };
-        image.PropertyChanged += (_, args) =>
-        {
-            // A rotation swaps the page's proportions, so the fitted size has to be recomputed
-            // whenever the preview itself is replaced.
-            if (args.Property == Image.SourceProperty) ApplyZoom();
-        };
-
-        this.FindControl<Button>("ZoomInButton")!.Click += (_, _) => ZoomBy(ZoomStep, anchor: null);
-        this.FindControl<Button>("ZoomOutButton")!.Click += (_, _) => ZoomBy(1 / ZoomStep, anchor: null);
-        this.FindControl<Button>("ZoomFitButton")!.Click += (_, _) => { _zoom = FitZoom; ApplyZoom(); UpdateCursor(); };
-    }
-
-    /// <summary>The viewport the image is actually scrolled within — the ScrollViewer's own
-    /// content area, i.e. minus whatever room its scrollbars are currently taking. "Fit" has to
-    /// be measured against this and not the outer container, or the fitted image is a scrollbar's
-    /// width too wide, which spawns the scrollbars, which shrinks the viewport, which never
-    /// settles.</summary>
+    /// <summary>The ScrollViewer's own content area — bounds minus whatever its scrollbars are
+    /// occupying. Fit is measured against this so a fitted image is never a scrollbar-width too
+    /// wide.</summary>
     private Size ViewportSize()
     {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
+        var scroller = Scroller;
         if (scroller == null) return default;
         var v = scroller.Viewport;
         if (v.Width > 0 && v.Height > 0) return v;
-        // Before the first layout pass Viewport is zero; fall back to the bounds.
-        return scroller.Bounds.Size;
+        return scroller.Bounds.Size; // before first layout, Viewport is zero
     }
 
-    /// <summary>Scale at which the whole preview fits the viewing area — the meaning of zoom 1.0.
-    /// Measured against the container, for the reason given in <see cref="AttachZoomHandlers"/>.</summary>
-    private double FitScale()
-    {
-        var source = this.FindControl<Image>("AdjustTargetImage")?.Source;
-        if (source == null) return 0;
+    /// <summary>Image size in the DIPs it draws at with Stretch=None — <see cref="Bitmap.Size"/>,
+    /// not PixelSize — so the scale factor maps 1:1 to what is on screen.</summary>
+    private Size ImageDipSize() =>
+        TargetImage?.Source is Bitmap bmp ? bmp.Size : default;
 
+    /// <summary>Scale at which the whole page fits the viewport, capped at 1.0 so "Fit" never
+    /// upsamples a small page.</summary>
+    private double ComputeFitScale()
+    {
         var area = ViewportSize();
-        var image = source.Size;
-        if (area.Width <= 0 || area.Height <= 0 || image.Width <= 0 || image.Height <= 0) return 0;
-
-        return Math.Min(area.Width / image.Width, area.Height / image.Height);
+        var img = ImageDipSize();
+        if (area.Width <= 0 || area.Height <= 0 || img.Width <= 0 || img.Height <= 0) return 0;
+        return Math.Min(1.0, Math.Min(area.Width / img.Width, area.Height / img.Height));
     }
 
-    /// <summary>Sizes the image to the current zoom. An explicit size rather than a stretch mode,
-    /// so the ScrollViewer has something genuinely larger than itself to scroll over.</summary>
-    private void ApplyZoom()
+    private double MinScale() => _fitScale > 0 ? _fitScale : 0.01;
+    private double MaxScale() => Math.Max(MinScale(), AbsoluteMaxScale);
+
+    /// <summary>Recomputes the fitted scale; while still following fit, snaps the current scale
+    /// to it. A no-op once the operator has zoomed manually.</summary>
+    private void RefitIfFollowing()
     {
-        var image = this.FindControl<Image>("AdjustTargetImage");
-        var source = image?.Source;
-        if (image == null || source == null) return;
-
-        var fit = FitScale();
+        if (_applyingZoom) return;
+        var fit = ComputeFitScale();
         if (fit <= 0) return;
-
-        var scale = fit * _zoom;
-        var size = new Size(
-            Math.Max(1, source.Size.Width * scale),
-            Math.Max(1, source.Size.Height * scale));
-
-        // Belt and braces against the freeze described above: even if something upstream did
-        // manage to feed a size change back round, an unchanged size stops the cycle here.
-        if (Math.Abs(size.Width - _lastAppliedSize.Width) < 0.5
-            && Math.Abs(size.Height - _lastAppliedSize.Height) < 0.5) return;
-        _lastAppliedSize = size;
-
-        image.Width = size.Width;
-        image.Height = size.Height;
-
-        var label = this.FindControl<TextBlock>("ZoomLabel");
-        if (label != null)
-            label.Text = Math.Abs(_zoom - FitZoom) < 0.001 ? "Fit" : $"{scale * 100:0}%";
+        _fitScale = fit;
+        if (_followFit)
+            SetScale(fit, anchor: null, keepFollowing: true);
+        else
+            UpdateZoomLabel();
     }
 
-    /// <summary>Zooms about a point given in the scroller's viewport coordinates — the cursor,
-    /// when there is one — so whatever pixel of the page is under the pointer stays under it
-    /// afterwards, the way every map and design canvas behaves, rather than the view re-centring
-    /// and sliding what was being looked at off screen.
-    ///
-    /// <para>The maths is done as a fraction of the image, not in raw content pixels. The image
-    /// is centred inside the scrollable host, so when it is smaller than the viewport there is a
-    /// gutter on each side; that gutter does not scale with the zoom, so scaling a raw
-    /// "content pixel under the cursor" by the zoom ratio (what this used to do) walked the
-    /// anchor off by the gutter every step. Working in image fractions sidesteps the gutter
-    /// entirely.</para>
-    ///
-    /// <para>Only touches scroller.Offset, which the freeze-avoidance in
-    /// <see cref="AttachZoomHandlers"/> does not depend on, so this cannot reintroduce it.</para></summary>
-    private void ZoomBy(double factor, Point? anchor)
+    // ---------- Core zoom ----------
+
+    /// <summary>Applies an absolute scale, re-anchoring so the image point under
+    /// <paramref name="anchor"/> (viewport coordinates) stays under it. The
+    /// LayoutTransformControl makes the scrolled content exactly imageDip * scale, so the anchor
+    /// maths is a straight fraction-of-image mapping (plus the ScrollViewer's centring pad while
+    /// the content is smaller than the viewport).</summary>
+    private void SetScale(double target, Point? anchor, bool keepFollowing = false)
     {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
-        var host = this.FindControl<Grid>("ZoomHost");
-        var source = this.FindControl<Image>("AdjustTargetImage")?.Source;
-        if (scroller == null || host == null || source == null) return;
+        var scroller = Scroller;
+        var scaleXf = ScaleXf;
+        if (scroller == null || scaleXf == null) return;
 
-        var fit = FitScale();
-        if (fit <= 0) return;
+        var img = ImageDipSize();
+        if (img.Width <= 0 || img.Height <= 0) return;
 
-        var next = Math.Clamp(_zoom * factor, FitZoom, MaxZoom);
-        if (Math.Abs(next - _zoom) < 0.0001) { UpdateCursor(); return; }
+        target = Math.Clamp(target, MinScale(), MaxScale());
+        if (Math.Abs(target - _scale) < 0.00001 && !keepFollowing)
+        {
+            UpdateCursor();
+            return;
+        }
 
-        var viewport = ViewportSize();
-        var point = anchor ?? new Point(viewport.Width / 2, viewport.Height / 2);
+        var oldViewport = ViewportSize();
+        var point = anchor ?? new Point(oldViewport.Width / 2, oldViewport.Height / 2);
 
-        // The image's on-screen size and top-left gutter within the host, before the change.
-        var oldImgW = source.Size.Width * fit * _zoom;
-        var oldImgH = source.Size.Height * fit * _zoom;
-        var oldHostW = Math.Max(oldImgW, viewport.Width);
-        var oldHostH = Math.Max(oldImgH, viewport.Height);
-        var oldGutterX = (oldHostW - oldImgW) / 2;
-        var oldGutterY = (oldHostH - oldImgH) / 2;
+        var oldContentW = img.Width * _scale;
+        var oldContentH = img.Height * _scale;
+        var oldPadX = Math.Max(0, (oldViewport.Width - oldContentW) / 2);
+        var oldPadY = Math.Max(0, (oldViewport.Height - oldContentH) / 2);
+        var fx = oldContentW > 0 ? Math.Clamp((scroller.Offset.X + point.X - oldPadX) / oldContentW, 0, 1) : 0.5;
+        var fy = oldContentH > 0 ? Math.Clamp((scroller.Offset.Y + point.Y - oldPadY) / oldContentH, 0, 1) : 0.5;
 
-        // The point under the cursor, as a 0..1 fraction of the image (clamped: the cursor can
-        // sit out in the gutter, and an anchor just outside the page should pin to its edge).
-        var fx = oldImgW > 0 ? Math.Clamp((scroller.Offset.X + point.X - oldGutterX) / oldImgW, 0, 1) : 0.5;
-        var fy = oldImgH > 0 ? Math.Clamp((scroller.Offset.Y + point.Y - oldGutterY) / oldImgH, 0, 1) : 0.5;
+        _applyingZoom = true;
+        try
+        {
+            _scale = target;
+            _followFit = keepFollowing;
+            scaleXf.ScaleX = target;
+            scaleXf.ScaleY = target;
 
-        _zoom = next;
-        ApplyZoom();
+            // Force the extent to catch up before touching Offset: ScrollViewer clamps a new
+            // offset against the extent from the LAST layout pass.
+            Host?.InvalidateMeasure();
+            scroller.UpdateLayout();
 
-        // Re-measure before setting an offset: ScrollViewer clamps against its extent from the
-        // last layout pass, and setting the offset before that updates leaves the anchor off by
-        // whatever the size just changed by.
-        scroller.UpdateLayout();
+            // Re-read the viewport after layout — crossing fit adds/removes scrollbars.
+            var newViewport = ViewportSize();
+            var newContentW = img.Width * target;
+            var newContentH = img.Height * target;
+            var newPadX = Math.Max(0, (newViewport.Width - newContentW) / 2);
+            var newPadY = Math.Max(0, (newViewport.Height - newContentH) / 2);
 
-        var newImgW = source.Size.Width * fit * next;
-        var newImgH = source.Size.Height * fit * next;
-        var newGutterX = (Math.Max(newImgW, viewport.Width) - newImgW) / 2;
-        var newGutterY = (Math.Max(newImgH, viewport.Height) - newImgH) / 2;
+            var desiredX = newPadX + fx * newContentW - point.X;
+            var desiredY = newPadY + fy * newContentH - point.Y;
+            var maxX = Math.Max(0, newContentW - newViewport.Width);
+            var maxY = Math.Max(0, newContentH - newViewport.Height);
+            scroller.Offset = new Vector(
+                Math.Clamp(desiredX, 0, maxX),
+                Math.Clamp(desiredY, 0, maxY));
+        }
+        finally
+        {
+            _applyingZoom = false;
+        }
 
-        // Put that same image fraction back under the same viewport point.
-        scroller.Offset = new Vector(
-            Math.Max(0, newGutterX + fx * newImgW - point.X),
-            Math.Max(0, newGutterY + fy * newImgH - point.Y));
-
+        UpdateZoomLabel();
         UpdateCursor();
+    }
+
+    private void ZoomBy(double factor, Point? anchor) => SetScale(_scale * factor, anchor);
+
+    private void UpdateZoomLabel()
+    {
+        var label = ZoomLabelText;
+        if (label == null) return;
+        var atFit = _fitScale > 0 && Math.Abs(_scale - _fitScale) < 0.005;
+        label.Text = atFit ? "Fit" : $"{_scale * 100:0}%";
+    }
+
+    /// <summary>Hand cursor whenever there is somewhere to pan to (past fit), plain arrow at
+    /// fit. Re-checked after every zoom change.</summary>
+    private void UpdateCursor()
+    {
+        var scroller = Scroller;
+        if (scroller == null) return;
+        var canPan = _scale > MinScale() + 0.001;
+        scroller.Cursor = new Cursor(canPan ? StandardCursorType.Hand : StandardCursorType.Arrow);
+    }
+
+    // ---------- XAML event handlers ----------
+
+    private void OnPreviewImageSizeChanged(object? sender, SizeChangedEventArgs e)
+    {
+        // Fires on first render and on every Source swap (rotate / re-decode). Either way the
+        // fitted scale is stale — snap back to Fit so the whole new page shows.
+        _followFit = true;
+        Dispatcher.UIThread.Post(RefitIfFollowing, DispatcherPriority.Background);
+    }
+
+    private void OnZoomInClick(object? sender, RoutedEventArgs e) => ZoomBy(ButtonZoomStep, anchor: null);
+    private void OnZoomOutClick(object? sender, RoutedEventArgs e) => ZoomBy(1 / ButtonZoomStep, anchor: null);
+    private void OnZoomFitClick(object? sender, RoutedEventArgs e)
+    {
+        _followFit = true;
+        RefitIfFollowing();
     }
 
     private void OnPreviewWheel(object? sender, PointerWheelEventArgs e)
     {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
+        var scroller = Scroller;
         if (scroller == null) return;
 
-        // Honour the notch magnitude — trackpads and free-spin wheels report fractional and
-        // multi-unit deltas — so a firm scroll zooms faster than a gentle one, like a map.
-        var notches = e.Delta.Y;
-        if (Math.Abs(notches) < 0.0001) return;
-        var factor = Math.Pow(WheelZoomStep, notches);
+        // Normalise the notch: a mouse wheel reports +/-1 per detent, a trackpad reports many
+        // small fractional events. macOS can put the delta on X during a vertical two-finger
+        // scroll, so fall back to it when Y is flat. Bounded exponent -> a firm scroll zooms
+        // faster than a gentle one without teleporting.
+        var delta = Math.Abs(e.Delta.Y) > 0.0001 ? e.Delta.Y : e.Delta.X;
+        if (Math.Abs(delta) < 0.0001) return;
+        var factor = Math.Pow(1.15, Math.Clamp(delta, -3.0, 3.0));
 
-        ZoomBy(factor, e.GetPosition(scroller));
-        // Claim the wheel, or the ScrollViewer scrolls as well and one notch both zooms and
-        // jumps the page.
+        SetScale(_scale * factor, e.GetPosition(scroller));
+        // Claim the wheel, or the ScrollViewer scrolls too and one notch both zooms and jumps.
         e.Handled = true;
-    }
-
-    /// <summary>A hand cursor whenever there is somewhere to drag to — i.e. past Fit — and the
-    /// ordinary arrow at Fit, where a drag would have nothing to do. Checked after every zoom
-    /// change, not just on hover, since zooming in with the wheel or the + button can make
-    /// dragging newly available without the pointer having moved.</summary>
-    private void UpdateCursor()
-    {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
-        if (scroller == null) return;
-        scroller.Cursor = new Cursor(_zoom > FitZoom + 0.001 ? StandardCursorType.Hand : StandardCursorType.Arrow);
     }
 
     private void OnPreviewPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
-        if (scroller == null || _zoom <= FitZoom + 0.001) return;
+        var scroller = Scroller;
+        if (scroller == null || _scale <= MinScale() + 0.001) return;
         if (!e.GetCurrentPoint(scroller).Properties.IsLeftButtonPressed) return;
 
         _isPanning = true;
@@ -241,13 +244,17 @@ public partial class CropReviewWindow : UserControl
     private void OnPreviewPointerMoved(object? sender, PointerEventArgs e)
     {
         if (!_isPanning) return;
-        var scroller = this.FindControl<ScrollViewer>("PreviewScroller");
+        var scroller = Scroller;
         if (scroller == null) return;
 
         var delta = e.GetPosition(scroller) - _panPointerStart;
+        var img = ImageDipSize();
+        var viewport = ViewportSize();
+        var maxX = Math.Max(0, img.Width * _scale - viewport.Width);
+        var maxY = Math.Max(0, img.Height * _scale - viewport.Height);
         scroller.Offset = new Vector(
-            Math.Max(0, _panOffsetStart.X - delta.X),
-            Math.Max(0, _panOffsetStart.Y - delta.Y));
+            Math.Clamp(_panOffsetStart.X - delta.X, 0, maxX),
+            Math.Clamp(_panOffsetStart.Y - delta.Y, 0, maxY));
     }
 
     private void OnPreviewPointerReleased(object? sender, PointerReleasedEventArgs e) => StopPanning();
@@ -258,6 +265,8 @@ public partial class CropReviewWindow : UserControl
         _isPanning = false;
         UpdateCursor();
     }
+
+    // ---------- Lifecycle ----------
 
     private void OnDataContextChanged(object? sender, EventArgs e)
     {
