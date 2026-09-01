@@ -18,9 +18,30 @@
 
                     <StackPanel Spacing="6">
                         <TextBlock Text="PROJECT CODE" Classes="sectionLabel"/>
-                        <TextBox Text="{Binding ProjectCode}" Watermark="e.g. QLD-TOURISM"
-                                 Background="{DynamicResource Surface2Brush}" Foreground="{DynamicResource InkBrush}"
-                                 BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8"/>
+                        <!-- Suggests existing projects as you type (contains-match, case-insensitive).
+                             Text two-way binds to ProjectCode, so picking a suggestion or typing a
+                             new code both flow through the same property — and the VM's
+                             known-project snap points the location at that project's folder. -->
+                        <AutoCompleteBox Text="{Binding ProjectCode, Mode=TwoWay}"
+                                         ItemsSource="{Binding KnownProjects}"
+                                         ValueMemberBinding="{Binding Code}"
+                                         FilterMode="Contains"
+                                         MinimumPrefixLength="1"
+                                         IsTextCompletionEnabled="False"
+                                         Watermark="e.g. QLD-TOURISM"
+                                         Background="{DynamicResource Surface2Brush}" Foreground="{DynamicResource InkBrush}"
+                                         BorderBrush="{DynamicResource HairlineStrongBrush}" CornerRadius="8">
+                            <AutoCompleteBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Spacing="1" Margin="2">
+                                        <TextBlock Text="{Binding Code}" FontWeight="SemiBold"
+                                                   Foreground="{DynamicResource InkBrush}"/>
+                                        <TextBlock Text="{Binding Location}" FontSize="11"
+                                                   Foreground="{DynamicResource InkTertiaryBrush}" TextWrapping="NoWrap"/>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </AutoCompleteBox.ItemTemplate>
+                        </AutoCompleteBox>
                     </StackPanel>
 
                     <StackPanel Spacing="6">

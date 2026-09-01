@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -20,16 +21,15 @@ public partial class NewBatchDialog : Window
 
     /// <summary>Shows the dialog and returns the operator's settings, or null if they cancelled.
     /// <paramref name="defaultLocation"/> seeds the location box so the common case is one click.
-    /// <paramref name="resolveExistingProjectLocation"/> maps a sanitized project code to the
-    /// folder that project's batches already live under (or null if it's a new project), so
-    /// picking a known project snaps the location to it.</summary>
+    /// <paramref name="knownProjects"/> feeds the project-code box's suggestions; picking one
+    /// snaps the location to that project's folder.</summary>
     public static async Task<NewBatchViewModel?> ShowAsync(
         Window owner, string? defaultLocation, string? projectCode,
-        Func<string, string?>? resolveExistingProjectLocation = null)
+        IReadOnlyList<NewBatchViewModel.KnownProject>? knownProjects = null)
     {
         var viewModel = new NewBatchViewModel
         {
-            ResolveExistingProjectLocation = resolveExistingProjectLocation
+            KnownProjects = knownProjects ?? System.Array.Empty<NewBatchViewModel.KnownProject>()
         };
         // Seed the project code first so the location snap below sees it, then seed the location
         // as the fallback default without it counting as an operator choice.

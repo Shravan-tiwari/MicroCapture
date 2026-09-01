@@ -35,12 +35,31 @@ public partial class NewBatchViewModel : ObservableObject
     [ObservableProperty] private string _validationMessage = string.Empty;
     [ObservableProperty] private bool _hasValidationMessage;
 
-    /// <summary>Looks up an existing project by its (sanitized) code and returns the folder its
-    /// batches already live under, or null if the code isn't a known project. Set by the caller,
-    /// which owns the database; keeping the VM free of a DbContext dependency. When it returns a
-    /// path, typing that project code snaps <see cref="BatchLocation"/> to it so a project's
-    /// batches stay together — see <see cref="OnProjectCodeChanged"/>.</summary>
-    public Func<string, string?>? ResolveExistingProjectLocation { get; set; }
+    /// <summary>One known project the operator can pick from the project-code box's suggestion
+    /// list. <see cref="Location"/> is the folder that project's batches live under — picking the
+    /// suggestion snaps <see cref="NewBatchViewModel.BatchLocation"/> to it.</summary>
+    public sealed record KnownProject(string Code, string Location)
+    {
+        // AutoCompleteBox shows this in the drop-down and, on selection, writes it back into the
+        // bound Text — so it has to be exactly the project code, nothing decorative.
+        public override string ToString() => Code;
+    }
+
+    /// <summary>Every existing project, for the project-code box's suggestions. Set by the caller,
+    /// which owns the database — the VM stays free of a DbContext dependency. Empty is fine (no
+    /// suggestions, plain free text). Codes are matched case-insensitively and de-duplicated by
+    /// the caller.</summary>
+    public IReadOnlyList<KnownProject> KnownProjects { get; set; } = System.Array.Empty<KnownProject>();
+
+    /// <summary>Looks up a known project by (sanitized) code, case-insensitively; null if it isn't
+    /// one. Used to snap the location when the operator types or picks an existing project — see
+    /// <see cref="OnProjectCodeChanged"/>.</summary>
+    private KnownProject? FindKnownProject(string code)
+    {
+        var sanitized = MicroCapture.Core.FileNaming.Sanitize(code);
+        return KnownProjects.FirstOrDefault(p =>
+            string.Equals(MicroCapture.Core.FileNaming.Sanitize(p.Code), sanitized, StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>Full DPI range from the requirements. 150 is the rig's native captured size —
     /// below that the image is downsampled, above it upsampled — see Batch.Dpi.</summary>
@@ -96,37 +115,35 @@ public partial class NewBatchViewModel : ObservableObject
     partial void OnProjectCodeChanged(string value)
     {
         ClearValidation();
-
-        // If this project already exists, drop its batch into the same parent its other batches
-        // live in — unless the operator has since picked a location by hand.
-        if (!_locationChosenByOperator && ResolveExistingProjectLocation is { } resolve
-            && !string.IsNullOrWhiteSpace(value))
-        {
-            var existing = resolve(MicroCapture.Core.FileNaming.Sanitize(value));
-            if (!string.IsNullOrWhiteSpace(existing) &&
-                !string.Equals(existing, BatchLocation, StringComparison.OrdinalIgnoreCase))
-            {
-                _snappingLocation = true;
-                try { BatchLocation = existing!; }
-                finally { _snappingLocation = false; }
-            }
-        }
-
+        SnapLocationToKnownProject(value);
         OnPropertyChanged(nameof(ResolvedBatchFolder));
+    }
+
+    /// <summary>If <paramref name="code"/> names an existing project, point the location box at
+    /// that project's folder so the new batch lands beside its siblings — the whole reason a
+    /// project code exists. Skipped once the operator has chosen a location by hand, so it can't
+    /// yank the batch out from under a folder they picked deliberately.</summary>
+    private void SnapLocationToKnownProject(string code)
+    {
+        if (_locationChosenByOperator || string.IsNullOrWhiteSpace(code)) return;
+
+        var known = FindKnownProject(code);
+        if (known == null || string.IsNullOrWhiteSpace(known.Location)) return;
+        if (string.Equals(known.Location, BatchLocation, StringComparison.OrdinalIgnoreCase)) return;
+
+        _snappingLocation = true;
+        try { BatchLocation = known.Location; }
+        finally { _snappingLocation = false; }
     }
 
     /// <summary>Seeds the location box with the caller's fallback default without it counting as
     /// an operator choice, so a later known-project pick can still snap the location. If the
-    /// project code seeded before this call already resolves to an existing project's folder,
-    /// that wins over the fallback.</summary>
+    /// project code seeded before this call already names an existing project, that project's
+    /// folder wins over the fallback.</summary>
     public void SeedDefaultLocation(string fallback)
     {
-        var seed = fallback;
-        if (ResolveExistingProjectLocation is { } resolve && !string.IsNullOrWhiteSpace(ProjectCode))
-        {
-            var existing = resolve(MicroCapture.Core.FileNaming.Sanitize(ProjectCode));
-            if (!string.IsNullOrWhiteSpace(existing)) seed = existing!;
-        }
+        var known = string.IsNullOrWhiteSpace(ProjectCode) ? null : FindKnownProject(ProjectCode);
+        var seed = !string.IsNullOrWhiteSpace(known?.Location) ? known!.Location : fallback;
 
         _snappingLocation = true;
         try { BatchLocation = seed; }

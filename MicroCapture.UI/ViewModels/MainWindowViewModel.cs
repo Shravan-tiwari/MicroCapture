@@ -1695,19 +1695,25 @@ public partial class MainWindowViewModel : ViewModelBase
             var defaultLocation = LastBatchLocation ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MicroCapture");
 
-            // Lets the dialog snap its location box to an existing project's parent folder, so a
-            // project's batches stay together on disk. Returns the parent of the project's own
-            // folder — the dialog re-appends <projectCode>/<batchCode> itself.
-            Func<string, string?> resolveProjectLocation = code =>
-            {
-                var existing = _dbContext.Projects.AsNoTracking().FirstOrDefault(p => p.Name == code);
-                return string.IsNullOrWhiteSpace(existing?.OutputDirectory)
-                    ? null
-                    : Path.GetDirectoryName(existing!.OutputDirectory);
-            };
+            // Feed the project-code box its suggestions. Location is the PARENT of the project's
+            // own folder — the dialog re-appends <projectCode>/<batchCode> itself. A project row
+            // with a blank OutputDirectory (shouldn't happen, but old data might) still offers its
+            // name as a suggestion, just with no location to snap to.
+            var knownProjects = _dbContext.Projects.AsNoTracking()
+                .Where(p => p.Name != null && p.Name != "")
+                .OrderBy(p => p.Name)
+                .AsEnumerable()
+                .Select(p => new MicroCapture.UI.ViewModels.NewBatchViewModel.KnownProject(
+                    p.Name,
+                    string.IsNullOrWhiteSpace(p.OutputDirectory)
+                        ? string.Empty
+                        : Path.GetDirectoryName(p.OutputDirectory) ?? string.Empty))
+                .GroupBy(p => p.Code, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
 
             var settings = await MicroCapture.UI.Views.NewBatchDialog.ShowAsync(
-                owner, defaultLocation, ProjectCode, resolveProjectLocation);
+                owner, defaultLocation, ProjectCode, knownProjects);
             if (settings == null) return;
 
             var projectCode = MicroCapture.Core.FileNaming.Sanitize(settings.ProjectCode);
