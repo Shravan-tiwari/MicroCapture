@@ -41,7 +41,7 @@
                         Click="OnInsertPointClick"
                         IsVisible="{Binding !IsFirstAfterScanTile}"
                         ToolTip.Tip="Start capturing here — this page and the ones after it shift down"/>
-                <Grid Classes="thumb" Width="104" DragDrop.AllowDrop="True">
+                <Grid Classes="thumb" Classes.selected="{Binding IsSelected}" Width="104" DragDrop.AllowDrop="True">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
@@ -77,16 +77,23 @@
                     </Button>
 
                     <!-- Selection treatment. All non-hit-testable so none of them steals a click
-                         from the tile underneath. -->
+                         from the tile underneath.
+                         · an outer accent glow, drawn behind so it reads as a halo
+                         · a firm tinted wash over the tile body (SelectionFillBrush — far more
+                           visible than the old 12%-alpha wash), still see-through enough for the
+                           thumbnail
+                         · a thick solid accent edge hugging the tile
+                         Selected tiles also lift with a shadow (Grid.thumb:selected style). -->
+                    <Border IsVisible="{Binding IsSelected}" CornerRadius="12"
+                            Margin="-4" IsHitTestVisible="False"
+                            Background="{DynamicResource SelectionGlowBrush}"
+                            BoxShadow="0 4 14 0 #59000000"/>
                     <Border IsVisible="{Binding IsSelected}" CornerRadius="6"
                             Margin="2" IsHitTestVisible="False"
-                            Background="{DynamicResource PrimaryWashBrush}"/>
-                    <Border IsVisible="{Binding IsSelected}" CornerRadius="11"
-                            Margin="-3" BorderThickness="3" IsHitTestVisible="False"
-                            BorderBrush="{DynamicResource PrimaryWashBrush}"/>
+                            Background="{DynamicResource SelectionFillBrush}"/>
                     <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
-                            BorderBrush="{DynamicResource PrimaryBrush}"
-                            BorderThickness="2.5" IsHitTestVisible="False"/>
+                            BorderBrush="{DynamicResource PrimaryHoverBrush}"
+                            BorderThickness="3.5" IsHitTestVisible="False"/>
 
                     <!-- The arrow-key browse cursor. Deliberately a different mark from the
                          selection ring. -->
@@ -571,19 +578,24 @@
                                 IsVisible="{Binding ScanTile.IsVisible}">
                     <ContentControl.ContentTemplate>
                         <DataTemplate x:DataType="vm:ScanTileViewModel">
-                            <Grid Classes="scanThumb" Width="116" Margin="6,0">
-                                <Border Classes="scanTile" CornerRadius="9" BorderThickness="2.5"
+                            <Grid Classes="scanThumb" Width="120">
+                                <!-- Outer accent halo, drawn behind the tile so it reads as a
+                                     glow rather than a second border. -->
+                                <Border CornerRadius="12" Margin="-4" IsHitTestVisible="False"
+                                        Background="{DynamicResource SelectionGlowBrush}"/>
+                                <Border Classes="scanTile" CornerRadius="9" BorderThickness="3"
                                         Padding="6,6,6,5"
-                                        BorderBrush="{Binding Readiness, Converter={x:Static conv:StatusSeverityConverter.Instance}}">
+                                        BorderBrush="{DynamicResource PrimaryHoverBrush}">
                                     <Grid>
-                                        <!-- Dashed inner edge: Border has no dash support, so an
-                                             overlaid Rectangle carries it. Marks the tile as a
-                                             placeholder, not a real page. -->
+                                        <!-- Readiness-tinted dashed inner edge: Border has no dash
+                                             support, so an overlaid Rectangle carries it. Marks
+                                             the tile as a placeholder and shows capture readiness
+                                             without competing with the solid accent frame. -->
                                         <Rectangle StrokeDashArray="3,2" StrokeThickness="1.5" RadiusX="7" RadiusY="7"
-                                                   IsHitTestVisible="False"
-                                                   Stroke="{DynamicResource PrimaryBrush}" Opacity="0.5"/>
+                                                   IsHitTestVisible="False" Opacity="0.7"
+                                                   Stroke="{Binding Readiness, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
                                         <StackPanel Spacing="5">
-                                            <Border CornerRadius="5" ClipToBounds="True" Height="64"
+                                            <Border CornerRadius="5" ClipToBounds="True" Height="68"
                                                     Background="{DynamicResource Surface1Brush}">
                                                 <Panel>
                                                     <Image Source="{Binding LivePreview}" Stretch="Uniform"
@@ -595,20 +607,21 @@
                                                 </Panel>
                                             </Border>
                                             <TextBlock Text="{Binding Label}" HorizontalAlignment="Center"
-                                                       FontSize="12" FontWeight="SemiBold"
-                                                       TextTrimming="CharacterEllipsis" MaxWidth="104"
+                                                       FontSize="12.5" FontWeight="Bold"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="106"
                                                        Foreground="{DynamicResource InkBrush}"/>
-                                            <TextBlock Text="scanning here" HorizontalAlignment="Center"
-                                                       FontSize="9.5" Foreground="{DynamicResource InkSubtleBrush}"/>
+                                            <TextBlock Text="SCANNING HERE" HorizontalAlignment="Center"
+                                                       FontSize="9" FontWeight="SemiBold" LetterSpacing="0.6"
+                                                       Foreground="{DynamicResource PrimaryHoverBrush}"/>
                                         </StackPanel>
                                     </Grid>
                                 </Border>
                                 <!-- Capture pulse: a soft primary ring while a shot is in flight,
                                      so the operator sees the page land in this slot. -->
                                 <Border IsVisible="{Binding IsCapturing}" Classes="scanPulse"
-                                        CornerRadius="11" Margin="-3" BorderThickness="3"
+                                        CornerRadius="12" Margin="-4" BorderThickness="3"
                                         IsHitTestVisible="False"
-                                        BorderBrush="{DynamicResource PrimaryBrush}"/>
+                                        BorderBrush="{DynamicResource PrimaryHoverBrush}"/>
                             </Grid>
                         </DataTemplate>
                     </ContentControl.ContentTemplate>

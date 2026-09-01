@@ -46,6 +46,10 @@
           <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#828fff"/>
           <SolidColorBrush x:Key="PrimaryFocusBrush" Color="#5e69d1"/>
           <SolidColorBrush x:Key="PrimaryWashBrush" Color="#1f2266d2"/>
+          <!-- A stronger fill for the selected-page treatment specifically — the 12%-alpha wash
+               above was too faint to read as "selected" across a full strip. -->
+          <SolidColorBrush x:Key="SelectionFillBrush" Color="#4a5ad0e0"/>
+          <SolidColorBrush x:Key="SelectionGlowBrush" Color="#66828fff"/>
 
           <!-- Semantic status — separate from the accent on purpose, so it always means the same
                thing wherever it appears. -->
@@ -92,6 +96,10 @@
           <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#3d47a8"/>
           <SolidColorBrush x:Key="PrimaryFocusBrush" Color="#333c92"/>
           <SolidColorBrush x:Key="PrimaryWashBrush" Color="#242f66d2"/>
+          <!-- Selected-page treatment: a firmer tint than the wash, still translucent enough to
+               read the thumbnail through it. -->
+          <SolidColorBrush x:Key="SelectionFillBrush" Color="#38334c9e"/>
+          <SolidColorBrush x:Key="SelectionGlowBrush" Color="#553d47a8"/>
 
           <!-- Semantic status, darkened for contrast against white. -->
           <SolidColorBrush x:Key="SuccessBrush" Color="#1a7f36"/>
@@ -294,13 +302,26 @@
     <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
   </Style>
 
+  <!-- A selected page lifts off the strip with a small scale-up, so a multi-select reads at a
+       glance rather than only from the edge treatment. The shadow itself rides on the glow
+       Border in the tile template (Button has no BoxShadow property). -->
+  <Style Selector="Grid.thumb.selected">
+    <Setter Property="RenderTransform" Value="scale(1.04)"/>
+  </Style>
+
   <!-- ───────────── Current-scan tile ─────────────
-       A marker for where the next capture lands, not a captured page. Deliberately unlike a
-       page tile: a dashed accent edge and a faintly primary-tinted body so it reads as "this
-       slot is the target" from across the strip, and slightly wider than a page tile so it
-       never passes for one. -->
+       A marker for where the next capture lands, not a captured page. It deliberately POPS
+       above the strip: a raised drop shadow, a solid accent edge, a primary-tinted body, and
+       a slight scale-up so the eye lands on it first. Wider than a page tile so it never
+       passes for one. -->
   <Style Selector="Border.scanTile">
     <Setter Property="Background" Value="{DynamicResource PrimaryWashBrush}"/>
+    <Setter Property="BoxShadow" Value="0 6 18 0 #66000000"/>
+    <Setter Property="RenderTransform" Value="scale(1.06)"/>
+  </Style>
+  <!-- The tile's own scale-up needs breathing room in the strip so neighbours aren't clipped. -->
+  <Style Selector="Grid.scanThumb">
+    <Setter Property="Margin" Value="10,4"/>
   </Style>
 
   <!-- The in-flight capture pulse. A gentle opacity breathe rather than motion, so a 400-page
