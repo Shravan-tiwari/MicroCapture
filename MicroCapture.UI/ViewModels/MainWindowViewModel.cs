@@ -258,7 +258,8 @@ public partial class MainWindowViewModel : ViewModelBase
         InsertPointLabel = _insertBeforePage is { } page
             ? $"Next capture will be inserted as page {page}. Later pages shift down to make room."
             : string.Empty;
-        UpdateCaptureReadiness(); // also refreshes the scan tile
+        UpdateCaptureReadiness();
+        RefreshScanTile();
     }
 
     /// <summary>Sets the cart position the next capture will be inserted at.</summary>
@@ -1083,9 +1084,10 @@ public partial class MainWindowViewModel : ViewModelBase
         else
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
 
-        // The scan tile's border mirrors readiness. Guarded against the design-time ctor, which
-        // never constructs ScanTile-dependent state.
-        RefreshScanTile();
+        // The scan tile's border mirrors readiness. Cheap direct assignment only — this runs on
+        // every live-view frame, so it must NOT trigger the full RefreshScanTile (clamp +
+        // partition rebuild); position/visibility changes are pushed from their own sites.
+        ScanTile.Readiness = CaptureReadiness;
     }
 
     /// <summary>Projects the drawn frames into 0..1 fractions of the frame they were authored
@@ -1840,7 +1842,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task NewBatchAsync(Avalonia.Controls.Window? owner)
     {
-        if (owner == null) return;
+        if (owner == null)
+        {
+            StatusText = "Could not open the New Batch dialog — no parent window.";
+            return;
+        }
         try
         {
             var defaultLocation = LastBatchLocation ?? Path.Combine(
@@ -1955,7 +1961,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task OpenBatchAsync(Avalonia.Controls.Window? owner)
     {
-        if (owner == null) return;
+        if (owner == null)
+        {
+            StatusText = "Could not open the Open Batch dialog — no parent window.";
+            return;
+        }
         try
         {
             var roots = BatchSearchRoots();
