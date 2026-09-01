@@ -68,6 +68,7 @@ TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
+await TestDeletingAPageRemovesItsFilesAndRenumbers();
 await TestLiveViewRotationAppliesToNewCapturesOnly();
 await TestCropReviewPreviewsTheCroppedPageNotTheWholeFrame();
 TestPdfEncodingQuality();
@@ -2308,6 +2309,78 @@ async Task TestCartReorderKeepsRecapturesWithTheirPage()
         Check("Every page still has exactly one live capture", liveByPage.All(g => g.Count() == 1));
         Check("No page numbers collided after renumbering", liveByPage.Count == 3);
     }
+}
+
+async Task TestDeletingAPageRemovesItsFilesAndRenumbers()
+{
+    Console.WriteLine("\n-- Deleting a page hard-removes its files from the batch folder and closes the numbering gap --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "delete_files.db");
+
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb);
+        seedDb.Projects.Add(new Project { Name = "DELFILES", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "DELFILES";
+    vm.BatchCode = "DELFILES";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    for (var i = 0; i < 3; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")), timeoutMs: 40000);
+    Check("Three pages captured and processed", vm.RecentCaptures.Count == 3
+        && vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")));
+    if (vm.RecentCaptures.Count != 3) return;
+
+    // Resolve the on-disk files for the page we're about to delete (page 2), the way export
+    // does, so the assertion checks the real deliverable — not a guessed filename.
+    List<string> page2Files;
+    string page2Original;
+    using (var db = new AppDbContext(dbPath))
+    {
+        var batchId = db.Batches.Select(b => b.Id).First();
+        var page2Job = db.CaptureJobs.AsNoTracking().Single(j => j.BatchId == batchId && j.PageNumber == 2);
+        page2Files = MicroCapture.Processing.BatchExportService.GetProcessedFilesForJob(page2Job);
+        page2Original = page2Job.OriginalFilePath;
+    }
+    Check("Page 2 has a processed file on disk before deletion",
+        page2Files.Count > 0 && page2Files.All(File.Exists));
+
+    var page2ThumbJobId = vm.RecentCaptures.First(t => t.PageNumber == 2).JobId;
+    var page2Item = vm.RecentCaptures.First(t => t.JobId == page2ThumbJobId);
+    await RunPumped(() => vm.DeleteCaptureAsync(page2Item), timeoutMs: 30000);
+
+    Check("The deleted page's processed file is gone from the batch folder",
+        page2Files.All(f => !File.Exists(f)));
+    Check("The deleted page's original capture file is gone too",
+        !File.Exists(page2Original));
+
+    Check("The cart now holds two pages, renumbered 1 and 2",
+        vm.RecentCaptures.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2 }));
+    Check("The PAGE count reflects the delete", vm.PageCount == 2);
+
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var batchId = verify.Batches.Select(b => b.Id).First();
+        var rows = verify.CaptureJobs.AsNoTracking().Where(j => j.BatchId == batchId).ToList();
+        Check("The deleted page's database rows are removed outright, not left as Superseded",
+            rows.Count == 2 && rows.All(j => j.ProcessingStatus != "Superseded"));
+        Check("The database is renumbered 1..2 with no gap",
+            rows.Select(j => j.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2 }));
+    }
+
+    // The manifest another machine would read must agree. StartBatchAsync puts the batch folder
+    // at {project.OutputDirectory}/{batchCode} — here that's workDir/DELFILES.
+    var manifest = new BatchManifestService().Load(Path.Combine(workDir, "DELFILES"));
+    Check("The manifest lists exactly the two surviving pages",
+        manifest != null && manifest.Pages.Select(p => p.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2 }));
 }
 
 void TestPdfEncodingQuality()

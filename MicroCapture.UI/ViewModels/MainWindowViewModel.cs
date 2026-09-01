@@ -3139,18 +3139,17 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var removedJobs = await _queueService.PurgeCaptureAsync(item.JobId);
 
-        // Which original capture files are now unreferenced. A fixed-frame shot produces several
-        // jobs from one source image, so an original is only safe to delete once no surviving
-        // job still points at it. Recapture attempts have their own "_R_" originals, each
-        // referenced by exactly one (now-removed) job.
+        // Every original capture path the removed jobs referenced. A fixed-frame shot produces
+        // several jobs from ONE source image, so that original is only safe to delete once no
+        // job that survived the purge still points at it. A recapture attempt has its own
+        // "_R_{timestamp}" original, referenced by exactly one (now-removed) job.
         var removedOriginals = removedJobs
             .Select(j => j.OriginalFilePath)
-            .Concat(new[] { item.FilePath })
             .Where(p => !string.IsNullOrWhiteSpace(p))
             .Select(Path.GetFullPath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var stillReferenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stillReferencedOriginals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (_currentBatchId != null)
         {
             _dbContext.ChangeTracker.Clear();
@@ -3159,33 +3158,39 @@ public partial class MainWindowViewModel : ViewModelBase
                          .Select(j => j.OriginalFilePath)
                          .ToListAsync())
             {
-                if (!string.IsNullOrWhiteSpace(path)) stillReferenced.Add(Path.GetFullPath(path));
+                if (!string.IsNullOrWhiteSpace(path)) stillReferencedOriginals.Add(Path.GetFullPath(path));
             }
         }
 
-        foreach (var original in removedOriginals)
+        // Processed derivatives: resolve them the same way export does — from the job's recorded
+        // ProcessedFilePath first (the authoritative answer, which is how fixed-frame outputs
+        // like "..._p000002.tif" in output/ are found — their names don't follow the base-name
+        // + known-suffix shape EnumerateDerivatives matches), then the folder globs as a
+        // fallback for older rows. Also clear the OCR sidecars that sit beside each derivative.
+        foreach (var job in removedJobs)
         {
             try
             {
-                // Processed derivatives sit in the same folder as the original and share its
-                // base name. Use the boundary-aware matcher, not a raw "{baseName}*" glob: a
-                // recapture's own original ("{baseName}_R_{timestamp}.jpg") is a literal
-                // prefix-match of the page it recaptured.
-                var processedDir = MicroCapture.Processing.ProcessedFilePaths.OutputDirectoryFor(original);
-                foreach (var derivative in MicroCapture.Processing.ProcessedFilePaths.EnumerateDerivatives(processedDir, original))
+                foreach (var derivative in MicroCapture.Processing.BatchExportService.GetProcessedFilesForJob(job))
                 {
-                    if (removedOriginals.Contains(Path.GetFullPath(derivative))) continue; // handled below
+                    if (string.Equals(Path.GetFullPath(derivative), Path.GetFullPath(job.OriginalFilePath), StringComparison.OrdinalIgnoreCase))
+                        continue; // the original is handled separately below
                     TryDeleteFile(derivative);
+                    TryDeleteFile(MicroCapture.Processing.ProcessedFilePaths.OcrSidecarPath(derivative, ".txt"));
+                    TryDeleteFile(MicroCapture.Processing.ProcessedFilePaths.OcrSidecarPath(derivative, ".tsv"));
                 }
-
-                // The original itself — only if nothing that survived the purge still uses it.
-                if (!stillReferenced.Contains(original))
-                    TryDeleteFile(original);
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Capture-file cleanup failed for '{original}': {ex}");
+                Console.Error.WriteLine($"Processed-file cleanup failed for job '{job.Id}': {ex}");
             }
+        }
+
+        // Originals: delete each one no surviving job still needs.
+        foreach (var original in removedOriginals)
+        {
+            if (!stillReferencedOriginals.Contains(original))
+                TryDeleteFile(original);
         }
 
         // The cached page thumbnail is named by page number; delete it before the renumber pass
