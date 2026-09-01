@@ -21,6 +21,95 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
+    <Window.Resources>
+        <!-- One page-tile template, shared by the two filmstrip slices on either side of the
+             current-scan tile. Was inline in a single ItemsControl before the scan tile split
+             the strip in two. -->
+        <DataTemplate x:Key="PageTileTemplate" x:DataType="vm:ThumbnailItem">
+            <StackPanel Orientation="Horizontal">
+                <!-- Insert point. Sits before each tile and means "start capturing here", so
+                     someone who shot 400 pages can go back and add the ones they missed at 350
+                     without recapturing the rest. Faint until hovered so 400 of them don't
+                     shout over the pages themselves. Hidden on the first tile right after the
+                     inline scan tile — there it would only set the insert point to where the
+                     scan tile already is.
+                     Click handler, not a $parent[ItemsControl] compiled binding: that pattern
+                     threw "unable to resolve type" at runtime on the target machine despite
+                     building cleanly — see RecentBatchesDialog's own note. Every per-row control
+                     in this app uses the code-behind idiom for that reason. -->
+                <Button Classes="insertPoint" Content="+"
+                        Click="OnInsertPointClick"
+                        IsVisible="{Binding !IsFirstAfterScanTile}"
+                        ToolTip.Tip="Start capturing here — this page and the ones after it shift down"/>
+                <Grid Classes="thumb" Width="104" DragDrop.AllowDrop="True">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Button Classes="tile"
+                            Background="{DynamicResource Surface2Brush}"
+                            BorderBrush="{Binding BorderColor, TargetNullValue={DynamicResource HairlineBrush}}"
+                            BorderThickness="2" CornerRadius="8" Padding="6,6,6,5"
+                            HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                            ToolTip.Tip="Click to adjust this page · drag to reorder · ctrl-click to select"
+                            PointerPressed="OnThumbnailPointerPressed"
+                            PointerMoved="OnThumbnailPointerMoved"
+                            PointerReleased="OnThumbnailPointerReleased"
+                            Click="OnThumbnailClick"
+                            Tag="{Binding JobId}">
+                        <StackPanel Spacing="5">
+                            <Border CornerRadius="5" ClipToBounds="True" Background="{DynamicResource Surface1Brush}">
+                                <Image Source="{Binding Thumbnail}" Height="64" Stretch="Uniform"/>
+                            </Border>
+                            <!-- The page number is what the operator navigates by, so it reads
+                                 as the tile's label rather than a caption. -->
+                            <TextBlock Text="{Binding PageNumber, StringFormat='Page {0}'}"
+                                       HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold"
+                                       Foreground="{DynamicResource InkBrush}"/>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="4">
+                                <Ellipse Width="6" Height="6" VerticalAlignment="Center"
+                                         Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
+                                <TextBlock Text="{Binding Status}" FontSize="9.5"
+                                           Foreground="{DynamicResource InkSubtleBrush}"
+                                           TextTrimming="CharacterEllipsis" MaxWidth="66"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Button>
+
+                    <!-- Selection treatment. All non-hit-testable so none of them steals a click
+                         from the tile underneath. -->
+                    <Border IsVisible="{Binding IsSelected}" CornerRadius="6"
+                            Margin="2" IsHitTestVisible="False"
+                            Background="{DynamicResource PrimaryWashBrush}"/>
+                    <Border IsVisible="{Binding IsSelected}" CornerRadius="11"
+                            Margin="-3" BorderThickness="3" IsHitTestVisible="False"
+                            BorderBrush="{DynamicResource PrimaryWashBrush}"/>
+                    <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
+                            BorderBrush="{DynamicResource PrimaryBrush}"
+                            BorderThickness="2.5" IsHitTestVisible="False"/>
+
+                    <!-- The arrow-key browse cursor. Deliberately a different mark from the
+                         selection ring. -->
+                    <Border IsVisible="{Binding IsCurrent}" CornerRadius="8"
+                            BorderBrush="{DynamicResource WarningBrush}"
+                            BorderThickness="2" IsHitTestVisible="False"/>
+
+                    <!-- Select and delete sit in a top strip that appears on hover, or stays put
+                         while selected. -->
+                    <Grid Classes="tileActions" VerticalAlignment="Top" ColumnDefinitions="Auto,*,Auto"
+                          Margin="3,3,3,0">
+                        <Button Grid.Column="0" Classes="tileAction" Click="OnThumbnailSelectClick"
+                                ToolTip.Tip="Select this page for batch actions"
+                                Content="{Binding IsSelected, Converter={x:Static conv:BoolToSelectGlyphConverter.Instance}}"/>
+                        <Button Grid.Column="2" Classes="tileAction danger" Click="OnDeleteThumbnailClick"
+                                ToolTip.Tip="Delete this page from the batch"
+                                Content="✕"/>
+                    </Grid>
+                </Grid>
+            </StackPanel>
+        </DataTemplate>
+    </Window.Resources>
+
     <!-- Filmstrip row (3rd). This row has to hold three things, and was repeatedly sized for
          only some of them: the selection/undo action bar, a tile tall enough for its image plus
          the page-number and status lines, and the horizontal scrollbar underneath. At 140px the
@@ -462,116 +551,85 @@
                           PointerWheelChanged="OnFilmstripWheel"
                           HorizontalScrollBarVisibility="Visible" VerticalScrollBarVisibility="Disabled">
                 <StackPanel Orientation="Horizontal">
-                <ItemsControl ItemsSource="{Binding RecentCaptures}">
+                <!-- The filmstrip is drawn in three parts so the current-scan tile can sit
+                     inline between two pages: [pages before it] [scan tile] [pages after it].
+                     With no insert point set, PagesAfterScanTile is empty and the tile trails
+                     the whole strip. -->
+                <ItemsControl ItemsSource="{Binding PagesBeforeScanTile}"
+                              ItemTemplate="{StaticResource PageTileTemplate}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
                             <StackPanel Orientation="Horizontal" Spacing="0" />
                         </ItemsPanelTemplate>
                     </ItemsControl.ItemsPanel>
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:ThumbnailItem">
-                            <StackPanel Orientation="Horizontal">
-                            <!-- Insert point. Sits before each tile and means "start capturing
-                                 here", so someone who shot 400 pages can go back and add the ones
-                                 they missed at 350 without recapturing the rest. Faint until
-                                 hovered so 400 of them don't shout over the pages themselves. -->
-                            <!-- Click handler, not a $parent[ItemsControl] compiled binding: that
-                                 pattern threw "unable to resolve type" at runtime on the target
-                                 machine despite building cleanly — see RecentBatchesDialog's own
-                                 note. Every per-row control in this app uses the code-behind
-                                 idiom for that reason. -->
-                            <Button Classes="insertPoint" Content="+"
-                                    Click="OnInsertPointClick"
-                                    ToolTip.Tip="Start capturing here — this page and the ones after it shift down"/>
-                            <Grid Classes="thumb" Width="104" DragDrop.AllowDrop="True">
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="*"/>
-                                </Grid.RowDefinitions>
-
-                                <Button Classes="tile"
-                                        Background="{DynamicResource Surface2Brush}"
-                                        BorderBrush="{Binding BorderColor, TargetNullValue={DynamicResource HairlineBrush}}"
-                                        BorderThickness="2" CornerRadius="8" Padding="6,6,6,5"
-                                        HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                                        ToolTip.Tip="Click to adjust this page · drag to reorder · ctrl-click to select"
-                                        PointerPressed="OnThumbnailPointerPressed"
-                                        PointerMoved="OnThumbnailPointerMoved"
-                                        PointerReleased="OnThumbnailPointerReleased"
-                                        Click="OnThumbnailClick"
-                                        Tag="{Binding JobId}">
-                                    <StackPanel Spacing="5">
-                                        <Border CornerRadius="5" ClipToBounds="True" Background="{DynamicResource Surface1Brush}">
-                                            <Image Source="{Binding Thumbnail}" Height="64" Stretch="Uniform"/>
-                                        </Border>
-                                        <!-- The page number is what the operator navigates by, so
-                                             it reads as the tile's label rather than a caption. -->
-                                        <TextBlock Text="{Binding PageNumber, StringFormat='Page {0}'}"
-                                                   HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold"
-                                                   Foreground="{DynamicResource InkBrush}"/>
-                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="4">
-                                            <Ellipse Width="6" Height="6" VerticalAlignment="Center"
-                                                     Fill="{Binding Status, Converter={x:Static conv:StatusSeverityConverter.Instance}}"/>
-                                            <TextBlock Text="{Binding Status}" FontSize="9.5"
-                                                       Foreground="{DynamicResource InkSubtleBrush}"
-                                                       TextTrimming="CharacterEllipsis" MaxWidth="66"/>
-                                        </StackPanel>
-                                    </StackPanel>
-                                </Button>
-
-                                <!-- Selection treatment. All non-hit-testable so none of them
-                                     steals a click from the tile underneath.
-                                     · a faint primary wash over the whole tile body, so selection
-                                       reads from the tile and not only its edge
-                                     · a soft translucent halo just outside the tile
-                                     · a crisp solid primary edge hugging it
-                                     Together they read as "selected" from across the strip without
-                                     shouting. -->
-                                <Border IsVisible="{Binding IsSelected}" CornerRadius="6"
-                                        Margin="2" IsHitTestVisible="False"
-                                        Background="{DynamicResource PrimaryWashBrush}"/>
-                                <Border IsVisible="{Binding IsSelected}" CornerRadius="11"
-                                        Margin="-3" BorderThickness="3" IsHitTestVisible="False"
-                                        BorderBrush="{DynamicResource PrimaryWashBrush}"/>
-                                <Border IsVisible="{Binding IsSelected}" CornerRadius="8"
-                                        BorderBrush="{DynamicResource PrimaryBrush}"
-                                        BorderThickness="2.5" IsHitTestVisible="False"/>
-
-                                <!-- The arrow-key browse cursor. Deliberately a different mark
-                                     from the selection ring: browsing to look at a page and
-                                     selecting it for a batch action are different acts, and one
-                                     shouldn't look like the other. -->
-                                <Border IsVisible="{Binding IsCurrent}" CornerRadius="8"
-                                        BorderBrush="{DynamicResource WarningBrush}"
-                                        BorderThickness="2" IsHitTestVisible="False"/>
-
-                                <!-- Select and delete sit in a top strip that appears on hover, or
-                                     stays put while selected. They used to be two 20px circles
-                                     pinned outside the tile's corners on negative margins, which
-                                     overlapped the neighbouring tile and were easy to hit by
-                                     accident. Real labels and full-height targets are far harder
-                                     to mis-click. -->
-                                <Grid Classes="tileActions" VerticalAlignment="Top" ColumnDefinitions="Auto,*,Auto"
-                                      Margin="3,3,3,0">
-                                    <Button Grid.Column="0" Classes="tileAction" Click="OnThumbnailSelectClick"
-                                            ToolTip.Tip="Select this page for batch actions"
-                                            Content="{Binding IsSelected, Converter={x:Static conv:BoolToSelectGlyphConverter.Instance}}"/>
-                                    <Button Grid.Column="2" Classes="tileAction danger" Click="OnDeleteThumbnailClick"
-                                            ToolTip.Tip="Delete this page from the batch"
-                                            Content="✕"/>
-                                </Grid>
-                            </Grid>
-                            </StackPanel>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
                 </ItemsControl>
 
-                <!-- The trailing insert point. Every other "+" means "insert before this page";
-                     this one means "carry on at the end", which is also how to cancel an insert
-                     point you set earlier without hunting for the banner's button. -->
+                <!-- Current-scan tile: where the next capture lands. Not a captured page and not
+                     in RecentCaptures — a distinct, non-draggable marker. Shows a throttled live
+                     preview, the target page (or frame count), and a readiness-tinted border. -->
+                <ContentControl Name="ScanTilePresenter" Content="{Binding ScanTile}"
+                                IsVisible="{Binding ScanTile.IsVisible}">
+                    <ContentControl.ContentTemplate>
+                        <DataTemplate x:DataType="vm:ScanTileViewModel">
+                            <Grid Classes="scanThumb" Width="116" Margin="6,0">
+                                <Border Classes="scanTile" CornerRadius="9" BorderThickness="2.5"
+                                        Padding="6,6,6,5"
+                                        BorderBrush="{Binding Readiness, Converter={x:Static conv:StatusSeverityConverter.Instance}}">
+                                    <Grid>
+                                        <!-- Dashed inner edge: Border has no dash support, so an
+                                             overlaid Rectangle carries it. Marks the tile as a
+                                             placeholder, not a real page. -->
+                                        <Rectangle StrokeDashArray="3,2" StrokeThickness="1.5" RadiusX="7" RadiusY="7"
+                                                   IsHitTestVisible="False"
+                                                   Stroke="{DynamicResource PrimaryBrush}" Opacity="0.5"/>
+                                        <StackPanel Spacing="5">
+                                            <Border CornerRadius="5" ClipToBounds="True" Height="64"
+                                                    Background="{DynamicResource Surface1Brush}">
+                                                <Panel>
+                                                    <Image Source="{Binding LivePreview}" Stretch="Uniform"
+                                                           IsVisible="{Binding IsLiveActive}"/>
+                                                    <TextBlock Text="live view off" FontSize="9"
+                                                               Foreground="{DynamicResource InkTertiaryBrush}"
+                                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                               IsVisible="{Binding !IsLiveActive}"/>
+                                                </Panel>
+                                            </Border>
+                                            <TextBlock Text="{Binding Label}" HorizontalAlignment="Center"
+                                                       FontSize="12" FontWeight="SemiBold"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="104"
+                                                       Foreground="{DynamicResource InkBrush}"/>
+                                            <TextBlock Text="scanning here" HorizontalAlignment="Center"
+                                                       FontSize="9.5" Foreground="{DynamicResource InkSubtleBrush}"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                                <!-- Capture pulse: a soft primary ring while a shot is in flight,
+                                     so the operator sees the page land in this slot. -->
+                                <Border IsVisible="{Binding IsCapturing}" Classes="scanPulse"
+                                        CornerRadius="11" Margin="-3" BorderThickness="3"
+                                        IsHitTestVisible="False"
+                                        BorderBrush="{DynamicResource PrimaryBrush}"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ContentControl.ContentTemplate>
+                </ContentControl>
+
+                <ItemsControl ItemsSource="{Binding PagesAfterScanTile}"
+                              ItemTemplate="{StaticResource PageTileTemplate}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" Spacing="0" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                </ItemsControl>
+
+                <!-- The trailing "+" — only meaningful when the scan tile is inline (an insert
+                     point is set). It means "carry on at the end", and is also how to cancel an
+                     insert point without hunting for the banner's button. -->
                 <Button Classes="insertPoint" Content="+"
                         Command="{Binding ClearInsertPointCommand}"
-                        IsVisible="{Binding HasOpenBatch}"
-                        ToolTip.Tip="Capture at the end of the batch"/>
+                        IsVisible="{Binding ScanTile.IsInline}"
+                        ToolTip.Tip="Capture at the end of the batch instead"/>
                 </StackPanel>
             </ScrollViewer>
             </Grid>

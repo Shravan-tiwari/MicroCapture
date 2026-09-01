@@ -68,6 +68,7 @@ TestBatchManifestRoundTripsAndValidates();
 TestBatchManifestSurvivesRelocation();
 TestBatchManifestSurvivesInterruptedWrite();
 await TestCartReorderKeepsRecapturesWithTheirPage();
+await TestScanTileTracksWhereTheNextCaptureLands();
 await TestDeletingAPageRemovesItsFilesAndRenumbers();
 await TestLiveViewRotationAppliesToNewCapturesOnly();
 await TestCropReviewPreviewsTheCroppedPageNotTheWholeFrame();
@@ -2309,6 +2310,88 @@ async Task TestCartReorderKeepsRecapturesWithTheirPage()
         Check("Every page still has exactly one live capture", liveByPage.All(g => g.Count() == 1));
         Check("No page numbers collided after renumbering", liveByPage.Count == 3);
     }
+}
+
+async Task TestScanTileTracksWhereTheNextCaptureLands()
+{
+    Console.WriteLine("\n-- The current-scan tile marks where the next capture lands, and inserting numbers the page correctly --");
+    var workDir = TempWorkDir();
+    var dbPath = Path.Combine(workDir, "scantile.db");
+
+    using (var seedDb = new AppDbContext(dbPath))
+    {
+        _ = new CaptureQueueService(seedDb);
+        seedDb.Projects.Add(new Project { Name = "SCANTILE", OutputDirectory = workDir });
+        await seedDb.SaveChangesAsync();
+    }
+
+    var camera = new MicroCapture.Camera.MockCameraService();
+    var vm = new MainWindowViewModel(camera, dbPath);
+    await RunPumped(() => vm.ConnectCommand.ExecuteAsync(null));
+    vm.ProjectCode = "SCANTILE";
+    vm.BatchCode = "SCANTILE";
+    await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
+
+    // Zero pages: the tile is visible, trailing, and points at page 1.
+    Check("Scan tile is visible once a batch is open", vm.ScanTile.IsVisible);
+    Check("Scan tile trails the strip when no insert point is set", !vm.ScanTile.IsInline);
+    Check("Scan tile targets page 1 on an empty batch", vm.ScanTile.TargetPageNumber == 1);
+
+    for (var i = 0; i < 5; i++)
+        await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 5, timeoutMs: 30000);
+
+    Check("Scan tile targets PageCount + 1 after five appends", vm.ScanTile.TargetPageNumber == 6);
+    Check("All five pages render before the trailing scan tile",
+        vm.PagesBeforeScanTile.Count == 5 && vm.PagesAfterScanTile.Count == 0);
+
+    // Set an insert point at page 3.
+    vm.SetInsertPointCommand.Execute(3);
+    Check("Scan tile goes inline when an insert point is set", vm.ScanTile.IsInline);
+    Check("Scan tile targets the chosen page", vm.ScanTile.TargetPageNumber == 3);
+    Check("Strip partitions around the inline scan tile",
+        vm.PagesBeforeScanTile.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2 })
+        && vm.PagesAfterScanTile.Select(t => t.PageNumber).SequenceEqual(new[] { 3, 4, 5 }));
+    Check("The first page after the scan tile suppresses its leading +",
+        vm.PagesAfterScanTile[0].IsFirstAfterScanTile
+        && vm.PagesBeforeScanTile.All(t => !t.IsFirstAfterScanTile));
+
+    // Capture at the insert point — the new page must take number 3, and 3..5 shift to 4..6.
+    await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 6, timeoutMs: 30000);
+
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var live = verify.CaptureJobs.AsNoTracking()
+            .Where(j => j.ProcessingStatus != "Superseded")
+            .OrderBy(j => j.PageNumber).Select(j => j.PageNumber).ToList();
+        Check("The inserted page numbered the batch 1..6 with no gap or collision",
+            live.SequenceEqual(new[] { 1, 2, 3, 4, 5, 6 }));
+    }
+    Check("Insert point advanced past the page just inserted", vm.ScanTile.TargetPageNumber == 4);
+
+    // Delete pages 4..6 — the insert point (now at 4) must clamp back into range.
+    var toDelete = vm.RecentCaptures.Where(t => t.PageNumber >= 4).ToList();
+    await RunPumped(() => vm.DeleteCapturesAsync(toDelete), timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
+    Check("Deleting past the insert point clamps the scan tile back to append",
+        !vm.ScanTile.IsInline && vm.ScanTile.TargetPageNumber == 4);
+
+    // Set an insert point again, then reorder — the reorder must clear it.
+    vm.SetInsertPointCommand.Execute(2);
+    Check("Insert point re-set to page 2", vm.ScanTile.IsInline && vm.ScanTile.TargetPageNumber == 2);
+    var firstId = vm.RecentCaptures[0].JobId;
+    var lastId = vm.RecentCaptures[2].JobId;
+    await RunPumped(() => vm.ReorderCaptureAsync(firstId, lastId), timeoutMs: 30000);
+    Check("A reorder clears the insert point", !vm.ScanTile.IsInline);
+
+    // Closing the batch hides the tile and drops the insert point.
+    vm.SetInsertPointCommand.Execute(2);
+    await RunPumped(() => vm.CloseBatchCommand.ExecuteAsync(null), timeoutMs: 30000);
+    Check("Closing the batch hides the scan tile", !vm.ScanTile.IsVisible);
+    Check("Closing the batch clears the insert point", !vm.ScanTile.IsInline);
+    Check("Closing the batch empties both strip partitions",
+        vm.PagesBeforeScanTile.Count == 0 && vm.PagesAfterScanTile.Count == 0);
 }
 
 async Task TestDeletingAPageRemovesItsFilesAndRenumbers()

@@ -294,6 +294,26 @@
     <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
   </Style>
 
+  <!-- ───────────── Current-scan tile ─────────────
+       A marker for where the next capture lands, not a captured page. Deliberately unlike a
+       page tile: a dashed accent edge and a faintly primary-tinted body so it reads as "this
+       slot is the target" from across the strip, and slightly wider than a page tile so it
+       never passes for one. -->
+  <Style Selector="Border.scanTile">
+    <Setter Property="Background" Value="{DynamicResource PrimaryWashBrush}"/>
+  </Style>
+
+  <!-- The in-flight capture pulse. A gentle opacity breathe rather than motion, so a 400-page
+       session doesn't have something jittering in the corner of the operator's eye. -->
+  <Style Selector="Border.scanPulse">
+    <Style.Animations>
+      <Animation Duration="0:0:1.1" IterationCount="INFINITE" PlaybackDirection="Alternate">
+        <KeyFrame Cue="0%"><Setter Property="Opacity" Value="0.25"/></KeyFrame>
+        <KeyFrame Cue="100%"><Setter Property="Opacity" Value="0.9"/></KeyFrame>
+      </Animation>
+    </Style.Animations>
+  </Style>
+
   <!-- Every button gets a visible focus ring for keyboard-first operation — the app leans on
        Space/R/A shortcuts already, but nothing previously showed which control had focus. -->
   <Style Selector="Button:focus-visible">

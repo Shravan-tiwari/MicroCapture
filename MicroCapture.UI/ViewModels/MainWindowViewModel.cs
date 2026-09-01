@@ -146,6 +146,8 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _openBatchLabel = string.Empty;
     [ObservableProperty] private string _openBatchSettingsLabel = string.Empty;
 
+    partial void OnHasOpenBatchChanged(bool value) => RefreshScanTile();
+
     private void UpdateOpenBatchLabels(Batch? batch)
     {
         if (batch == null)
@@ -256,13 +258,22 @@ public partial class MainWindowViewModel : ViewModelBase
         InsertPointLabel = _insertBeforePage is { } page
             ? $"Next capture will be inserted as page {page}. Later pages shift down to make room."
             : string.Empty;
-        UpdateCaptureReadiness();
+        UpdateCaptureReadiness(); // also refreshes the scan tile
     }
 
     /// <summary>Sets the cart position the next capture will be inserted at.</summary>
     [RelayCommand]
     private void SetInsertPoint(object? pageNumber)
     {
+        // Moving the insert point mid-capture would leave the in-flight page numbered against
+        // the old target while the tile jumps to the new one. The capture itself is already
+        // guarded; block the control that feeds it too.
+        if (Volatile.Read(ref _captureInProgress) != 0)
+        {
+            StatusText = "Wait for the current capture to finish before moving the insert point.";
+            return;
+        }
+
         var page = pageNumber switch
         {
             int i => i,
@@ -271,18 +282,124 @@ public partial class MainWindowViewModel : ViewModelBase
         };
         if (page < 1) return;
 
-        _insertBeforePage = page;
+        // insertAt == PageCount + 1 is just "append" — collapse it to no insert point rather
+        // than carrying a redundant inline state the tile would have to special-case.
+        _insertBeforePage = page > PageCount ? (int?)null : page;
         UpdateInsertPointLabel();
-        StatusText = $"Capturing will insert at page {page}. Press Insert point off to go back to adding at the end.";
+        ScanTileMoved?.Invoke(this, EventArgs.Empty);
+
+        if (_insertBeforePage == null)
+            StatusText = "Capturing will add pages at the end again.";
+        else if (PageCount > RecentCaptures.Count)
+            // A batch longer than the cart window: pages before the visible range still exist,
+            // they just aren't drawn, so the tile sits among the visible pages by number.
+            StatusText = $"Capturing will insert at page {page}. Pages before the visible range of the cart aren't shown.";
+        else
+            StatusText = $"Capturing will insert at page {page}. Press Insert point off to go back to adding at the end.";
     }
 
     [RelayCommand]
     private void ClearInsertPoint()
     {
+        if (Volatile.Read(ref _captureInProgress) != 0)
+        {
+            StatusText = "Wait for the current capture to finish before moving the insert point.";
+            return;
+        }
         if (_insertBeforePage == null) return;
         _insertBeforePage = null;
         UpdateInsertPointLabel();
+        ScanTileMoved?.Invoke(this, EventArgs.Empty);
         StatusText = "Capturing will add pages at the end again.";
+    }
+
+    // ---------- Current-scan tile ----------
+
+    /// <summary>The filmstrip's "current scan" marker — where the next capture will land. Its
+    /// whole state is recomputed by <see cref="RefreshScanTile"/>; nothing else writes to it.</summary>
+    public ScanTileViewModel ScanTile { get; } = new();
+
+    /// <summary>Pages that render BEFORE the scan tile in the strip — everything when the tile is
+    /// trailing, or pages numbered below the insert point when it is inline. Split out into two
+    /// bound collections because the tile sits between them as its own control rather than being
+    /// an item in one list.</summary>
+    public ObservableCollection<ThumbnailItem> PagesBeforeScanTile { get; } = new();
+
+    /// <summary>Pages that render AFTER the scan tile — empty when it is trailing.</summary>
+    public ObservableCollection<ThumbnailItem> PagesAfterScanTile { get; } = new();
+
+    /// <summary>Raised when the scan tile's slot changes (insert point set/cleared, or a capture
+    /// just landed) so the view can scroll it back into sight. Deliberately NOT raised by
+    /// <see cref="RefreshScanTile"/>'s routine updates (live frame, readiness) — those must not
+    /// yank the strip while the operator is looking elsewhere.</summary>
+    public event EventHandler? ScanTileMoved;
+
+    /// <summary>Status of the open batch, snapshotted at open time. The scan tile hides for a
+    /// batch that can no longer be captured into (already exported).</summary>
+    private string? _currentBatchStatus;
+
+    /// <summary>Single owner of the scan tile's truth: recomputes visibility, target page,
+    /// pages-per-shot, inline-vs-trailing, and the live/readiness mirror from current VM state,
+    /// then repartitions the strip around it. Cheap; call after anything that changes an input
+    /// (batch open/close, insert point, frame count, page count, readiness, live-view state,
+    /// delete, reorder).</summary>
+    private void RefreshScanTile()
+    {
+        var open = _currentBatchId != null && HasOpenBatch
+                   && _currentBatchStatus is null or "Active" or "Draft";
+        ScanTile.IsVisible = open;
+
+        if (!open)
+        {
+            ScanTile.IsInline = false;
+            ScanTile.PagesPerShot = 1;
+            RebuildStripPartition();
+            return;
+        }
+
+        // Clamp a stale insert point into range on every refresh. It can fall out of range
+        // when pages it pointed past are deleted, when a reorder renumbers the batch, or when
+        // another machine inserted pages into the same batch folder. insertAt > PageCount
+        // collapses to "append".
+        if (_insertBeforePage is { } raw)
+        {
+            var clamped = Math.Clamp(raw, 1, PageCount + 1);
+            _insertBeforePage = clamped > PageCount ? (int?)null : clamped;
+            if (clamped != raw)
+            {
+                HasInsertPoint = _insertBeforePage.HasValue;
+                InsertPointLabel = _insertBeforePage is { } p2
+                    ? $"Next capture will be inserted as page {p2}. Later pages shift down to make room."
+                    : string.Empty;
+            }
+        }
+
+        ScanTile.PagesPerShot = Frames.Count > 0 ? Frames.Count : 1;
+        ScanTile.IsInline = _insertBeforePage is { } p && p <= PageCount;
+        ScanTile.TargetPageNumber = _insertBeforePage ?? (PageCount + 1);
+        ScanTile.LivePreview = LiveViewImage;
+        ScanTile.IsLiveActive = IsLiveViewActive;
+        ScanTile.Readiness = CaptureReadiness;
+
+        RebuildStripPartition();
+    }
+
+    /// <summary>Splits <see cref="RecentCaptures"/> into the before/after halves the view binds
+    /// around the scan tile, and flags the first page after the tile so the template can
+    /// suppress the redundant "+" that would set the insert point to where the tile already is.</summary>
+    private void RebuildStripPartition()
+    {
+        var splitAt = ScanTile.IsInline ? ScanTile.TargetPageNumber : int.MaxValue;
+
+        PagesBeforeScanTile.Clear();
+        PagesAfterScanTile.Clear();
+        foreach (var tile in RecentCaptures)
+        {
+            tile.IsFirstAfterScanTile = false;
+            (tile.PageNumber < splitAt ? PagesBeforeScanTile : PagesAfterScanTile).Add(tile);
+        }
+        if (PagesAfterScanTile.Count > 0)
+            PagesAfterScanTile[0].IsFirstAfterScanTile = true;
     }
 
     /// <summary>Makes room at <paramref name="insertAt"/> by moving that page and every later one
@@ -354,17 +471,32 @@ public partial class MainWindowViewModel : ViewModelBase
 
         RecentCaptures.Move(from, to);
 
+        // A reorder renumbers the whole batch, so an insert point set against the old numbering
+        // would now point at a different page. Clear it rather than silently retarget.
+        var hadInsertPoint = _insertBeforePage != null;
+        if (hadInsertPoint)
+        {
+            _insertBeforePage = null;
+            UpdateInsertPointLabel();
+        }
+
         try
         {
             await RenumberBatchSequentiallyAsync();
             await PublishManifestAsync();
-            StatusText = $"Moved page to position {to + 1}";
+            StatusText = hadInsertPoint
+                ? $"Moved page to position {to + 1}. Insert point cleared — pages were renumbered."
+                : $"Moved page to position {to + 1}";
         }
         catch (Exception ex)
         {
             // Put the cart back rather than leaving the display disagreeing with the database.
             RecentCaptures.Move(to, from);
             StatusText = $"Could not reorder pages: {ex.Message}";
+        }
+        finally
+        {
+            RefreshScanTile();
         }
     }
 
@@ -906,6 +1038,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _ = HydrateLastUsedCaptureFormatAsync();
         InitializeFrameTracking();
+
+        // The scan tile sits between two slices of RecentCaptures; keep those slices in step
+        // with every add/remove/clear. Individual tiles' PageNumber changes (from a shift or
+        // renumber) are followed by the explicit RefreshScanTile calls at those sites.
+        RecentCaptures.CollectionChanged += (_, _) => RebuildStripPartition();
     }
 
     /// <summary>Sets SelectedCaptureFormat's initial value from whatever format the most
@@ -945,6 +1082,10 @@ public partial class MainWindowViewModel : ViewModelBase
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "AUTO CAPTURE ACTIVE" : "WAITING FOR DOCUMENT";
         else
             CaptureReadiness = DocumentStatus.StartsWith("✓") ? "READY TO CAPTURE" : "WAITING FOR DOCUMENT";
+
+        // The scan tile's border mirrors readiness. Guarded against the design-time ctor, which
+        // never constructs ScanTile-dependent state.
+        RefreshScanTile();
     }
 
     /// <summary>Projects the drawn frames into 0..1 fractions of the frame they were authored
@@ -1517,6 +1658,11 @@ public partial class MainWindowViewModel : ViewModelBase
         _activeBatchCode = batch.BatchCode;
         _outputDirectory = batch.Project?.OutputDirectory ?? _outputDirectory;
         _currentBatchId = batch.Id;
+        _currentBatchStatus = batch.Status;
+        // The insert point is session-local and never persisted; a value left over from a
+        // previously open batch must not carry into this one.
+        _insertBeforePage = null;
+        UpdateInsertPointLabel();
         // Highest live page number — Superseded rows (deleted pages, retired recapture attempts)
         // are excluded so a reopened batch doesn't resurrect a count higher than the pages it
         // actually holds, and the next capture doesn't skip a number.
@@ -1571,6 +1717,7 @@ public partial class MainWindowViewModel : ViewModelBase
         UpdateOpenBatchLabels(batch);
         await LoadRecentCapturesFromBatchAsync(batch);
         await RefreshFrameEditPermissionAsync();
+        RefreshScanTile();
     }
 
     /// <summary>Opens the Recent Batches picker and, if the operator picks one, reopens it —
@@ -1651,16 +1798,20 @@ public partial class MainWindowViewModel : ViewModelBase
             var closed = _activeBatchCode;
             _currentBatchId = null;
             _currentBatchFolder = null;
+            _currentBatchStatus = null;
             _activeBatchCode = string.Empty;
             _activeProjectCode = string.Empty;
             ProjectCode = string.Empty;
             BatchCode = string.Empty;
             PageCount = 0;
+            _insertBeforePage = null;
+            UpdateInsertPointLabel();
 
             foreach (var thumbnail in RecentCaptures) thumbnail.Thumbnail?.Dispose();
             RecentCaptures.Clear();
             OnPropertyChanged(nameof(SelectedCount));
             OnPropertyChanged(nameof(HasSelection));
+            RefreshScanTile();
 
             // A new batch starts with a clean history; undoing into a batch that is no longer
             // open would reprocess pages the operator can't see.
@@ -2115,6 +2266,8 @@ public partial class MainWindowViewModel : ViewModelBase
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{pageStr}";
 
         StatusText = $"Capturing page{(frameCount > 0 ? "s" : "")} ...";
+        ScanTile.IsCapturing = true;
+        RefreshScanTile();
         try
         {
             var captureDirectory = CaptureDirectory;
@@ -2151,8 +2304,12 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             else
             {
-                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, PageCount, SelectedCaptureFormat, SelectedDpi, rotationDegrees: LiveViewRotation);
-                AddThumbnail(job.Id, filePath, PageCount);
+                // firstPageNumber, NOT PageCount: with an insert point set, firstPageNumber is
+                // the chosen slot while PageCount has already been bumped past the tail by
+                // ShiftPagesForInsertAsync — using PageCount here numbered an inserted page at
+                // the end of the batch, so it landed nowhere near where the operator asked.
+                var job = await _queueService.EnqueueCaptureAsync(_currentBatchId, filePath, firstPageNumber, SelectedCaptureFormat, SelectedDpi, rotationDegrees: LiveViewRotation);
+                AddThumbnail(job.Id, filePath, firstPageNumber);
             }
 
             // A job is now queued under the current geometry — lock frame editing until it lands.
@@ -2170,15 +2327,31 @@ public partial class MainWindowViewModel : ViewModelBase
             // Arm the next shot only after another page turn is observed.
             _sawPageTurnSinceCapture = false;
 
+            // Bring the scan tile back into view after any capture — append or insert. The
+            // append case also fires CartAppended from AddThumbnail, but an inserted page does
+            // not, and the operator still needs to see where the run is landing.
+            ScanTileMoved?.Invoke(this, EventArgs.Empty);
+
             StatusText = $"Page{(frameCount > 0 ? "s" : "")} captured — {Path.GetFileName(filePath)}";
         }
         catch (Exception ex)
         {
             StatusText = $"Capture failed: {ex.Message}";
-            PageCount = firstPageNumber - 1; // Revert count
+            // Only safe to rewind the count for a plain append. An insert already committed a
+            // page-number shift (and moved DB rows) in ShiftPagesForInsertAsync; a failed
+            // capture there leaves a one-shot numbering gap that the next delete/reorder's
+            // RenumberBatchSequentiallyAsync closes — cheaper and safer than trying to
+            // un-shift rows the background worker may already be reading.
+            if (_insertBeforePage == null)
+                PageCount = firstPageNumber - 1;
         }
         }
-        finally { Volatile.Write(ref _captureInProgress, 0); }
+        finally
+        {
+            Volatile.Write(ref _captureInProgress, 0);
+            ScanTile.IsCapturing = false;
+            RefreshScanTile();
+        }
     }
 
     [RelayCommand]
@@ -2201,6 +2374,10 @@ public partial class MainWindowViewModel : ViewModelBase
         var prefix = $"{_activeProjectCode}_{_activeBatchCode}_{firstPageInSet.ToString("D6")}_R";
 
         StatusText = $"Recapturing page{(pagesInSet > 1 ? "s" : "")} {pageStr}...";
+        // Recapture redoes the pages just shot; it ignores any insert point. The tile keeps its
+        // slot but pulses so the operator sees the shutter fired.
+        ScanTile.IsCapturing = true;
+        RefreshScanTile();
         try
         {
             // Supersede all pages in this frame set
@@ -2265,7 +2442,12 @@ public partial class MainWindowViewModel : ViewModelBase
             StatusText = $"Recapture failed: {ex.Message}";
         }
         }
-        finally { Volatile.Write(ref _captureInProgress, 0); }
+        finally
+        {
+            Volatile.Write(ref _captureInProgress, 0);
+            ScanTile.IsCapturing = false;
+            RefreshScanTile();
+        }
     }
 
     [RelayCommand]
@@ -2451,6 +2633,11 @@ public partial class MainWindowViewModel : ViewModelBase
         // of which lives only in the local database until this runs. Without it a reopened batch
         // reads as still Active and reports every page's original as missing from disk.
         await PublishManifestAsync();
+
+        // The batch can no longer be captured into until it is explicitly reopened — hide the
+        // scan tile so it doesn't imply otherwise.
+        _currentBatchStatus = "Exported";
+        RefreshScanTile();
 
         StatusText = result.MissingOcrText
             ? $"Exported: {Path.GetFileName(result.ExportPath)} — no searchable text layer (Tesseract OCR unavailable or failed)."
@@ -2718,6 +2905,9 @@ public partial class MainWindowViewModel : ViewModelBase
             // rather than treating the new layout as "same page already shot".
             _lastCapturedSignature = null;
             _stableFrameCount = 0;
+
+            // The scan tile's "Next: N pages (frames)" badge tracks Frames.Count.
+            RefreshScanTile();
         };
     }
 
@@ -2802,6 +2992,22 @@ public partial class MainWindowViewModel : ViewModelBase
         // Until a reference is pinned, the editor's coordinate space follows the live feed.
         if (FrameReferenceWidth <= 0 || FrameReferenceHeight <= 0)
             OnPropertyChanged(nameof(FrameReferenceSize));
+
+        // This fires once per live frame — take the cheap path (just hand the bitmap over)
+        // rather than a full RefreshScanTile, which does clamping and partition work that
+        // nothing here changed.
+        ScanTile.LivePreview = value;
+    }
+
+    partial void OnIsLiveViewActiveChanged(bool value)
+    {
+        ScanTile.IsLiveActive = value;
+    }
+
+    partial void OnPageCountChanged(int value)
+    {
+        // The append target is PageCount + 1, so the tile's label follows the tail.
+        RefreshScanTile();
     }
 
     /// <summary>Full-resolution capture dimensions, learned from the first capture of the
@@ -3253,6 +3459,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
         await PublishManifestAsync();
 
+        // Deleting pages renumbered the batch — an insert point that pointed past the deleted
+        // range is now stale. RefreshScanTile clamps it back into [1, PageCount+1].
+        RefreshScanTile();
+
         StatusText = jobIds.Count == 1
             ? $"Page {lastPageNumber:D6} removed."
             : $"{jobIds.Count} pages removed.";
@@ -3358,6 +3568,11 @@ public partial class ThumbnailItem : ObservableObject
     // Selected) — toggled via ctrl/shift-click, independent of the plain-click "open Crop
     // Review" action.
     [ObservableProperty] private bool _isSelected;
+
+    /// <summary>True for the first page rendered immediately after the inline scan tile. The
+    /// leading "+" on that tile would set the insert point to where the scan tile already is,
+    /// so the template hides it. Set by <c>RebuildStripPartition</c>.</summary>
+    [ObservableProperty] private bool _isFirstAfterScanTile;
 }
 
 public partial class CameraControlItem : ObservableObject

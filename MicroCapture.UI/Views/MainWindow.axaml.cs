@@ -56,6 +56,11 @@ public partial class MainWindow : Window
             // what they just shot.
             viewModel.CartAppended -= OnCartAppended;
             viewModel.CartAppended += OnCartAppended;
+
+            // Bring the current-scan tile back into view when the operator moves the insert
+            // point, or after a capture lands (append or insert).
+            viewModel.ScanTileMoved -= OnScanTileMoved;
+            viewModel.ScanTileMoved += OnScanTileMoved;
         }
 
         var editor = this.FindControl<FixedFrameOverlayEditor>("FixedFrameOverlay");
@@ -78,6 +83,28 @@ public partial class MainWindow : Window
         {
             var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
             scroller?.ScrollToEnd();
+        }, Avalonia.Threading.DispatcherPriority.Background);
+    }
+
+    /// <summary>Centres the current-scan tile in the filmstrip. Raised only on an explicit
+    /// insert-point change or right after a capture — never on the tile's routine live-frame /
+    /// readiness updates, which must not move the strip while the operator is looking elsewhere.
+    /// Uses the tile's real rendered bounds rather than a fixed per-tile stride, because the
+    /// scan tile is wider than a page tile.</summary>
+    private void OnScanTileMoved(object? sender, EventArgs e)
+    {
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
+            var tile = this.FindControl<ContentControl>("ScanTilePresenter");
+            if (scroller?.Content is not Visual content || tile is null || !tile.IsVisible) return;
+
+            var originX = tile.TranslatePoint(new Point(0, 0), content)?.X;
+            if (originX is not { } x) return;
+
+            var target = x - (scroller.Viewport.Width - tile.Bounds.Width) / 2;
+            var maximum = Math.Max(0, scroller.Extent.Width - scroller.Viewport.Width);
+            scroller.Offset = scroller.Offset.WithX(Math.Clamp(target, 0, maximum));
         }, Avalonia.Threading.DispatcherPriority.Background);
     }
 
