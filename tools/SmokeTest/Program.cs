@@ -2160,9 +2160,15 @@ async Task TestLiveViewRotationAppliesToNewCapturesOnly()
         // Right cycles forward, left cycles back, and both wrap — no 360°, no -90.
         vm.RotateLiveViewLeftCommand.Execute(null);
         Check($"Rotating left from upright wraps to 270 (got {vm.LiveViewRotation})", vm.LiveViewRotation == 270);
+        Check($"270° in radians is 3π/2 for the overlay's counter-rotation (got {vm.LiveViewRotationRadians:F4})",
+            Math.Abs(vm.LiveViewRotationRadians - 3 * Math.PI / 2) < 1e-9);
         vm.RotateLiveViewRightCommand.Execute(null);
         Check($"Rotating right returns to upright (got {vm.LiveViewRotation})", vm.LiveViewRotation == 0);
-        Check("No badge is shown while upright", !vm.IsLiveViewRotated);
+        // The degree box is always on screen now, 0° included; IsLiveViewRotated only tells the
+        // rest of the UI whether the view is *turned*, and the label always reads the current angle.
+        Check("Upright is not flagged as rotated", !vm.IsLiveViewRotated);
+        Check($"The label still reads the angle at 0° ({vm.LiveViewRotationLabel})", vm.LiveViewRotationLabel == "0°");
+        Check($"0° is 0 radians (got {vm.LiveViewRotationRadians})", vm.LiveViewRotationRadians == 0);
 
         // Two pages shot upright.
         for (var i = 0; i < 2; i++)

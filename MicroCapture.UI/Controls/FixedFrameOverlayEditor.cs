@@ -64,6 +64,9 @@ public class FixedFrameOverlayEditor : Control
     public static readonly StyledProperty<bool> IsEditingEnabledProperty =
         AvaloniaProperty.Register<FixedFrameOverlayEditor, bool>(nameof(IsEditingEnabled), defaultValue: true);
 
+    public static readonly StyledProperty<double> ViewRotationRadiansProperty =
+        AvaloniaProperty.Register<FixedFrameOverlayEditor, double>(nameof(ViewRotationRadians));
+
     /// <summary>The authoritative frame list, in the pixel space of <see cref="SourceImageSize"/>.
     /// Index order is page order — it drives output filenames — so this control never reorders it.</summary>
     public ObservableCollection<FixedFrameRect>? Frames
@@ -104,6 +107,15 @@ public class FixedFrameOverlayEditor : Control
         set => SetValue(IsEditingEnabledProperty, value);
     }
 
+    /// <summary>How far the live view (and this overlay with it) is rotated, in radians clockwise.
+    /// The frames themselves ride that rotation so they stay glued to the page; the number badge
+    /// and the size readout are counter-rotated by this much so their text stays upright.</summary>
+    public double ViewRotationRadians
+    {
+        get => GetValue(ViewRotationRadiansProperty);
+        set => SetValue(ViewRotationRadiansProperty, value);
+    }
+
     /// <summary>Raised when an edit is complete and worth persisting.</summary>
     public event EventHandler<FrameEditKind>? EditCommitted;
 
@@ -128,7 +140,7 @@ public class FixedFrameOverlayEditor : Control
 
     static FixedFrameOverlayEditor()
     {
-        AffectsRender<FixedFrameOverlayEditor>(FramesProperty, SourceImageSizeProperty, SelectedFrameIndexProperty, IsEditingEnabledProperty);
+        AffectsRender<FixedFrameOverlayEditor>(FramesProperty, SourceImageSizeProperty, SelectedFrameIndexProperty, IsEditingEnabledProperty, ViewRotationRadiansProperty);
         // The overlay's geometry is derived from its own bounds (the live feed is Uniform-scaled
         // inside them), so a window resize has to repaint it as well.
         AffectsRender<FixedFrameOverlayEditor>(BoundsProperty);
@@ -407,8 +419,9 @@ public class FixedFrameOverlayEditor : Control
             // Every frame carries its number, not just the selected one. Frame order decides
             // output page order, so which frame is which is exactly what the operator needs to
             // read at a glance — and colour alone can't say it when a batch has more frames than
-            // the palette has entries.
-            DrawFrameNumber(context, displayRect, i + 1, color);
+            // the palette has entries. Counter-rotated so it stays upright while the frame turns.
+            using (PushUprightText(context, new Point(displayRect.X + 3, displayRect.Y + 3)))
+                DrawFrameNumber(context, displayRect, i + 1, color);
 
             if (!IsEditingEnabled) continue;
 
@@ -421,7 +434,8 @@ public class FixedFrameOverlayEditor : Control
             if (isSelected)
             {
                 DrawRemoveBadge(context, BadgeCenter(rect, imgRect, scale), color);
-                DrawSizeReadout(context, rect, displayRect);
+                using (PushUprightText(context, new Point(displayRect.X + 4, displayRect.Y + 4)))
+                    DrawSizeReadout(context, rect, displayRect);
             }
         }
 
@@ -435,8 +449,24 @@ public class FixedFrameOverlayEditor : Control
                 new SolidColorBrush(Color.FromArgb(40, color.R, color.G, color.B)),
                 new Pen(new SolidColorBrush(color), 2, new DashStyle(new double[] { 4, 3 }, 0)),
                 bandRect);
-            DrawSizeReadout(context, band, bandRect);
+            using (PushUprightText(context, new Point(bandRect.X + 4, bandRect.Y + 4)))
+                DrawSizeReadout(context, band, bandRect);
         }
+    }
+
+    /// <summary>Pushes a transform that rotates the coming draw calls by the negative of the view
+    /// rotation, about <paramref name="pivot"/> — so a label painted while the overlay is turned
+    /// still reads upright, hinged at the frame corner it belongs to. A no-op push at 0°.</summary>
+    private DrawingContext.PushedState PushUprightText(DrawingContext context, Point pivot)
+    {
+        var angle = ViewRotationRadians;
+        if (angle == 0)
+            return context.PushTransform(Matrix.Identity);
+
+        var m = Matrix.CreateTranslation(-pivot.X, -pivot.Y)
+              * Matrix.CreateRotation(-angle)
+              * Matrix.CreateTranslation(pivot.X, pivot.Y);
+        return context.PushTransform(m);
     }
 
     /// <summary>Draws a frame's 1-based number in its top-left corner, on the frame's own colour

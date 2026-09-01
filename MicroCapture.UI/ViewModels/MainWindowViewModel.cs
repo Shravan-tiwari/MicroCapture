@@ -71,11 +71,17 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(IsLiveViewRotated))]
     [NotifyPropertyChangedFor(nameof(LiveViewRotationLabel))]
+    [NotifyPropertyChangedFor(nameof(LiveViewRotationRadians))]
     private int _liveViewRotation;
 
     public bool IsLiveViewRotated => LiveViewRotation != 0;
 
+    // Shown at every angle, 0° included, so the orientation is never a silent mode — the operator
+    // can always read which way is up, and the "0°" state is explicit rather than an absence.
     public string LiveViewRotationLabel => $"{LiveViewRotation}°";
+
+    /// <summary>Rotation in radians, for the overlay's counter-rotation of on-frame text.</summary>
+    public double LiveViewRotationRadians => LiveViewRotation * Math.PI / 180.0;
 
     [RelayCommand]
     private void RotateLiveViewLeft() => SetLiveViewRotation(LiveViewRotation - 90);

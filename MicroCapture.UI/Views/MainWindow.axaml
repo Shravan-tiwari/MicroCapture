@@ -89,11 +89,10 @@
                         <Button Classes="ghost" Content="↻" FontSize="18" Padding="9,2"
                                 Command="{Binding RotateLiveViewRightCommand}"
                                 ToolTip.Tip="Rotate the live view 90° right. New captures are saved this way up; pages already captured are left alone."/>
-                        <!-- Shown only when rotated, so an orientation that silently applies to
-                             every capture can never be an invisible mode. -->
+                        <!-- Always shown, 0° included, so the orientation is never an invisible
+                             mode — the operator can always read which way is up. -->
                         <Border Background="{DynamicResource PrimaryWashBrush}" CornerRadius="5"
-                                Padding="6,2" VerticalAlignment="Center" Margin="2,0,0,0"
-                                IsVisible="{Binding IsLiveViewRotated}">
+                                Padding="6,2" VerticalAlignment="Center" Margin="2,0,0,0">
                             <TextBlock Text="{Binding LiveViewRotationLabel}" FontSize="11"
                                        FontWeight="SemiBold" Foreground="{DynamicResource PrimaryHoverBrush}"/>
                         </Border>
@@ -124,41 +123,45 @@
                     BorderBrush="{DynamicResource HairlineBrush}" BorderThickness="1"
                     IsVisible="{Binding IsShowingLiveView}">
                 <Grid Name="LiveViewContainer">
-                    <!-- Only the camera image rotates. The frames deliberately do not: they
-                         stay exactly where they were drawn, at the size and in the order they
-                         were drawn, and rotating the view never moves or renumbers one.
-
-                         Consequence worth knowing: a frame is stored in the capture's own
-                         unrotated coordinates and the crop is taken before the rotation is
-                         applied, so with the view turned, a frame selects the region it covers
-                         on the *unrotated* page rather than the one under it on screen. Draw
-                         frames with the view upright, or set the orientation first.
+                    <!-- The camera image and the fixed-frame overlay rotate together, as one
+                         unit, so a frame drawn upright still lands on the same page region once
+                         the view is turned — and the on-screen frame matches exactly what the
+                         crop takes (the crop is done in the capture's unrotated coordinates and
+                         the whole crop is then rotated, so frame and result stay in step). Only
+                         the number badge and size readout inside the overlay are counter-rotated,
+                         so their text stays upright at every angle.
 
                          LayoutTransformControl rather than a RenderTransform because layout has
                          to follow: at 90° the image is measured tall-in-a-wide-box, so a
-                         portrait page fills the area instead of overflowing and being clipped. -->
-                    <!-- Centred explicitly. A LayoutTransformControl left to stretch reports the
-                         rotated bounds but keeps the child anchored at the untransformed origin,
-                         so at 90° the image sat off to one side of the panel instead of in the
-                         middle of it. -->
+                         portrait page fills the area instead of overflowing and being clipped.
+                         Centred explicitly — a LayoutTransformControl left to stretch reports the
+                         rotated bounds but keeps its child at the untransformed origin, so at 90°
+                         the image sat off to one side of the panel. -->
                     <LayoutTransformControl Name="LiveViewRotator"
                                             HorizontalAlignment="Center" VerticalAlignment="Center">
                         <LayoutTransformControl.LayoutTransform>
                             <RotateTransform Angle="{Binding LiveViewRotation}"/>
                         </LayoutTransformControl.LayoutTransform>
-                        <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
-                    </LayoutTransformControl>
+                        <!-- Image and overlay share these bounds, so the overlay's Uniform
+                             letterbox math lands on the same rect the image is drawn in. -->
+                        <Grid>
+                            <Image Name="LiveViewImageControl" Source="{Binding LiveViewImage}" Stretch="Uniform" IsHitTestVisible="False" />
 
-                    <!-- Overlay: interactive fixed frames drawn straight onto the live view.
-                         Drag empty space to create one, drag a frame to move it, its handles to
-                         resize, and the × badge (or DEL) to remove it — no modal, no calibration
-                         shot, editable at any time. -->
-                    <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
-                            Frames="{Binding Frames}"
-                            SourceImageSize="{Binding FrameReferenceSize}"
-                            CaptureImageSize="{Binding CaptureImageSize}"
-                            SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
-                            IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
+                            <!-- Overlay: interactive fixed frames drawn straight onto the live
+                                 view. Drag empty space to create one, drag a frame to move it,
+                                 its handles to resize, and the × badge (or DEL) to remove it — no
+                                 modal, no calibration shot, editable at any time. Pointer events
+                                 are delivered in the overlay's own (unrotated) space by Avalonia,
+                                 so the drag math is unaffected by the rotation above it. -->
+                            <controls:FixedFrameOverlayEditor Name="FixedFrameOverlay"
+                                    Frames="{Binding Frames}"
+                                    SourceImageSize="{Binding FrameReferenceSize}"
+                                    CaptureImageSize="{Binding CaptureImageSize}"
+                                    ViewRotationRadians="{Binding LiveViewRotationRadians}"
+                                    SelectedFrameIndex="{Binding SelectedFrameIndex, Mode=TwoWay}"
+                                    IsEditingEnabled="{Binding AreFrameEditsAllowed}"/>
+                        </Grid>
+                    </LayoutTransformControl>
 
                     <!-- Overlay: readiness badge -->
                     <Border Background="{DynamicResource ScrimBrush}" HorizontalAlignment="Left" VerticalAlignment="Top"
