@@ -356,60 +356,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
-            _dbContext.ChangeTracker.Clear();
-            var jobs = await _dbContext.CaptureJobs
-                .Where(j => j.BatchId == _currentBatchId)
-                .ToListAsync();
-
-            // Old page number -> every job on that page, retired attempts included.
-            var byOldPage = jobs.GroupBy(j => j.PageNumber).ToDictionary(g => g.Key, g => g.ToList());
-
-            // The cart shows at most the last MaxCartLoad pages, so renumbering only what it
-            // holds would leave every page outside it on its old number — two jobs per number,
-            // colliding filenames, and the next capture overwriting an existing page. Build the
-            // full batch order instead: pages before the visible window keep their relative
-            // order, then the cart's order as the operator just arranged it.
-            var visiblePages = RecentCaptures.Select(t => t.PageNumber).ToHashSet();
-            var hiddenPagesInOrder = byOldPage.Keys.Where(p => !visiblePages.Contains(p)).OrderBy(p => p).ToList();
-            var fullOrder = hiddenPagesInOrder.Concat(RecentCaptures.Select(t => t.PageNumber)).ToList();
-
-            var renames = new List<(string From, string To)>();
-            var newPageByOld = new Dictionary<int, int>();
-            var newPage = 1;
-            foreach (var oldPage in fullOrder)
-            {
-                if (!byOldPage.ContainsKey(oldPage)) continue;
-                newPageByOld[oldPage] = newPage;
-
-                if (oldPage != newPage)
-                {
-                    var oldThumb = ThumbnailFileFor(_activeBatchCode, oldPage);
-                    var newThumb = ThumbnailFileFor(_activeBatchCode, newPage);
-                    if (File.Exists(oldThumb)) renames.Add((oldThumb, newThumb));
-                }
-                newPage++;
-            }
-
-            // Applied after the mapping is complete, so a page never reads a number another page
-            // has already overwritten.
-            foreach (var (oldPage, pageJobs) in byOldPage)
-            {
-                if (!newPageByOld.TryGetValue(oldPage, out var assigned)) continue;
-                foreach (var job in pageJobs) job.PageNumber = assigned;
-            }
-            foreach (var thumbnail in RecentCaptures)
-            {
-                if (newPageByOld.TryGetValue(thumbnail.PageNumber, out var assigned))
-                    thumbnail.PageNumber = assigned;
-            }
-
-            await _dbContext.SaveChangesAsync();
-            MoveThumbnailFiles(renames);
-
-            // Across the whole batch, not just the cart — otherwise a batch longer than the cart
-            // window reports a page count lower than pages that actually exist, and the next
-            // capture reuses a live page number.
-            PageCount = newPageByOld.Count == 0 ? 0 : newPageByOld.Values.Max();
+            await RenumberBatchSequentiallyAsync();
             await PublishManifestAsync();
             StatusText = $"Moved page to position {to + 1}";
         }
@@ -419,6 +366,81 @@ public partial class MainWindowViewModel : ViewModelBase
             RecentCaptures.Move(to, from);
             StatusText = $"Could not reorder pages: {ex.Message}";
         }
+    }
+
+    /// <summary>Renumbers every page in the batch to a gap-free 1..N run that matches the cart's
+    /// current visual order, renaming the page-numbered thumbnail files and recomputing
+    /// <see cref="PageCount"/> to match. Shared by drag-reorder and by delete — both leave the
+    /// cart in the order the batch should read and then need the stored <see cref="CaptureJob.PageNumber"/>
+    /// (which is the only sort key there is) brought back in line with it.
+    ///
+    /// <para>Every job sharing a page number is moved together — a Superseded recapture attempt
+    /// included — or a retired attempt would be left pointing at whatever page later takes its
+    /// old number and could resurface in an export. Thumbnails are renamed via temporary names
+    /// because the renumber permutes numbers that are all still in use.</para></summary>
+    private async Task RenumberBatchSequentiallyAsync()
+    {
+        if (_currentBatchId == null) return;
+
+        _dbContext.ChangeTracker.Clear();
+        var jobs = await _dbContext.CaptureJobs
+            .Where(j => j.BatchId == _currentBatchId)
+            .ToListAsync();
+        if (jobs.Count == 0)
+        {
+            PageCount = 0;
+            return;
+        }
+
+        // Old page number -> every job on that page, retired attempts included.
+        var byOldPage = jobs.GroupBy(j => j.PageNumber).ToDictionary(g => g.Key, g => g.ToList());
+
+        // The cart shows at most the last MaxCartLoad pages, so renumbering only what it holds
+        // would leave every page outside it on its old number — two jobs per number, colliding
+        // filenames, and the next capture overwriting an existing page. Build the full batch
+        // order instead: pages before the visible window keep their relative order, then the
+        // cart's order as it currently stands.
+        var visiblePages = RecentCaptures.Select(t => t.PageNumber).ToHashSet();
+        var hiddenPagesInOrder = byOldPage.Keys.Where(p => !visiblePages.Contains(p)).OrderBy(p => p).ToList();
+        var fullOrder = hiddenPagesInOrder.Concat(RecentCaptures.Select(t => t.PageNumber)).ToList();
+
+        var renames = new List<(string From, string To)>();
+        var newPageByOld = new Dictionary<int, int>();
+        var newPage = 1;
+        foreach (var oldPage in fullOrder)
+        {
+            if (!byOldPage.ContainsKey(oldPage) || newPageByOld.ContainsKey(oldPage)) continue;
+            newPageByOld[oldPage] = newPage;
+
+            if (oldPage != newPage)
+            {
+                var oldThumb = ThumbnailFileFor(_activeBatchCode, oldPage);
+                var newThumb = ThumbnailFileFor(_activeBatchCode, newPage);
+                if (File.Exists(oldThumb)) renames.Add((oldThumb, newThumb));
+            }
+            newPage++;
+        }
+
+        // Applied after the mapping is complete, so a page never reads a number another page has
+        // already overwritten.
+        foreach (var (oldPage, pageJobs) in byOldPage)
+        {
+            if (!newPageByOld.TryGetValue(oldPage, out var assigned)) continue;
+            foreach (var job in pageJobs) job.PageNumber = assigned;
+        }
+        foreach (var thumbnail in RecentCaptures)
+        {
+            if (newPageByOld.TryGetValue(thumbnail.PageNumber, out var assigned))
+                thumbnail.PageNumber = assigned;
+        }
+
+        await _dbContext.SaveChangesAsync();
+        MoveThumbnailFiles(renames);
+
+        // Across the whole batch, not just the cart — otherwise a batch longer than the cart
+        // window reports a page count lower than pages that actually exist, and the next capture
+        // reuses a live page number.
+        PageCount = newPageByOld.Count == 0 ? 0 : newPageByOld.Values.Max();
     }
 
     /// <summary>Applies thumbnail renames via temporary names. A reorder permutes numbers that are
@@ -1495,7 +1517,14 @@ public partial class MainWindowViewModel : ViewModelBase
         _activeBatchCode = batch.BatchCode;
         _outputDirectory = batch.Project?.OutputDirectory ?? _outputDirectory;
         _currentBatchId = batch.Id;
-        PageCount = batch.Captures.Count > 0 ? batch.Captures.Max(c => c.PageNumber) : 0;
+        // Highest live page number — Superseded rows (deleted pages, retired recapture attempts)
+        // are excluded so a reopened batch doesn't resurrect a count higher than the pages it
+        // actually holds, and the next capture doesn't skip a number.
+        var livePageNumbers = batch.Captures
+            .Where(c => c.ProcessingStatus != "Superseded")
+            .Select(c => c.PageNumber)
+            .ToList();
+        PageCount = livePageNumbers.Count > 0 ? livePageNumbers.Max() : 0;
         // These assignments hydrate the observable properties FROM the already-saved batch
         // row — without suppression, each one's OnXChanged would immediately
         // PersistBatchSettingAsync straight back to the very row it was just read from
@@ -3097,49 +3126,71 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Removes a mistakenly captured page: marks it Superseded (excluded from processing and
-    /// export, same as a recapture) and drops it from the thumbnail strip. The original file
-    /// is left on disk — consistent with how a recapture already preserves prior attempts —
-    /// but any processed derivative is deleted since it would otherwise sit unused forever.
+    /// Permanently removes a captured page from the batch. The confirm dialog tells the operator
+    /// this cannot be undone, so it is a hard delete on every level: the database rows for the
+    /// page and its whole recapture history are removed (not marked Superseded), the original
+    /// capture file and every processed derivative and the cached thumbnail are deleted from the
+    /// batch folder, and the remaining pages are renumbered to a gap-free 1..N run so both the
+    /// per-tile page numbers and the PAGE count stay correct. The manifest is republished so
+    /// another machine opening the folder sees the same result.
     /// Called from MainWindow.axaml.cs's delete button on each thumbnail.
     /// </summary>
     public async Task DeleteCaptureAsync(ThumbnailItem item)
     {
-        await _queueService.DeleteCaptureAsync(item.JobId);
-        // Keep the folder's own record in step, so the deletion is what another machine sees too
-        // rather than the page reappearing when the batch is opened elsewhere.
-        await PublishManifestAsync();
+        var removedJobs = await _queueService.PurgeCaptureAsync(item.JobId);
 
-        // Deleting the most recently captured page is effectively "undo that shot" — the next
-        // real capture should reuse its page number, not leave a permanent gap. Deleting an
-        // earlier page in the batch is different: PageCount must stay put, since decrementing
-        // it would make the next capture collide with a page number that's still in use.
-        // (A gap from deleting a non-tail page is harmless — export renumbers sequentially.)
-        if (item.PageNumber == PageCount)
-            PageCount--;
+        // Which original capture files are now unreferenced. A fixed-frame shot produces several
+        // jobs from one source image, so an original is only safe to delete once no surviving
+        // job still points at it. Recapture attempts have their own "_R_" originals, each
+        // referenced by exactly one (now-removed) job.
+        var removedOriginals = removedJobs
+            .Select(j => j.OriginalFilePath)
+            .Concat(new[] { item.FilePath })
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(Path.GetFullPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        try
+        var stillReferenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_currentBatchId != null)
         {
-            // Processed derivatives now live in the main capture folder alongside the (still-
-            // retained) original, not a separate "Processed" subfolder — target that folder, but
-            // skip the original itself so this cleanup never removes the file the doc comment
-            // above promises to leave on disk. Use the boundary-aware derivative matcher, not a
-            // raw "{baseName}*" glob: a recapture's own original ("{baseName}_R_{timestamp}.jpg")
-            // is a literal prefix-match of the page it recaptures and must never be deleted here.
-            var processedDir = MicroCapture.Processing.ProcessedFilePaths.OutputDirectoryFor(item.FilePath);
-            foreach (var derivative in MicroCapture.Processing.ProcessedFilePaths.EnumerateDerivatives(processedDir, item.FilePath))
+            _dbContext.ChangeTracker.Clear();
+            foreach (var path in await _dbContext.CaptureJobs
+                         .Where(j => j.BatchId == _currentBatchId)
+                         .Select(j => j.OriginalFilePath)
+                         .ToListAsync())
             {
-                if (string.Equals(Path.GetFullPath(derivative), Path.GetFullPath(item.FilePath), StringComparison.OrdinalIgnoreCase))
-                    continue;
-                try { File.Delete(derivative); }
-                catch (IOException) { /* best-effort cleanup; the DB status is what actually excludes it */ }
-                catch (UnauthorizedAccessException) { /* best-effort cleanup */ }
+                if (!string.IsNullOrWhiteSpace(path)) stillReferenced.Add(Path.GetFullPath(path));
             }
         }
-        catch (Exception ex)
+
+        foreach (var original in removedOriginals)
         {
-            Console.Error.WriteLine($"Processed-derivative cleanup failed for '{item.FilePath}': {ex}");
+            try
+            {
+                // Processed derivatives sit in the same folder as the original and share its
+                // base name. Use the boundary-aware matcher, not a raw "{baseName}*" glob: a
+                // recapture's own original ("{baseName}_R_{timestamp}.jpg") is a literal
+                // prefix-match of the page it recaptured.
+                var processedDir = MicroCapture.Processing.ProcessedFilePaths.OutputDirectoryFor(original);
+                foreach (var derivative in MicroCapture.Processing.ProcessedFilePaths.EnumerateDerivatives(processedDir, original))
+                {
+                    if (removedOriginals.Contains(Path.GetFullPath(derivative))) continue; // handled below
+                    TryDeleteFile(derivative);
+                }
+
+                // The original itself — only if nothing that survived the purge still uses it.
+                if (!stillReferenced.Contains(original))
+                    TryDeleteFile(original);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Capture-file cleanup failed for '{original}': {ex}");
+            }
         }
+
+        // The cached page thumbnail is named by page number; delete it before the renumber pass
+        // shifts the surviving files down onto lower numbers.
+        TryDeleteFile(ThumbnailFileFor(_activeBatchCode, item.PageNumber));
 
         // Each thumbnail has its own JobId now (one frame == one independent job — see
         // CaptureAsync), so this only ever matches the single row being deleted.
@@ -3148,7 +3199,34 @@ public partial class MainWindowViewModel : ViewModelBase
             sibling.Thumbnail?.Dispose();
             RecentCaptures.Remove(sibling);
         }
+
+        // Close the gap the delete just opened: renumber the remaining pages to 1..N (matching
+        // the cart's order), rename their thumbnail files, and recompute PageCount.
+        try
+        {
+            await RenumberBatchSequentiallyAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Renumber after delete failed: {ex}");
+            // Fall back to a best-effort count so the header isn't left stale.
+            PageCount = RecentCaptures.Count;
+        }
+
+        // Keep the folder's own record in step, so the deletion is what another machine sees too
+        // rather than the page reappearing when the batch is opened elsewhere.
+        await PublishManifestAsync();
+
         StatusText = $"Page {item.PageNumber:D6} removed.";
+    }
+
+    /// <summary>Best-effort file delete for capture cleanup — a missing file or a lock must never
+    /// abort the surrounding delete/renumber, which the database rows have already committed.</summary>
+    private static void TryDeleteFile(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (IOException) { /* best-effort; the DB rows are what actually removed the page */ }
+        catch (UnauthorizedAccessException) { /* best-effort */ }
     }
 
     /// <summary>

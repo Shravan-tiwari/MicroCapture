@@ -3800,6 +3800,26 @@ async Task TestDeleteCaptureExcludesFromExport()
     var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
     var exportedFiles = Directory.GetFiles(resultDir, "*.png");
     Check("Export includes only the kept page, not the deleted mistake", exportedFiles.Length == 1);
+
+    // PurgeCaptureAsync — the hard delete the filmstrip's per-page delete uses (the confirm
+    // dialog promises it "can't be undone"). Unlike DeleteCaptureAsync above, it removes rows
+    // outright, and takes the whole recapture history for that page number with it.
+    var purgeBase = WriteDummyImage(Path.Combine(workDir, "purge_page5_v1.png"));
+    var purgeV1 = await queue.EnqueueCaptureAsync(batch.Id, purgeBase, 5);
+    await queue.SupersedePageAsync(batch.Id, 5);
+    var purgeV2Path = WriteDummyImage(Path.Combine(workDir, "purge_page5_v2.png"));
+    var purgeV2 = await queue.EnqueueCaptureAsync(batch.Id, purgeV2Path, 5);
+
+    var removed = await queue.PurgeCaptureAsync(purgeV2.Id);
+    Check("Purge returns every job on the page, retired recapture attempts included",
+        removed.Count == 2 && removed.Any(j => j.Id == purgeV1.Id) && removed.Any(j => j.Id == purgeV2.Id));
+
+    using var purgeVerifyDb = new AppDbContext(dbPath);
+    Check("Purged jobs are gone from the database, not just marked Superseded",
+        await purgeVerifyDb.CaptureJobs.FindAsync(purgeV1.Id) == null
+        && await purgeVerifyDb.CaptureJobs.FindAsync(purgeV2.Id) == null);
+    Check("Purge leaves other pages untouched",
+        await purgeVerifyDb.CaptureJobs.FindAsync(keptJob.Id) != null);
 }
 
 /// <summary>Draws exactly what MicroCapture.Camera.MockCameraService.GenerateMockFrame draws

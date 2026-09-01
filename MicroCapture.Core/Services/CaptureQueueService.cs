@@ -320,6 +320,26 @@ public class CaptureQueueService
         return job;
     }
 
+    /// <summary>Permanently removes a page and its whole recapture history from the batch: the
+    /// live job for <paramref name="jobId"/> plus every other job (Superseded prior attempts
+    /// included) sharing that job's page number in the same batch. Rows are hard-deleted, not
+    /// marked Superseded, so nothing is left on the page number for a later reorder/renumber to
+    /// trip over. The caller is responsible for the on-disk files and for compacting the
+    /// remaining page numbers. Returns the removed jobs so the caller can clean up their files.</summary>
+    public async Task<IReadOnlyList<CaptureJob>> PurgeCaptureAsync(string jobId)
+    {
+        var job = await _dbContext.CaptureJobs.FindAsync(jobId);
+        if (job == null) return Array.Empty<CaptureJob>();
+
+        var onSamePage = await _dbContext.CaptureJobs
+            .Where(j => j.BatchId == job.BatchId && j.PageNumber == job.PageNumber)
+            .ToListAsync();
+
+        _dbContext.CaptureJobs.RemoveRange(onSamePage);
+        await _dbContext.SaveChangesAsync();
+        return onSamePage;
+    }
+
     public async Task UpdateJobStatusAsync(string jobId, string statusType, string newStatus)
     {
         var job = await _dbContext.CaptureJobs.FindAsync(jobId);
