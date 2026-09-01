@@ -1156,7 +1156,7 @@ public partial class ImageProcessor
     /// (crop/deskew/dewarp/enhance/sharpen) produced a correct image right up until this write
     /// step. Writing every tag before the first scanline, in one pass, never needs to relocate
     /// anything and has no such failure mode.</summary>
-    private static void WriteTiff(string path, Mat mat, TiffMetadata metadata, bool binarized = false)
+    private static void WriteTiff(string path, Mat mat, TiffMetadata metadata, bool binarized = false, bool lzw = false)
     {
         if (binarized)
         {
@@ -1183,7 +1183,9 @@ public partial class ImageProcessor
         tiff.SetField(TiffTag.BITSPERSAMPLE, 8);
         tiff.SetField(TiffTag.SAMPLESPERPIXEL, channels);
         tiff.SetField(TiffTag.PHOTOMETRIC, channels >= 3 ? Photometric.RGB : Photometric.MINISBLACK);
-        tiff.SetField(TiffTag.COMPRESSION, Compression.LZW);
+        // Uncompressed by default — "TIFF" is the archival master an operator picks when they
+        // want nothing done to the bytes. "TIFF LZW" opts into lossless compression.
+        tiff.SetField(TiffTag.COMPRESSION, lzw ? Compression.LZW : Compression.NONE);
         tiff.SetField(TiffTag.FILLORDER, FillOrder.MSB2LSB);
         tiff.SetField(TiffTag.ORIENTATION, Orientation.TOPLEFT);
         tiff.SetField(TiffTag.PLANARCONFIG, PlanarConfig.CONTIG);
@@ -1393,7 +1395,9 @@ public partial class ImageProcessor
                         $"Could not write {format} output: {path}. This build of OpenCV may not include that encoder.");
                 break;
             default:
-                WriteTiff(path, mat, metadata, binarized);
+                // "TIFF" = uncompressed archival master; "TIFF LZW" = lossless LZW. Binarized
+                // output ignores this and always uses CCITT G4 (see WriteBitonalTiff).
+                WriteTiff(path, mat, metadata, binarized, lzw: format == "TIFF LZW");
                 break;
         }
         return path;
@@ -1410,8 +1414,11 @@ public partial class ImageProcessor
         "PNG" => "PNG",
         "JP2" or "JPEG 2000" or "JPEG2000" or "JP2000" => "JP2",
         "BMP" => "BMP",
-        // TIFF is always written LZW-compressed (see WriteTiff), so the two names are the same
-        // output; "TIFF LZW" exists only to make that explicit where an operator expects to see it.
+        // "TIFF" is the uncompressed archival master; "TIFF LZW" is the same file type with
+        // lossless LZW compression. Kept as distinct normalized names so the writer can honor
+        // the operator's choice — collapsing them here is what made every "TIFF" capture come
+        // out LZW-compressed regardless.
+        "TIFF LZW" or "TIFF-LZW" or "TIFFLZW" or "LZW" => "TIFF LZW",
         _ => "TIFF"
     };
 
@@ -1421,7 +1428,7 @@ public partial class ImageProcessor
         "PNG" => ".png",
         "JP2" => ".jp2",
         "BMP" => ".bmp",
-        _ => ".tif"
+        _ => ".tif" // "TIFF" and "TIFF LZW" are the same file type
     };
 
     /// <summary>Writes <paramref name="mat"/> (expected 8-bit single-channel, values only 0 or

@@ -717,7 +717,11 @@ public partial class MainWindowViewModel : ViewModelBase
         // already-processed jobs in the batch (they keep their original format).
         // This is just a "remember my last choice" convenience.
     }
-    public string[] AvailableCaptureFormats { get; } = { "TIFF", "JPG", "PNG", "JP2", "BMP" };
+    // "TIFF" writes an uncompressed archival master; "TIFF LZW" is the same file type with
+    // lossless compression. NormalizeCaptureFormat keeps them distinct so the writer honors
+    // the choice, so both must appear here or a batch created as "TIFF LZW" would show a blank
+    // dropdown on reopen.
+    public string[] AvailableCaptureFormats { get; } = { "TIFF", "TIFF LZW", "JPG", "PNG", "JP2", "BMP" };
 
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
     // in the background queue, off the capture path, so toggling this never affects shutter

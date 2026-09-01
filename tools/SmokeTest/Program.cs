@@ -115,6 +115,7 @@ TestFingerRemovalCleansEdgeTouchingSkinBlob();
 TestFingerRemovalLeavesInteriorSkinToneAlone();
 TestBleedthroughSuppressesFaintGhostPreservesRealInk();
 TestWriteTiffPreservesLargeColorImagePixelData();
+TestCaptureTiffFormatHonorsCompressionChoice();
 await TestDeleteCaptureExcludesFromExport();
 TestMockCameraStyleFrameAutoCrops();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
@@ -3933,6 +3934,66 @@ void TestWriteTiffPreservesLargeColorImagePixelData()
         Check("Bottom-left quadrant color survives the write/read round-trip", ColorNear(blPixel, new SKColor(30, 30, 220)));
         Check("Bottom-right quadrant color survives the write/read round-trip", ColorNear(brPixel, new SKColor(230, 220, 30)));
     }
+}
+
+void TestCaptureTiffFormatHonorsCompressionChoice()
+{
+    Console.WriteLine("\n-- Capture 'TIFF' writes uncompressed; 'TIFF LZW' writes LZW (New Batch format choice) --");
+    var workDir = TempWorkDir();
+    const int width = 1600, height = 1200;
+
+    // Document-like: light ground with dark text and big flat areas, so LZW genuinely shrinks
+    // it. Random noise would be the wrong fixture (LZW expands noise).
+    var sourcePath = Path.Combine(workDir, "src.png");
+    using (var mat = new OpenCvSharp.Mat(height, width, OpenCvSharp.MatType.CV_8UC3, new OpenCvSharp.Scalar(245, 245, 245)))
+    {
+        for (var line = 0; line < 25; line++)
+            OpenCvSharp.Cv2.PutText(mat, "the quick brown fox jumps over the lazy dog",
+                new OpenCvSharp.Point(40, 60 + line * 44), OpenCvSharp.HersheyFonts.HersheySimplex,
+                1.0, new OpenCvSharp.Scalar(20, 20, 20), 2);
+        OpenCvSharp.Cv2.ImWrite(sourcePath, mat);
+    }
+
+    var processor = new ImageProcessor();
+    var meta = new TiffMetadata(ImageProcessor.BaselineDpi, "Smoke Test Operator", DateTime.UtcNow);
+
+    var plainDir = Path.Combine(workDir, "plain");
+    var lzwDir = Path.Combine(workDir, "lzw");
+    var plain = processor.Process(sourcePath, plainDir, manualOverride: true,
+        leftCrop: $"0,0,{width},{height}", metadata: meta, captureFormat: "TIFF");
+    var lzw = processor.Process(sourcePath, lzwDir, manualOverride: true,
+        leftCrop: $"0,0,{width},{height}", metadata: meta, captureFormat: "TIFF LZW");
+
+    Check("Both captures succeed and write one .tif each",
+        plain.Success && lzw.Success
+        && plain.OutputFilePaths.Count == 1 && plain.OutputFilePaths[0].EndsWith(".tif")
+        && lzw.OutputFilePaths.Count == 1 && lzw.OutputFilePaths[0].EndsWith(".tif"));
+    if (!plain.Success || !lzw.Success || plain.OutputFilePaths.Count != 1 || lzw.OutputFilePaths.Count != 1) return;
+
+    // Read the actual COMPRESSION tag — the definitive check, not just file size.
+    int CompressionTag(string path)
+    {
+        using var t = BitMiracle.LibTiff.Classic.Tiff.Open(path, "r");
+        return (int)t.GetField(BitMiracle.LibTiff.Classic.TiffTag.COMPRESSION)[0].ToInt();
+    }
+    var plainTag = CompressionTag(plain.OutputFilePaths[0]);
+    var lzwTag = CompressionTag(lzw.OutputFilePaths[0]);
+    Console.WriteLine($"  [tag] TIFF compression={plainTag} (1=none)  TIFF LZW compression={lzwTag} (5=LZW)");
+    Check("'TIFF' capture is written with no compression (tag 1)", plainTag == 1);
+    Check("'TIFF LZW' capture is written LZW-compressed (tag 5)", lzwTag == 5);
+
+    var plainKb = new FileInfo(plain.OutputFilePaths[0]).Length / 1024.0;
+    var lzwKb = new FileInfo(lzw.OutputFilePaths[0]).Length / 1024.0;
+    Console.WriteLine($"  [size] TIFF {plainKb:F0} KB vs TIFF LZW {lzwKb:F0} KB");
+    Check($"Uncompressed capture file is larger than the LZW one ({plainKb:F0} KB vs {lzwKb:F0} KB)", plainKb > lzwKb * 1.05);
+
+    // Pixels must be identical — LZW is lossless.
+    using var a = Cv2.ImRead(plain.OutputFilePaths[0], ImreadModes.Color);
+    using var b = Cv2.ImRead(lzw.OutputFilePaths[0], ImreadModes.Color);
+    using var diff = new Mat();
+    Cv2.Absdiff(a, b, diff);
+    Check("The two files decode to pixel-identical images (LZW is lossless)",
+        !a.Empty() && !b.Empty() && Cv2.CountNonZero(diff.Reshape(1)) == 0);
 }
 
 async Task TestDeleteCaptureExcludesFromExport()
