@@ -14,29 +14,46 @@
                        Text="Pick a batch to continue it. Batches found on this machine and on any connected drive are listed below — including ones started on another workstation. Use Browse to open a batch from anywhere else."/>
 
             <ScrollViewer Grid.Row="2">
-                <ItemsControl ItemsSource="{Binding Batches}">
+                <ItemsControl ItemsSource="{Binding Projects}">
                     <ItemsControl.ItemTemplate>
                         <DataTemplate>
-                            <!-- Row buttons dispatch through code-behind rather than a
-                                 $parent[ItemsControl] compiled binding — see the note in
-                                 RecentBatchesDialog.axaml.cs, where that pattern threw at
-                                 runtime on the target machine despite building cleanly. -->
-                            <Button Classes="secondary" HorizontalAlignment="Stretch" Margin="0,0,0,8" Padding="14,10"
-                                    Click="OnBatchRowClick">
-                                <Grid ColumnDefinitions="*, Auto">
-                                    <StackPanel Grid.Column="0" Spacing="3">
-                                        <StackPanel Orientation="Horizontal" Spacing="8">
-                                            <TextBlock Text="{Binding ProjectCode}" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource InkBrush}"/>
-                                            <TextBlock Text="/" Foreground="{DynamicResource InkSubtleBrush}"/>
-                                            <TextBlock Text="{Binding BatchCode}" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource InkBrush}"/>
-                                        </StackPanel>
-                                        <TextBlock Text="{Binding Subtitle}" FontSize="11" Foreground="{DynamicResource InkTertiaryBrush}" TextWrapping="Wrap"/>
+                            <!-- One project. The Expander header is the project; expanding it
+                                 reveals its batches, newest first. Per-batch buttons dispatch
+                                 through code-behind rather than a $parent[ItemsControl] compiled
+                                 binding — see the note in RecentBatchesDialog.axaml.cs, where that
+                                 pattern threw at runtime on the target machine despite building
+                                 cleanly. -->
+                            <Expander Margin="0,0,0,8" IsExpanded="{Binding IsExpanded}"
+                                      HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                                <Expander.Header>
+                                    <StackPanel Spacing="2">
+                                        <TextBlock Text="{Binding ProjectCode}" FontWeight="SemiBold" FontSize="14"
+                                                   Foreground="{DynamicResource InkBrush}"/>
+                                        <TextBlock Text="{Binding Summary}" FontSize="11"
+                                                   Foreground="{DynamicResource InkTertiaryBrush}"/>
                                     </StackPanel>
-                                    <Border Grid.Column="1" Background="{DynamicResource Surface2Brush}" CornerRadius="6" Padding="8,3" VerticalAlignment="Center">
-                                        <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="Medium" Foreground="{DynamicResource InkMutedBrush}"/>
-                                    </Border>
-                                </Grid>
-                            </Button>
+                                </Expander.Header>
+                                <ItemsControl ItemsSource="{Binding Batches}" Margin="0,4,0,0">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Button Classes="secondary" HorizontalAlignment="Stretch" Margin="0,0,0,6" Padding="14,10"
+                                                    Click="OnBatchRowClick">
+                                                <Grid ColumnDefinitions="*, Auto">
+                                                    <StackPanel Grid.Column="0" Spacing="3">
+                                                        <TextBlock Text="{Binding BatchCode}" FontWeight="SemiBold" FontSize="14"
+                                                                   Foreground="{DynamicResource InkBrush}"/>
+                                                        <TextBlock Text="{Binding Subtitle}" FontSize="11"
+                                                                   Foreground="{DynamicResource InkTertiaryBrush}" TextWrapping="Wrap"/>
+                                                    </StackPanel>
+                                                    <Border Grid.Column="1" Background="{DynamicResource Surface2Brush}" CornerRadius="6" Padding="8,3" VerticalAlignment="Center">
+                                                        <TextBlock Text="{Binding Status}" FontSize="11" FontWeight="Medium" Foreground="{DynamicResource InkMutedBrush}"/>
+                                                    </Border>
+                                                </Grid>
+                                            </Button>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </Expander>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>

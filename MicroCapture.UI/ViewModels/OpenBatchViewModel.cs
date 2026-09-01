@@ -23,6 +23,30 @@ public partial class OpenBatchRow : ObservableObject
     /// been unplugged, a sharing PC that's asleep. Shown as unavailable rather than hidden, so the
     /// operator can tell "gone" from "never existed".</summary>
     public bool IsUnavailable { get; init; }
+    /// <summary>When the batch was last written — its manifest's UpdatedUtc, or DateTime.MinValue
+    /// if that couldn't be read. Batches sort newest-first within their project, and a project
+    /// sorts by its newest batch. A recent folder with no readable manifest keeps its position in
+    /// the recent list via <see cref="RecentRank"/> instead.</summary>
+    public DateTime UpdatedUtc { get; init; }
+    /// <summary>Index of this folder in the operator's recent list, or int.MaxValue if it wasn't
+    /// in it. Lower = more recently opened. Used to order projects/batches whose manifests give no
+    /// usable timestamp.</summary>
+    public int RecentRank { get; init; } = int.MaxValue;
+}
+
+/// <summary>A project and its batches, as shown in the Open Batch list: a header row that expands
+/// to the batches under it, newest first.</summary>
+public partial class OpenBatchProjectGroup : ObservableObject
+{
+    public string ProjectCode { get; init; } = string.Empty;
+    public IReadOnlyList<OpenBatchRow> Batches { get; init; } = System.Array.Empty<OpenBatchRow>();
+
+    /// <summary>Count line under the project name — "3 batches", "1 batch".</summary>
+    public string Summary => Batches.Count == 1 ? "1 batch" : $"{Batches.Count} batches";
+
+    /// <summary>The most recently opened project starts expanded so reopening the batch you were
+    /// just in is a single click; the rest collapse to keep a shop's worth of projects scannable.</summary>
+    [ObservableProperty] private bool _isExpanded;
 }
 
 /// <summary>Backs the Open Batch dialog.
@@ -44,6 +68,10 @@ public partial class OpenBatchViewModel : ObservableObject
     }
 
     public IReadOnlyList<string> RecentFolders { get; }
+
+    /// <summary>Projects, newest-active first, each holding its batches. The dialog binds to this;
+    /// <see cref="Batches"/> is the flat list it's built from.</summary>
+    public ObservableCollection<OpenBatchProjectGroup> Projects { get; } = new();
 
     public ObservableCollection<OpenBatchRow> Batches { get; } = new();
 
@@ -70,8 +98,14 @@ public partial class OpenBatchViewModel : ObservableObject
         try
         {
             var rows = await Task.Run(() => Discover());
+
             Batches.Clear();
             foreach (var row in rows) Batches.Add(row);
+
+            Projects.Clear();
+            foreach (var group in GroupByProject(rows)) Projects.Add(group);
+            if (Projects.Count > 0) Projects[0].IsExpanded = true;
+
             IsEmpty = Batches.Count == 0;
         }
         finally
@@ -80,17 +114,38 @@ public partial class OpenBatchViewModel : ObservableObject
         }
     }
 
+    /// <summary>Turns the flat scan into project groups. Batches sort newest-first inside a
+    /// project (by manifest UpdatedUtc, falling back to recent-list position); projects sort by
+    /// their newest batch, so the project you last worked in is on top.</summary>
+    private static IEnumerable<OpenBatchProjectGroup> GroupByProject(IEnumerable<OpenBatchRow> rows)
+    {
+        static (DateTime, int) Key(OpenBatchRow r) => (r.UpdatedUtc, -r.RecentRank);
+
+        return rows
+            .GroupBy(r => string.IsNullOrWhiteSpace(r.ProjectCode) ? "(no project)" : r.ProjectCode)
+            .Select(g => new OpenBatchProjectGroup
+            {
+                ProjectCode = g.Key,
+                Batches = g.OrderByDescending(Key).ToList()
+            })
+            .OrderByDescending(p => p.Batches.Select(Key).Max())
+            .ToList();
+    }
+
     private List<OpenBatchRow> Discover()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var rows = new List<OpenBatchRow>();
 
         // Recent first — the common case is reopening what you were just working on, and it
-        // should not be buried under a scan of every batch in the shop.
-        foreach (var folder in RecentFolders)
+        // should not be buried under a scan of every batch in the shop. The recent list is
+        // already in most-recent-first order, so its index is the recency rank for batches whose
+        // manifest gives no usable timestamp.
+        for (var i = 0; i < RecentFolders.Count; i++)
         {
+            var folder = RecentFolders[i];
             if (!seen.Add(Path.GetFullPath(folder))) continue;
-            rows.Add(Describe(folder));
+            rows.Add(Describe(folder, i));
         }
 
         foreach (var root in _searchRoots)
@@ -98,7 +153,7 @@ public partial class OpenBatchViewModel : ObservableObject
             foreach (var folder in FindBatchFolders(root))
             {
                 if (!seen.Add(Path.GetFullPath(folder))) continue;
-                rows.Add(Describe(folder));
+                rows.Add(Describe(folder, int.MaxValue));
             }
         }
 
@@ -149,7 +204,7 @@ public partial class OpenBatchViewModel : ObservableObject
         return string.IsNullOrEmpty(parent) ? string.Empty : Path.GetFileName(parent);
     }
 
-    private OpenBatchRow Describe(string folder)
+    private OpenBatchRow Describe(string folder, int recentRank)
     {
         if (!Directory.Exists(folder))
         {
@@ -160,7 +215,8 @@ public partial class OpenBatchViewModel : ObservableObject
                 ProjectCode = ProjectFromParent(folder),
                 Subtitle = $"Unavailable — {folder}",
                 Status = "Offline",
-                IsUnavailable = true
+                IsUnavailable = true,
+                RecentRank = recentRank
             };
         }
 
@@ -174,7 +230,8 @@ public partial class OpenBatchViewModel : ObservableObject
                 ProjectCode = ProjectFromParent(folder),
                 Subtitle = folder,
                 Status = "Not a batch",
-                IsUnavailable = true
+                IsUnavailable = true,
+                RecentRank = recentRank
             };
         }
 
@@ -186,7 +243,9 @@ public partial class OpenBatchViewModel : ObservableObject
             BatchCode = manifest.BatchCode,
             ProjectCode = manifest.ProjectCode,
             Subtitle = $"{pages} · {manifest.Settings.Dpi} DPI {manifest.Settings.CaptureFormat}{device} · {folder}",
-            Status = manifest.Status
+            Status = manifest.Status,
+            UpdatedUtc = manifest.UpdatedUtc,
+            RecentRank = recentRank
         };
     }
 
