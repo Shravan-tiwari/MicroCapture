@@ -2331,16 +2331,20 @@ async Task TestDeletingAPageRemovesItsFilesAndRenumbers()
     vm.BatchCode = "DELFILES";
     await RunPumped(() => vm.StartBatchCommand.ExecuteAsync(null));
 
-    for (var i = 0; i < 3; i++)
+    for (var i = 0; i < 4; i++)
         await RunPumped(() => vm.CaptureCommand.ExecuteAsync(null), timeoutMs: 30000);
-    PumpUntil(() => vm.RecentCaptures.Count == 3, timeoutMs: 30000);
-    PumpUntil(() => vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")), timeoutMs: 40000);
-    Check("Three pages captured and processed", vm.RecentCaptures.Count == 3
+    PumpUntil(() => vm.RecentCaptures.Count == 4, timeoutMs: 30000);
+    PumpUntil(() => vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")), timeoutMs: 60000);
+    Check("Four pages captured and processed", vm.RecentCaptures.Count == 4
         && vm.RecentCaptures.All(t => t.Status.StartsWith("Processed")));
-    if (vm.RecentCaptures.Count != 3) return;
+    if (vm.RecentCaptures.Count != 4) return;
 
-    // Resolve the on-disk files for the page we're about to delete (page 2), the way export
-    // does, so the assertion checks the real deliverable — not a guessed filename.
+    var outputDir = Path.Combine(workDir, "DELFILES", "output");
+    var tempDir = Path.Combine(workDir, "DELFILES", "temp");
+
+    // Resolve page 2's real on-disk file the way export does, so the assertion checks the actual
+    // deliverable rather than a guessed name (the file-cleanup bug was precisely that the name
+    // couldn't be guessed by the old prefix matcher).
     List<string> page2Files;
     string page2Original;
     using (var db = new AppDbContext(dbPath))
@@ -2353,34 +2357,58 @@ async Task TestDeletingAPageRemovesItsFilesAndRenumbers()
     Check("Page 2 has a processed file on disk before deletion",
         page2Files.Count > 0 && page2Files.All(File.Exists));
 
-    var page2ThumbJobId = vm.RecentCaptures.First(t => t.PageNumber == 2).JobId;
-    var page2Item = vm.RecentCaptures.First(t => t.JobId == page2ThumbJobId);
+    // --- Single mid-batch delete: file gone, gap closed ---
+    var page2Item = vm.RecentCaptures.First(t => t.PageNumber == 2);
     await RunPumped(() => vm.DeleteCaptureAsync(page2Item), timeoutMs: 30000);
 
     Check("The deleted page's processed file is gone from the batch folder",
         page2Files.All(f => !File.Exists(f)));
     Check("The deleted page's original capture file is gone too",
         !File.Exists(page2Original));
-
-    Check("The cart now holds two pages, renumbered 1 and 2",
-        vm.RecentCaptures.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2 }));
-    Check("The PAGE count reflects the delete", vm.PageCount == 2);
+    Check("The cart now holds three pages, renumbered 1..3",
+        vm.RecentCaptures.Select(t => t.PageNumber).SequenceEqual(new[] { 1, 2, 3 }));
+    Check("The PAGE count reflects the delete", vm.PageCount == 3);
 
     using (var verify = new AppDbContext(dbPath))
     {
         var batchId = verify.Batches.Select(b => b.Id).First();
         var rows = verify.CaptureJobs.AsNoTracking().Where(j => j.BatchId == batchId).ToList();
-        Check("The deleted page's database rows are removed outright, not left as Superseded",
-            rows.Count == 2 && rows.All(j => j.ProcessingStatus != "Superseded"));
-        Check("The database is renumbered 1..2 with no gap",
-            rows.Select(j => j.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2 }));
+        Check("The deleted page's rows are removed outright, not left as Superseded",
+            rows.Count == 3 && rows.All(j => j.ProcessingStatus != "Superseded"));
+        Check("The database is renumbered 1..3 with no gap",
+            rows.Select(j => j.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2, 3 }));
     }
 
-    // The manifest another machine would read must agree. StartBatchAsync puts the batch folder
-    // at {project.OutputDirectory}/{batchCode} — here that's workDir/DELFILES.
     var manifest = new BatchManifestService().Load(Path.Combine(workDir, "DELFILES"));
-    Check("The manifest lists exactly the two surviving pages",
-        manifest != null && manifest.Pages.Select(p => p.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2 }));
+    Check("The manifest lists exactly the three surviving pages",
+        manifest != null && manifest.Pages.Select(p => p.PageNumber).OrderBy(n => n).SequenceEqual(new[] { 1, 2, 3 }));
+
+    // --- Bulk Select-All delete: the exact operator repro where "one image wouldn't delete"
+    // and the count stuck at 1, because renumbering ran between each per-page delete. ---
+    var tifsBefore = Directory.GetFiles(outputDir, "*.tif").Length;
+    Check("Three processed files remain in output/ before the bulk delete", tifsBefore == 3);
+
+    foreach (var t in vm.RecentCaptures) t.IsSelected = true;
+    await RunPumped(() => vm.DeleteSelectedCommand.ExecuteAsync(null), timeoutMs: 30000);
+
+    Check("The cart is empty after deleting every page", vm.RecentCaptures.Count == 0);
+    Check("The PAGE count is back to zero, not stuck at one", vm.PageCount == 0);
+    Check($"output/ holds no processed files after deleting every page (found {Directory.GetFiles(outputDir).Length})",
+        Directory.GetFiles(outputDir).Length == 0);
+
+    var origsAfter = Directory.GetFiles(tempDir).Count(f => !f.EndsWith(".db", StringComparison.OrdinalIgnoreCase));
+    Check($"temp/ holds no capture originals after deleting every page (found {origsAfter})", origsAfter == 0);
+
+    using (var verify = new AppDbContext(dbPath))
+    {
+        var batchId = verify.Batches.Select(b => b.Id).First();
+        Check("No capture rows remain for the batch",
+            verify.CaptureJobs.AsNoTracking().Count(j => j.BatchId == batchId) == 0);
+    }
+
+    var finalManifest = new BatchManifestService().Load(Path.Combine(workDir, "DELFILES"));
+    Check("The manifest lists no pages once every page is deleted",
+        finalManifest != null && finalManifest.Pages.Count == 0);
 }
 
 void TestPdfEncodingQuality()

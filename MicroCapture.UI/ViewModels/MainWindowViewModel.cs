@@ -2509,14 +2509,11 @@ public partial class MainWindowViewModel : ViewModelBase
             if (!confirmed) return;
         }
 
-        foreach (var item in selected)
-        {
-            // DeleteCaptureAsync already removes every sibling thumbnail sharing this JobId
-            // (fixed-frame captures), so re-checking IsSelected per iteration avoids acting on
-            // an item RecentCaptures no longer contains.
-            if (RecentCaptures.Contains(item))
-                await DeleteCaptureAsync(item);
-        }
+        // One pass: purge every selected page and its files, THEN renumber once. Deleting them
+        // one at a time renumbered the batch between each, moving the remaining selected items'
+        // page numbers so the next delete targeted the wrong file (confirmed: the last page's
+        // derivative was left on disk and the count stuck one above zero).
+        await DeleteCapturesAsync(selected);
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(HasSelection));
         OnPropertyChanged(nameof(SelectAllLabel));
@@ -3126,23 +3123,39 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Permanently removes a captured page from the batch. The confirm dialog tells the operator
-    /// this cannot be undone, so it is a hard delete on every level: the database rows for the
-    /// page and its whole recapture history are removed (not marked Superseded), the original
-    /// capture file and every processed derivative and the cached thumbnail are deleted from the
-    /// batch folder, and the remaining pages are renumbered to a gap-free 1..N run so both the
-    /// per-tile page numbers and the PAGE count stay correct. The manifest is republished so
-    /// another machine opening the folder sees the same result.
-    /// Called from MainWindow.axaml.cs's delete button on each thumbnail.
+    /// Permanently removes one or more captured pages from the batch. The confirm dialog tells
+    /// the operator this cannot be undone, so it is a hard delete on every level: the database
+    /// rows for each page and its whole recapture history are removed (not marked Superseded),
+    /// the original capture file and every processed derivative and cached thumbnail are deleted
+    /// from the batch folder, and the remaining pages are renumbered ONCE to a gap-free 1..N run
+    /// so both the per-tile page numbers and the PAGE count stay correct. The manifest is
+    /// republished so another machine opening the folder sees the same result.
+    /// Called from MainWindow.axaml.cs's per-thumbnail delete button.
     /// </summary>
-    public async Task DeleteCaptureAsync(ThumbnailItem item)
-    {
-        var removedJobs = await _queueService.PurgeCaptureAsync(item.JobId);
+    public Task DeleteCaptureAsync(ThumbnailItem item) => DeleteCapturesAsync(new[] { item });
 
-        // Every original capture path the removed jobs referenced. A fixed-frame shot produces
-        // several jobs from ONE source image, so that original is only safe to delete once no
-        // job that survived the purge still points at it. A recapture attempt has its own
-        // "_R_{timestamp}" original, referenced by exactly one (now-removed) job.
+    /// <summary>Deletes a set of pages in one pass: every page's rows and files are removed
+    /// first, then the batch is renumbered a single time. Renumbering per-page inside a loop was
+    /// the bug behind "one image won't delete" — each renumber mutated the still-pending items'
+    /// PageNumber out from under the next iteration, so the last file was targeted by a page
+    /// number that no longer matched it.</summary>
+    public async Task DeleteCapturesAsync(IReadOnlyList<ThumbnailItem> items)
+    {
+        if (items.Count == 0) return;
+
+        // De-dupe by JobId — a fixed-frame page is one job with potentially several sibling
+        // thumbnails, and Select All can hand us all of them.
+        var jobIds = items.Select(i => i.JobId).Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
+        var lastPageNumber = items.Count > 0 ? items.Max(i => i.PageNumber) : 0;
+
+        var removedJobs = new List<MicroCapture.Core.Models.CaptureJob>();
+        foreach (var jobId in jobIds)
+            removedJobs.AddRange(await _queueService.PurgeCaptureAsync(jobId));
+
+        // Which originals the removed jobs referenced. A fixed-frame shot produces several jobs
+        // from ONE source image, so that original is only deleted once no SURVIVING job points
+        // at it. A recapture attempt has its own "_R_{timestamp}" original, referenced by
+        // exactly one now-removed job.
         var removedOriginals = removedJobs
             .Select(j => j.OriginalFilePath)
             .Where(p => !string.IsNullOrWhiteSpace(p))
@@ -3162,11 +3175,11 @@ public partial class MainWindowViewModel : ViewModelBase
             }
         }
 
-        // Processed derivatives: resolve them the same way export does — from the job's recorded
-        // ProcessedFilePath first (the authoritative answer, which is how fixed-frame outputs
-        // like "..._p000002.tif" in output/ are found — their names don't follow the base-name
-        // + known-suffix shape EnumerateDerivatives matches), then the folder globs as a
-        // fallback for older rows. Also clear the OCR sidecars that sit beside each derivative.
+        // Processed derivatives: resolve them the same way export does — the job's recorded
+        // ProcessedFilePath first (the authoritative answer, and how fixed-frame outputs like
+        // "..._p000002.tif" in output/ are found — their names don't follow the base-name +
+        // known-suffix shape EnumerateDerivatives matches), folder globs as a fallback for
+        // older rows. Also clear the OCR sidecars beside each derivative.
         foreach (var job in removedJobs)
         {
             try
@@ -3193,20 +3206,21 @@ public partial class MainWindowViewModel : ViewModelBase
                 TryDeleteFile(original);
         }
 
-        // The cached page thumbnail is named by page number; delete it before the renumber pass
-        // shifts the surviving files down onto lower numbers.
-        TryDeleteFile(ThumbnailFileFor(_activeBatchCode, item.PageNumber));
+        // Cached page thumbnails, by the page numbers the deleted items held BEFORE any
+        // renumber (nothing has renumbered yet — that happens once, below).
+        foreach (var pageNumber in items.Select(i => i.PageNumber).Distinct())
+            TryDeleteFile(ThumbnailFileFor(_activeBatchCode, pageNumber));
 
-        // Each thumbnail has its own JobId now (one frame == one independent job — see
-        // CaptureAsync), so this only ever matches the single row being deleted.
-        foreach (var sibling in RecentCaptures.Where(t => t.JobId == item.JobId).ToList())
+        // Drop every deleted job's thumbnail(s) from the strip.
+        var removedJobIds = jobIds.ToHashSet();
+        foreach (var sibling in RecentCaptures.Where(t => removedJobIds.Contains(t.JobId)).ToList())
         {
             sibling.Thumbnail?.Dispose();
             RecentCaptures.Remove(sibling);
         }
 
-        // Close the gap the delete just opened: renumber the remaining pages to 1..N (matching
-        // the cart's order), rename their thumbnail files, and recompute PageCount.
+        // Renumber ONCE, after everything is gone: remaining pages become a gap-free 1..N
+        // matching the cart order, their thumbnail files are renamed, PageCount is recomputed.
         try
         {
             await RenumberBatchSequentiallyAsync();
@@ -3214,15 +3228,14 @@ public partial class MainWindowViewModel : ViewModelBase
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Renumber after delete failed: {ex}");
-            // Fall back to a best-effort count so the header isn't left stale.
-            PageCount = RecentCaptures.Count;
+            PageCount = RecentCaptures.Count; // best-effort so the header isn't left stale
         }
 
-        // Keep the folder's own record in step, so the deletion is what another machine sees too
-        // rather than the page reappearing when the batch is opened elsewhere.
         await PublishManifestAsync();
 
-        StatusText = $"Page {item.PageNumber:D6} removed.";
+        StatusText = jobIds.Count == 1
+            ? $"Page {lastPageNumber:D6} removed."
+            : $"{jobIds.Count} pages removed.";
     }
 
     /// <summary>Best-effort file delete for capture cleanup — a missing file or a lock must never

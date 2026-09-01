@@ -328,15 +328,30 @@ public class CaptureQueueService
     /// remaining page numbers. Returns the removed jobs so the caller can clean up their files.</summary>
     public async Task<IReadOnlyList<CaptureJob>> PurgeCaptureAsync(string jobId)
     {
-        var job = await _dbContext.CaptureJobs.FindAsync(jobId);
+        // Read fresh: a caller deleting several pages in a row renumbers between deletes, so a
+        // job left tracked from an earlier pass would carry a stale PageNumber and the same-page
+        // sweep below would match the wrong rows.
+        _dbContext.ChangeTracker.Clear();
+
+        var job = await _dbContext.CaptureJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId);
         if (job == null) return Array.Empty<CaptureJob>();
 
+        // The named job plus every other job on its page number (retired recapture attempts),
+        // matched on this job's CURRENT batch + page number.
         var onSamePage = await _dbContext.CaptureJobs
             .Where(j => j.BatchId == job.BatchId && j.PageNumber == job.PageNumber)
             .ToListAsync();
+        if (onSamePage.All(j => j.Id != jobId))
+        {
+            // Defensive: the job itself must always be in the set even if its page number moved
+            // out from under a stale caller.
+            var self = await _dbContext.CaptureJobs.FirstOrDefaultAsync(j => j.Id == jobId);
+            if (self != null) onSamePage.Add(self);
+        }
 
         _dbContext.CaptureJobs.RemoveRange(onSamePage);
         await _dbContext.SaveChangesAsync();
+        _dbContext.ChangeTracker.Clear();
         return onSamePage;
     }
 
