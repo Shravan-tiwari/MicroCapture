@@ -342,6 +342,27 @@
     <Setter Property="BorderThickness" Value="2"/>
   </Style>
 
+  <!-- ───────────── Filmstrip scrollbar ─────────────
+       A standalone ScrollBar in its own lane under the tiles (see MainWindow.axaml), not the
+       ScrollViewer's built-in overlay — that one auto-hid when idle and, worse, drew inside
+       the content area and clipped the bottom of the page tiles. This one is always laid out
+       the instant the strip overflows, with a tinted track and a generous thumb so it reads
+       as a grabbable control. -->
+  <Style Selector="ScrollBar#FilmstripScrollBar">
+    <Setter Property="AllowAutoHide" Value="False"/>
+    <Setter Property="MinHeight" Value="12"/>
+    <Setter Property="Background" Value="{DynamicResource Surface3Brush}"/>
+    <Setter Property="CornerRadius" Value="6"/>
+  </Style>
+  <Style Selector="ScrollBar#FilmstripScrollBar Thumb">
+    <Setter Property="MinWidth" Value="48"/>
+    <Setter Property="Background" Value="{DynamicResource HairlineStrongBrush}"/>
+    <Setter Property="CornerRadius" Value="6"/>
+  </Style>
+  <Style Selector="ScrollBar#FilmstripScrollBar Thumb:pointerover">
+    <Setter Property="Background" Value="{DynamicResource InkSubtleBrush}"/>
+  </Style>
+
   <!-- ───────────── Cards / panels ───────────── -->
 
   <Style Selector="Border.panel">

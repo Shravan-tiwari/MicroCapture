@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -32,6 +33,52 @@ public partial class MainWindow : Window
         AddHandler(DragDrop.DragOverEvent, OnThumbnailDragOver);
         AddHandler(DragDrop.DropEvent, OnThumbnailDrop);
         DataContextChanged += OnDataContextChanged;
+        Loaded += (_, _) => WireFilmstripScrollBar();
+    }
+
+    /// <summary>Drives the standalone <c>FilmstripScrollBar</c> from <c>FilmstripScroller</c>'s
+    /// offset/extent/viewport. The strip uses a separate ScrollBar in its own lane rather than
+    /// the ScrollViewer's built-in one, which auto-hid when idle and drew over the bottom of
+    /// the page tiles.</summary>
+    private void WireFilmstripScrollBar()
+    {
+        var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
+        var bar = this.FindControl<ScrollBar>("FilmstripScrollBar");
+        if (scroller == null || bar == null) return;
+
+        void Sync()
+        {
+            var extent = scroller.Extent.Width;
+            var viewport = scroller.Viewport.Width;
+            var overflow = extent - viewport > 0.5;
+            bar.IsVisible = overflow;
+            if (!overflow) return;
+
+            bar.Minimum = 0;
+            bar.Maximum = Math.Max(0, extent - viewport);
+            bar.ViewportSize = viewport;
+            bar.LargeChange = viewport * 0.9;
+            bar.SmallChange = 90;
+            if (Math.Abs(bar.Value - scroller.Offset.X) > 0.5)
+                bar.Value = scroller.Offset.X;
+        }
+
+        scroller.PropertyChanged += (_, args) =>
+        {
+            if (args.Property == ScrollViewer.OffsetProperty
+                || args.Property == ScrollViewer.ExtentProperty
+                || args.Property == ScrollViewer.ViewportProperty)
+                Sync();
+        };
+        Sync();
+    }
+
+    private void OnFilmstripScrollBarScroll(object? sender, ScrollEventArgs e)
+    {
+        var scroller = this.FindControl<ScrollViewer>("FilmstripScroller");
+        if (scroller == null || sender is not ScrollBar bar) return;
+        var maximum = Math.Max(0, scroller.Extent.Width - scroller.Viewport.Width);
+        scroller.Offset = scroller.Offset.WithX(Math.Clamp(bar.Value, 0, maximum));
     }
 
     /// <summary>Finds the filmstrip tile an event landed on, by walking up from whatever inner

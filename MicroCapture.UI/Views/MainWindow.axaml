@@ -121,10 +121,9 @@
          only some of them: the selection/undo action bar, a tile tall enough for its image plus
          the page-number and status lines, and the horizontal scrollbar underneath. At 140px the
          tile's lower rows were clipped away — which is why page numbers and status text appeared
-         missing even though both were bound correctly. Sized for all three now; the inner
-         ScrollViewer scrolls horizontally only, so anything that doesn't fit vertically is lost
-         rather than reachable. -->
-    <Grid RowDefinitions="Auto, *, 200, Auto">
+         missing even though both were bound correctly. 220px now covers all three including the
+         scrollbar in its own lane below the tiles (was 200 when the scrollbar overlaid them). -->
+    <Grid RowDefinitions="Auto, *, 220, Auto">
 
         <!-- ═══════════════ TOP TOOLBAR ═══════════════ -->
         <Border Grid.Row="0" Background="{DynamicResource Surface1Brush}" Padding="14,10"
@@ -479,7 +478,11 @@
 
         <!-- ═══════════════ THUMBNAIL STRIP ═══════════════ -->
         <Border Grid.Row="2" Classes="panel" Margin="10,5,10,5" Padding="10">
-            <Grid RowDefinitions="Auto, *">
+            <Grid RowDefinitions="Auto, *, Auto">
+                <!-- Row 2 is a dedicated lane for the horizontal scrollbar so it sits BELOW the
+                     tiles instead of overlaying (and clipping) their bottom edge. The
+                     ScrollViewer's own built-in bar is hidden; FilmstripScrollBar is a real
+                     control bound to it in code-behind. -->
                 <!-- Batch action bar: appears only while at least one thumbnail is selected
                      (ctrl/shift-click). Kept inside the same fixed-height row as the filmstrip
                      itself, not a new row, so it doesn't grow/shrink the overall layout. -->
@@ -556,7 +559,7 @@
                  though its scrollbar worked. -->
             <ScrollViewer Grid.Row="1" Name="FilmstripScroller" DragDrop.AllowDrop="True"
                           PointerWheelChanged="OnFilmstripWheel"
-                          HorizontalScrollBarVisibility="Visible" VerticalScrollBarVisibility="Disabled">
+                          HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
                 <StackPanel Orientation="Horizontal">
                 <!-- The filmstrip is drawn in three parts so the current-scan tile can sit
                      inline between two pages: [pages before it] [scan tile] [pages after it].
@@ -645,6 +648,14 @@
                         ToolTip.Tip="Capture at the end of the batch instead"/>
                 </StackPanel>
             </ScrollViewer>
+
+            <!-- Dedicated scrollbar lane, below the tiles so it never overlays or clips them.
+                 A real ScrollBar (not the ScrollViewer's built-in overlay) so it stays visible
+                 the moment the strip overflows; wired to FilmstripScroller in code-behind. -->
+            <ScrollBar Grid.Row="2" Name="FilmstripScrollBar" Orientation="Horizontal"
+                       Margin="0,6,0,0" MinHeight="12"
+                       AllowAutoHide="False" IsVisible="False"
+                       Scroll="OnFilmstripScrollBarScroll"/>
             </Grid>
         </Border>
 
