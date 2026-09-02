@@ -20,13 +20,20 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        // Global shortcuts must win even when a button currently has keyboard focus.
-        // Avalonia's Button handles Space/Enter as its own "activate" key at the focused
-        // control during the normal bubble phase, which otherwise consumes the event before
-        // it ever reaches OnKeyDown below — that's why Space was re-clicking whatever button
-        // was last clicked instead of firing Capture. Intercepting during the tunnel phase
-        // (root to focused control, before the focused control's own handling runs) fixes it.
+        // Global shortcuts (Space = capture, R = recapture, A = auto-capture) must fire no
+        // matter what has keyboard focus, and must NOT also re-activate whatever button was
+        // last clicked. Two things make that work:
+        //
+        //  * Handle KeyDown on the tunnel so the shortcut runs before a focused Button's own
+        //    key handling, and mark it Handled.
+        //  * Handle KeyUp too (tunnel, handledEventsToo) and swallow it — Avalonia's Button
+        //    raises its Click on the Space/Enter KEY-UP, so intercepting only KeyDown left the
+        //    focused button to still fire on release. That was the "Space clicks the last
+        //    button" bug, and also why Space appeared to do nothing until CAPTURE had been
+        //    clicked once (before that, no element had focus so no key event routed here at
+        //    all — see EnsureShortcutFocus).
         AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDown, RoutingStrategies.Tunnel);
+        AddHandler(InputElement.KeyUpEvent, OnGlobalKeyUp, RoutingStrategies.Tunnel, handledEventsToo: true);
         // Drag-to-reorder drop targets are the filmstrip tiles, but DragDrop's events are routed
         // events that Avalonia won't accept as XAML attributes — so they're handled here at the
         // window and resolved back to whichever tile is under the pointer.
@@ -36,13 +43,70 @@ public partial class MainWindow : Window
         Loaded += (_, _) =>
         {
             WireFilmstripScrollBar();
-            // Give the window keyboard focus so the Space shortcut works before the operator
-            // has clicked anything in it.
-            Focus();
+            EnsureShortcutFocus();
         };
-        // Re-assert focus after any dialog (New Batch, Open Batch, Finalize, a confirm) closes,
+        // Re-claim focus after any dialog (New Batch, Open Batch, Finalize, a confirm) closes,
         // so Space keeps firing capture without the operator clicking back into the window.
-        Activated += (_, _) => Focus();
+        Activated += (_, _) => EnsureShortcutFocus();
+        // A click lands focus on the button that was pressed; that button would then eat the
+        // next Space/Enter. After a release on a Button, hand focus back to the window root so
+        // there is no "last button" to re-activate. Releases on inputs that legitimately keep
+        // focus (text boxes, sliders, dropdowns) are left alone.
+        AddHandler(InputElement.PointerReleasedEvent, OnAnyPointerReleased,
+            RoutingStrategies.Bubble, handledEventsToo: true);
+    }
+
+    private void OnAnyPointerReleased(object? sender, Avalonia.Input.PointerReleasedEventArgs e)
+    {
+        var hit = e.Source as Visual;
+        while (hit != null)
+        {
+            switch (hit)
+            {
+                case TextBox:
+                case AutoCompleteBox:
+                case Slider:
+                case ComboBox:
+                case Avalonia.Controls.Primitives.TemplatedControl { Classes: var c } when c.Contains("keepsFocus"):
+                    return; // this control wants the focus it just got
+                case Button:
+                    EnsureShortcutFocus();
+                    return;
+            }
+            hit = hit.GetVisualParent();
+        }
+    }
+
+    /// <summary>Puts keyboard focus on a stable, non-activatable host (the window's root
+    /// visual) so global key shortcuts route to this window's handlers, and so no button holds
+    /// focus and re-fires on the next Space/Enter. Window.Focus() alone is unreliable — focus
+    /// needs a focusable control — so this focuses the content root, making it focusable if it
+    /// isn't already.</summary>
+    private void EnsureShortcutFocus()
+    {
+        if (Content is InputElement root)
+        {
+            root.Focusable = true;
+            root.Focus();
+        }
+        else
+        {
+            Focus();
+        }
+    }
+
+    // The key whose KeyDown this window consumed as a shortcut, so its matching KeyUp can be
+    // swallowed too — Avalonia's Button raises Click on the Space/Enter KEY-UP, so without this
+    // a focused button still fires on release even though KeyDown was handled.
+    private Key _consumedShortcutKey = Key.None;
+
+    private void OnGlobalKeyUp(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == _consumedShortcutKey)
+        {
+            _consumedShortcutKey = Key.None;
+            e.Handled = true;
+        }
     }
 
     /// <summary>Drives the standalone <c>FilmstripScrollBar</c> from <c>FilmstripScroller</c>'s
@@ -492,14 +556,17 @@ public partial class MainWindow : Window
                 case Key.Space:
                     vm.HandleKeyShortcut("Space");
                     e.Handled = true;
+                    _consumedShortcutKey = Key.Space;
                     break;
                 case Key.R:
                     vm.HandleKeyShortcut("R");
                     e.Handled = true;
+                    _consumedShortcutKey = Key.R;
                     break;
                 case Key.A:
                     vm.HandleKeyShortcut("A");
                     e.Handled = true;
+                    _consumedShortcutKey = Key.A;
                     break;
                 case Key.Left:
                     vm.BrowsePages(-1);
@@ -517,6 +584,7 @@ public partial class MainWindow : Window
                     {
                         vm.OpenCurrentBrowsePage();
                         e.Handled = true;
+                        _consumedShortcutKey = Key.Enter;
                     }
                     break;
                 case Key.Delete:
