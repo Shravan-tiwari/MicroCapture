@@ -394,11 +394,6 @@ public partial class ImageProcessor
     // Depth above which content is certainly real ink and is left fully unchanged. Between low
     // and high, suppression ramps linearly rather than cutting sharply.
     public double BleedthroughSuppressHighDepth { get; set; } = 45.0;
-    // Unsharp-mask strength applied as the pipeline's last step, after enhancement — counters
-    // the softening every warp/rotate resample introduces. Deliberately mild: high enough to
-    // read as crisper edges/text, low enough to avoid visible halos on a document scan.
-    public double SharpenAmount { get; set; } = 0.6;
-    public double SharpenSigma { get; set; } = 2.0;
 
     // --- Live-view auto-capture gating ---
 
@@ -432,15 +427,13 @@ public partial class ImageProcessor
     // in ways nothing in the app admitted to, which is indistinguishable from a bug when the
     // result looks wrong. Named here so what runs automatically is visible in one place rather
     // than buried mid-pipeline.
+    //
+    // Automatic CLAHE enhancement + unsharp sharpening used to live here too; both were removed
+    // outright (not just flipped off) — see FinishPageProcessing for why. The processed page now
+    // preserves the captured tones, and only geometry/DPI/binarization steps alter it.
 
     /// <summary>Off: inpainting is destructive and there is no UI for it.</summary>
     private const bool EnableAutomaticFingerRemoval = false;
-
-    /// <summary>On: CLAHE contrast enhancement and a mild unsharp pass. Left enabled because
-    /// every capture to date was produced with them and turning them off silently would change
-    /// how every scan looks. Unlike the geometry above they alter tone, not shape, so they were
-    /// not what made pages come out curved.</summary>
-    private const bool EnableAutomaticEnhancement = true;
 
     /// <summary>Fast, non-mutating boundary check for live-view auto-capture gating.</summary>
     public static bool IsDocumentDetected(byte[] encodedImage) => CheckLiveFrame(encodedImage).Detected;
@@ -1744,9 +1737,9 @@ public partial class ImageProcessor
     }
 
     /// <summary>Shared tail of every page-processing path (Method 4 auto-detect AND the manual-
-    /// crop-quad path above): finger removal, bleedthrough suppression, enhancement/sharpen,
-    /// optional manual (operator) adjustments, quality checks, DPI resample, and optional
-    /// binarization — every real, independently-valuable feature that has nothing to do with
+    /// crop-quad path above): bleedthrough suppression, optional manual (operator) adjustments,
+    /// quality checks, DPI resample, and optional binarization — every real, independently-
+    /// valuable feature that has nothing to do with
     /// HOW the page's geometric boundary/curvature correction was produced. Takes ownership of
     /// <paramref name="working"/> (disposes intermediate Mats as it reassigns the local, exactly
     /// as the old inline tail in <see cref="ProcessSinglePage"/> did) and returns the final Mat
@@ -1759,18 +1752,19 @@ public partial class ImageProcessor
         // UI offers it yet; when it is offered, this is what that switch should set.
         if (EnableAutomaticFingerRemoval)
             working = TryRemoveFingers(working, result) ?? working;
-        // Before enhancement/sharpen so a sharpen pass doesn't crisp up leftover ghosting, and
-        // before binarization so Sauvola's own local threshold isn't skewed by it either.
+        // Before binarization so Sauvola's own local threshold isn't skewed by leftover ghosting.
         working = TryRemoveBleedthrough(working, result, bleedthroughEnabled);
 
-        if (EnableAutomaticEnhancement)
-        {
-            working = ApplyEnhancement(working);
-            working = Sharpen(working);
-        }
-        // Manual (operator-driven) adjustments layer on top of the automatic CLAHE
-        // enhancement/sharpen above rather than replacing them — see
-        // ApplyManualAdjustments's own doc comment for the fixed operation order. Skipped
+        // Automatic CLAHE enhancement and unsharp-mask sharpening used to run here on every
+        // capture. They were removed: both are discretionary cosmetic tone/edge changes (not a
+        // correction of anything wrong with the capture), CLAHE is non-linear and non-invertible,
+        // and on a full-resolution copy-stand capture the pair visibly degraded the archival
+        // master versus the raw frame — amplified paper texture / sensor noise / JPEG blocking in
+        // flat areas, then sharpened that amplified noise. The processed page now carries the
+        // captured tones unchanged; geometric correction, DPI resample and binarization still run.
+        // Operator-driven tone/sharpen adjustments remain available per page via ApplyManualAdjustments.
+
+        // Manual (operator-driven) adjustments run against the pipeline's output. Skipped
         // entirely (not just a no-op call) when the job was never touched in the Adjust UI,
         // so untouched pages are provably unaffected by this feature's existence.
         if (hasManualAdjustments)
@@ -1786,8 +1780,8 @@ public partial class ImageProcessor
         // Resize before binarization (not after): DespeckleBinary's blob-size floor is scaled
         // against actual pixel density, so it needs to see the image at its final pixel grid,
         // not the pre-resize one. Everything before this point (crop/deskew/dewarp/mesh/QC)
-        // deliberately runs at native capture resolution, where all of this class's other
-        // pixel-footprint tunables (Sharpen's sigma, CLAHE tile size, etc.) were tuned.
+        // deliberately runs at native capture resolution, where this class's other
+        // pixel-footprint tunables (edge-detection bands, despeckle floors, etc.) were tuned.
         working = ResizeForDpi(working, dpi, measuredDpi);
         working = TryApplyBinarization(working, result, binarizeEnabled, dpi, measuredDpi);
 
@@ -4583,39 +4577,6 @@ public partial class ImageProcessor
         sb.AppendLine($"Untouched real ink (depth > {BleedthroughSuppressHighDepth}): {aboveHigh} ({100.0 * aboveHigh / total:F1}%)");
         sb.AppendLine($"Average suppressed depth per touched byte: {(suppressedTotal / Math.Max(1, belowLow + ramped)):F2}");
         return sb.ToString();
-    }
-
-    // ───────────── ENHANCEMENT ─────────────
-
-    private Mat ApplyEnhancement(Mat src)
-    {
-        // Mild contrast/brightness via CLAHE on L channel (for color images)
-        using var lab = new Mat();
-        Cv2.CvtColor(src, lab, ColorConversionCodes.BGR2Lab);
-        Cv2.Split(lab, out var channels);
-
-        using var clahe = Cv2.CreateCLAHE(2.0, new Size(8, 8));
-        clahe.Apply(channels[0], channels[0]);
-
-        using var merged = new Mat();
-        Cv2.Merge(channels, merged);
-        var enhanced = new Mat();
-        Cv2.CvtColor(merged, enhanced, ColorConversionCodes.Lab2BGR);
-
-        foreach (var ch in channels) ch.Dispose();
-        return enhanced;
-    }
-
-    /// <summary>Unsharp mask: blur a copy, then push the source away from that blur. Run last
-    /// in the pipeline (after crop/deskew/enhancement) since every prior resample step softens
-    /// edges a little, and CLAHE's contrast change is what sharpening should read against.</summary>
-    private Mat Sharpen(Mat src)
-    {
-        using var blurred = new Mat();
-        Cv2.GaussianBlur(src, blurred, new Size(0, 0), SharpenSigma);
-        var sharpened = new Mat();
-        Cv2.AddWeighted(src, 1 + SharpenAmount, blurred, -SharpenAmount, 0, sharpened);
-        return sharpened;
     }
 
     // ───────────── MANUAL ADJUSTMENTS ─────────────
