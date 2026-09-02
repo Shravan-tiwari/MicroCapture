@@ -36,15 +36,12 @@ public partial class MainWindow : Window
         Loaded += (_, _) =>
         {
             WireFilmstripScrollBar();
-            // Give the window itself keyboard focus so a bare keystroke — a USB foot pedal
-            // sending Space, in particular — always has somewhere to land, even before the
-            // operator has clicked anything in the window.
+            // Give the window keyboard focus so the Space shortcut works before the operator
+            // has clicked anything in it.
             Focus();
         };
-        // A pedal is a keyboard: its Space only reaches the app while this window is the active
-        // top-level. After any dialog (New Batch, Open Batch, Finalize, a confirm) closes, the
-        // OS hands activation back here — re-assert focus on the window so the very next pedal
-        // press captures without the operator first clicking into the window.
+        // Re-assert focus after any dialog (New Batch, Open Batch, Finalize, a confirm) closes,
+        // so Space keeps firing capture without the operator clicking back into the window.
         Activated += (_, _) => Focus();
     }
 
@@ -531,39 +528,6 @@ public partial class MainWindow : Window
                     e.Handled = true;
                     break;
             }
-
-            // Not one of the fixed shortcuts. A single-key USB foot pedal sends some key of its
-            // own; hand it to the view model, which learns it on first use and then treats it
-            // exactly like Space — so the operator never has to run the pedal vendor's config
-            // tool. Modifier and navigation keys are passed along flagged so they are never
-            // mistaken for the pedal.
-            if (!e.Handled && vm.TryHandleFootPedalKey(DescribeGesture(e.Key, e.KeyModifiers), IsModifierOrNavKey(e.Key)))
-                e.Handled = true;
         }
     }
-
-    /// <summary>An order-stable, case-insensitive text form of a key plus its held modifiers,
-    /// e.g. "F13", "Ctrl+Shift+B". Used only to remember and match the foot-pedal key.</summary>
-    private static string DescribeGesture(Key key, KeyModifiers modifiers)
-    {
-        var parts = new System.Collections.Generic.List<string>(4);
-        if (modifiers.HasFlag(KeyModifiers.Control)) parts.Add("Ctrl");
-        if (modifiers.HasFlag(KeyModifiers.Shift)) parts.Add("Shift");
-        if (modifiers.HasFlag(KeyModifiers.Alt)) parts.Add("Alt");
-        if (modifiers.HasFlag(KeyModifiers.Meta)) parts.Add("Meta");
-        parts.Add(key.ToString());
-        return string.Join("+", parts);
-    }
-
-    /// <summary>Keys that are never a foot pedal on their own: the modifier keys themselves, and
-    /// the navigation/editing keys the window already assigns. Kept out of pedal learning so a
-    /// stray Tab or a held Shift can't be adopted as the shutter.</summary>
-    private static bool IsModifierOrNavKey(Key key) => key is
-        Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift or
-        Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin or
-        Key.Tab or Key.Escape or Key.Up or Key.Down or Key.Left or Key.Right or
-        Key.Home or Key.End or Key.PageUp or Key.PageDown or
-        Key.Enter or Key.Delete or Key.Back or Key.Space or
-        Key.CapsLock or Key.NumLock or Key.Scroll or Key.PrintScreen or
-        Key.Apps or Key.None;
 }

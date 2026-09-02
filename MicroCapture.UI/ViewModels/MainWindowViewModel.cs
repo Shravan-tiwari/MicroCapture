@@ -1048,6 +1048,32 @@ public partial class MainWindowViewModel : ViewModelBase
         // with every add/remove/clear. Individual tiles' PageNumber changes (from a shift or
         // renumber) are followed by the explicit RefreshScanTile calls at those sites.
         RecentCaptures.CollectionChanged += (_, _) => RebuildStripPartition();
+
+        // A foot pedal that presents as a HID game controller (a joystick button) sends no
+        // keystroke, so the key handler never sees it. Watch its button state directly and
+        // treat a press exactly like the spacebar.
+        try
+        {
+            _footPedalWatcher = new FootPedalWatcher();
+            _footPedalWatcher.Pressed += (_, _) =>
+                Avalonia.Threading.Dispatcher.UIThread.Post(OnFootPedalPressed);
+        }
+        catch (Exception ex)
+        {
+            // No pedal, no HID access, unsupported platform — capture still works from the
+            // keyboard, so this must never stop the app coming up.
+            Console.Error.WriteLine($"Foot pedal watcher unavailable: {ex}");
+        }
+    }
+
+    private readonly FootPedalWatcher? _footPedalWatcher;
+
+    /// <summary>The shutter, driven by the HID game-controller foot pedal. Same gate as Space:
+    /// only fires while a batch is open and the live view is the panel on top.</summary>
+    private void OnFootPedalPressed()
+    {
+        if (!IsShowingLiveView || _currentBatchId == null) return;
+        if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
     }
 
     /// <summary>Sets SelectedCaptureFormat's initial value from whatever format the most
@@ -3494,57 +3520,16 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>
     /// Called from MainWindow.axaml.cs when keyboard shortcuts are pressed.
     /// </summary>
-    /// <summary>The key a foot pedal sends, once learned (see <see cref="TryHandleFootPedalKey"/>).
-    /// Held here as well as in preferences so a match check doesn't hit disk.</summary>
-    private string? _footPedalGesture = null;
-    private bool _footPedalLoaded;
-
-    /// <summary>Handles a key the fixed shortcut table didn't claim, so a single-key USB foot
-    /// pedal works without the operator ever running the pedal vendor's config app.
-    ///
-    /// <para>If a pedal key is already learned and this is it, fire the shutter. Otherwise — the
-    /// first unclaimed key seen while a batch is open and the live view is up — adopt it as the
-    /// pedal and fire the shutter that same press, then remember it for good. Nav/modifier/menu
-    /// keys are never adopted. Returns true if the press was consumed.</para></summary>
-    public bool TryHandleFootPedalKey(string gesture, bool isBareModifierOrNav)
-    {
-        if (!_footPedalLoaded)
-        {
-            _footPedalGesture = string.IsNullOrWhiteSpace(_preferences.FootPedalKey) ? null : _preferences.FootPedalKey;
-            _footPedalLoaded = true;
-        }
-
-        // The pedal is the shutter — same gate as Space.
-        if (!IsShowingLiveView || _currentBatchId == null) return false;
-
-        if (_footPedalGesture != null)
-        {
-            if (!string.Equals(gesture, _footPedalGesture, StringComparison.OrdinalIgnoreCase)) return false;
-            if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
-            return true;
-        }
-
-        // Not learned yet — adopt this key, unless it's the kind of key that is never a pedal.
-        if (isBareModifierOrNav) return false;
-
-        _footPedalGesture = gesture;
-        _preferences.FootPedalKey = gesture;
-        _preferences.Save();
-        StatusText = $"Foot pedal set to '{gesture}'. It now works like the spacebar for capture.";
-        if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
-        return true;
-    }
-
     public void HandleKeyShortcut(string key)
     {
         switch (key)
         {
             case "Space":
-                // Space is the shutter — including a USB foot pedal that sends Space. It only
-                // acts while the live camera view is the surface on top; with Crop Review or
-                // calibration open it does nothing (CaptureAsync would reject it anyway, but
-                // bailing here keeps a stray pedal press from posting a rejection message over
-                // whatever the operator is doing in that panel).
+                // Space is the shutter. It only acts while the live camera view is the surface
+                // on top; with Crop Review or calibration open it does nothing (CaptureAsync
+                // would reject it anyway, but bailing here keeps a stray press from posting a
+                // rejection message over whatever the operator is doing in that panel). The
+                // HID game-controller foot pedal takes the same path via OnFootPedalPressed.
                 if (!IsShowingLiveView) break;
                 if (CaptureCommand.CanExecute(null)) CaptureCommand.Execute(null);
                 break;
@@ -3571,6 +3556,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // closing aren't lost.
         PersistFramesNow();
         _worker?.Stop();
+        _footPedalWatcher?.Dispose();
         try
         {
             await _cameraService.StopLiveViewAsync();
