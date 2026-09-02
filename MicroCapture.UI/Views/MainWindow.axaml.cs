@@ -485,9 +485,17 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
+    // TEMP foot-pedal diagnostics — surfaced in the status bar because a WinExe build has no
+    // console on Windows. Remove once the pedal's output is known.
+    private void ReportKey(string phase, KeyEventArgs e)
+    {
+        if (DataContext is MainWindowViewModel vm)
+            vm.StatusText = $"[{phase}] key={e.Key} phys={e.PhysicalKey} sym='{e.KeySymbol}' mods={e.KeyModifiers} src={e.Source?.GetType().Name} handled={e.Handled}";
+    }
+
     private void OnGlobalKeyDownBubble(object? sender, KeyEventArgs e)
     {
-        Console.WriteLine($"[Key] BUBBLE key={e.Key} phys={e.PhysicalKey} sym='{e.KeySymbol}' mods={e.KeyModifiers} src={e.Source?.GetType().Name} handled={e.Handled}");
+        ReportKey("BUBBLE", e);
         if (e.Handled) return;
         if (e.Source is TextBox or AutoCompleteBox) return;
         if (DataContext is not MainWindowViewModel vm) return;
@@ -499,7 +507,7 @@ public partial class MainWindow : Window
 
     private void OnGlobalKeyDown(object? sender, KeyEventArgs e)
     {
-        Console.WriteLine($"[Key] TUNNEL key={e.Key} phys={e.PhysicalKey} sym='{e.KeySymbol}' mods={e.KeyModifiers} src={e.Source?.GetType().Name} handled={e.Handled}");
+        ReportKey("TUNNEL", e);
 
         // Don't fire shortcuts when typing — a project/batch code with a space in it must not
         // also trip the shutter. Covers plain text boxes and the New Batch dialog's

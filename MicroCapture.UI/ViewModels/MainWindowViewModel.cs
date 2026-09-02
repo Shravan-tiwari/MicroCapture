@@ -3514,7 +3514,8 @@ public partial class MainWindowViewModel : ViewModelBase
             _footPedalLoaded = true;
         }
 
-        Console.WriteLine($"[Pedal] TryHandle gesture='{gesture}' bareNav={isBareModifierOrNav} learned='{_footPedalGesture ?? "<none>"}' liveView={IsShowingLiveView} batch={_currentBatchId != null} canCapture={CaptureCommand.CanExecute(null)}");
+        // TEMP diagnostic (status bar — WinExe has no console).
+        StatusText = $"[Pedal] gesture='{gesture}' bareNav={isBareModifierOrNav} learned='{_footPedalGesture ?? "<none>"}' liveView={IsShowingLiveView} batch={_currentBatchId != null} canCapture={CaptureCommand.CanExecute(null)}";
 
         // The pedal is the shutter — same gate as Space.
         if (!IsShowingLiveView || _currentBatchId == null) return false;
