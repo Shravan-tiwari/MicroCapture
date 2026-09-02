@@ -27,6 +27,10 @@ public partial class MainWindow : Window
         // was last clicked instead of firing Capture. Intercepting during the tunnel phase
         // (root to focused control, before the focused control's own handling runs) fixes it.
         AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDown, RoutingStrategies.Tunnel);
+        // Also listen on the bubble phase, including keys another control already marked
+        // handled — a foot pedal that sends e.g. an arrow or Enter can be swallowed before the
+        // tunnel handler above runs, so this is the backstop that still lets it be learned.
+        AddHandler(InputElement.KeyDownEvent, OnGlobalKeyDownBubble, RoutingStrategies.Bubble, handledEventsToo: true);
         // Drag-to-reorder drop targets are the filmstrip tiles, but DragDrop's events are routed
         // events that Avalonia won't accept as XAML attributes — so they're handled here at the
         // window and resolved back to whichever tile is under the pointer.
@@ -481,8 +485,22 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
+    private void OnGlobalKeyDownBubble(object? sender, KeyEventArgs e)
+    {
+        Console.WriteLine($"[Key] BUBBLE key={e.Key} phys={e.PhysicalKey} sym='{e.KeySymbol}' mods={e.KeyModifiers} src={e.Source?.GetType().Name} handled={e.Handled}");
+        if (e.Handled) return;
+        if (e.Source is TextBox or AutoCompleteBox) return;
+        if (DataContext is not MainWindowViewModel vm) return;
+
+        // Only the pedal path here — the fixed shortcuts are all claimed on the tunnel pass.
+        if (vm.TryHandleFootPedalKey(DescribeGesture(e.Key, e.KeyModifiers), IsModifierOrNavKey(e.Key)))
+            e.Handled = true;
+    }
+
     private void OnGlobalKeyDown(object? sender, KeyEventArgs e)
     {
+        Console.WriteLine($"[Key] TUNNEL key={e.Key} phys={e.PhysicalKey} sym='{e.KeySymbol}' mods={e.KeyModifiers} src={e.Source?.GetType().Name} handled={e.Handled}");
+
         // Don't fire shortcuts when typing — a project/batch code with a space in it must not
         // also trip the shutter. Covers plain text boxes and the New Batch dialog's
         // autocomplete field.
