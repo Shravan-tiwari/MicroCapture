@@ -111,6 +111,7 @@ def run_all(files=FILES, work_w=B.WORK_W):
         dsk = B.deskew(work)                       # stage 1
         pap = B.segment_paper(dsk.rotated)         # stage 2
         scp = B.check_scope(dsk.rotated, pap)      # scope gate
+        bnd = B.detect_boundary(dsk.rotated, pap, scp) if scp.in_scope else None
         cls = B.classify_content(dsk.rotated, pap.mask)
         sig = B.edge_signal(dsk.rotated)
         ms = (time.time() - t) * 1000
@@ -118,7 +119,8 @@ def run_all(files=FILES, work_w=B.WORK_W):
         out.append(dict(
             idx=n + 1, name=os.path.basename(f), path=f,
             work=work, scale=scale,
-            deskew=dsk, paper=pap, scope=scp, content=cls, signal=sig, ms=ms))
+            deskew=dsk, paper=pap, scope=scp, bound=bnd,
+            content=cls, signal=sig, ms=ms))
         if (n + 1) % 25 == 0:
             print(f'  ...{n+1}/{len(files)}', flush=True)
     print(f'done: {len(out)} images in {time.time()-t0:.1f}s')
@@ -137,6 +139,10 @@ KIND     = [r['scope'].kind for r in R]
 INSCOPE  = [r['scope'].in_scope for r in R]
 WHITE    = [r['scope'].white_frac for r in R]
 ASPECT   = [r['scope'].aspect for r in R]
+SPAN     = [((r['bound'].right - r['bound'].left) / float(r['paper'].bbox[2]))
+            if r['bound'] else 0.0 for r in R]
+HASGUT   = [bool(r['bound'] and r['bound'].gutter is not None) for r in R]
+BLOCKL   = [r['bound'].block_left if r['bound'] else 0 for r in R]
 CONTRAST = [r['paper'].contrast for r in R]
 PTR      = [r['signal'].peak_to_interior for r in R]
 RIVALS   = [r['signal'].rival_columns for r in R]
@@ -400,6 +406,91 @@ V.grid([R[i]['work'] for i, b in enumerate(sng) if b],
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
+## 5c. Stage 3 — front-page boundary and gutter
+
+The operator's requirement: bound the **printed left and right pages**, not the side
+pages. Between the page and the stand sits the **fore-edge block** — the stack of
+remaining leaves, which *is* paper and therefore inside the paper mask — and it must be
+excluded.
+
+Evidence is the per-column **mean brightness** of the paper region, not a gradient.
+Content barely perturbs a column mean (it is a few levels of high-frequency noise on a
+~220 plateau), which is exactly why this works where gradient tracing failed.
+
+Two failures during development, both found by looking at the plots rather than the
+numbers, and both worth recording:
+
+1. **A plain longest-run returned one page, not the spread.** The gutter is a deep but
+   *narrow* spike that cuts below the on-page threshold and splits the run in two — on
+   #124 the result was `left=957 right=1491`, the right-hand page alone. Fixed by
+   morphologically closing gaps up to 8% of the book width before taking the run: a
+   gutter is tens of columns wide, the block is hundreds, so this bridges the spine
+   without ever bridging the block. Gutter detection went from 14/108 to 96/108.
+2. **Ink-heavy pages under-detected badly.** On full-bleed photo spreads the ink drags
+   the column mean below "page level" and the run stops short — 37 of 124 in-scope
+   captures, some down to span 0.20 of the paper bbox, every one with white fraction
+   ≤ 0.75. Fixed by using Stage 2's paper mask extent as the outer bound (ink barely
+   moves paper-vs-stand segmentation) and trimming inward only where a genuinely
+   *darker plateau* is present, capped at 25% of width. Under-detection fell from 37 to 4.
+""")
+
+code(r"""
+inb = [i for i, r in enumerate(R) if r['bound']]
+spreads = [i for i in inb if KIND[i] == 'spread']
+singles = [i for i in inb if KIND[i] == 'single']
+print(f'gutter found on {sum(HASGUT[i] for i in spreads)}/{len(spreads)} spreads')
+print(f'gutter wrongly found on {sum(HASGUT[i] for i in singles)}/{len(singles)} singles'
+      '  (must be 0 -- a single sheet has no gutter)')
+
+V.hist([SPAN[i] for i in inb],
+       title='Stage 3 - detected page span as fraction of the paper bbox',
+       xlabel='span / bbox width',
+       vlines=[(0.80, '0.80 - under-detection below this', 'red')])
+V.by_class([SPAN[i] for i in inb], [LABELS[i] for i in inb],
+           title='Page span by content class - FLAT means content-invariant',
+           ylabel='span / bbox width')
+
+span_bad = [bool(r['bound']) and s < 0.80 for r, s in zip(R, SPAN)]
+V.scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
+            'Stage 3 boundary (span >= 0.80 of paper bbox)')
+""")
+
+code(r"""
+def draw_bounds(r):
+    o = r['deskew'].rotated.copy()
+    b = r['bound']
+    if b is None:
+        return o
+    cv2.line(o, (b.left, b.top), (b.left, b.bottom), (0, 255, 0), 4)
+    cv2.line(o, (b.right, b.top), (b.right, b.bottom), (0, 255, 0), 4)
+    if b.gutter is not None:
+        cv2.line(o, (b.gutter, b.top), (b.gutter, b.bottom), (255, 0, 255), 4)
+    return o
+
+ovb = [draw_bounds(r) for r in R]
+V.grid([ovb[i] for i in inb],
+       [f"#{R[i]['idx']} {'g' if HASGUT[i] else '-'} {SPAN[i]:.2f}" for i in inb],
+       cols=8, width=200, flags=[span_bad[i] for i in inb],
+       title='Stage 3 - green = page edges, magenta = gutter, ALL in-scope captures')
+""")
+
+code(r"""
+# The under-detected cases, large. Green lines cutting into the printed page here
+# means the boundary is wrong and needs work -- not a metric to be tuned away.
+V.show_flagged(ovb, NAMES, span_bad,
+               [f'span {SPAN[i]:.2f} of bbox' for i in range(len(R))],
+               cols=3, width=520, title='Stage 3 FLAGGED - under-detected span')
+
+# Spreads where no gutter was found. Some are genuinely flat-lying books with no
+# spine shadow; any that clearly show a spine are a miss.
+nogut = [KIND[i] == 'spread' and not HASGUT[i] for i in range(len(R))]
+V.show_flagged(ovb, NAMES, nogut,
+               [R[i]['bound'].note if R[i]['bound'] else '' for i in range(len(R))],
+               cols=3, width=520, title='Stage 3 - spreads with NO gutter detected')
+""")
+
+# ────────────────────────────────────────────────────────────────
+md(r"""
 ## 6. Phase 0 baseline scorecard
 
 Where we stand **before** any boundary/gutter/finger work. Every later change is measured
@@ -412,6 +503,8 @@ print('PHASE 0 BASELINE'.center(64))
 print('=' * 64)
 V.scorecard(LABELS, [not b for b in big],      'Stage 1  deskew')
 V.scorecard(LABELS, [not b for b in paper_bad],'Stage 2  paper segmentation')
+V.scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
+            'Stage 3  front-page boundary')
 
 print(f"\nper-image time: median {np.median(MS):.0f} ms  "
       f"(full corpus {np.sum(MS)/1000:.1f}s)")
@@ -430,6 +523,10 @@ rows = [dict(idx=r['idx'], name=r['name'], label=r['content'].label,
              kind=r['scope'].kind, in_scope=r['scope'].in_scope,
              white=round(r['scope'].white_frac, 4),
              aspect=round(r['scope'].aspect, 3),
+             span=round(SPAN[R.index(r)], 4),
+             gutter=(r['bound'].gutter if r['bound'] else None),
+             page_left=(r['bound'].left if r['bound'] else None),
+             page_right=(r['bound'].right if r['bound'] else None),
              note=r['paper'].note, ms=round(r['ms'], 1)) for r in R]
 with open('phase0_baseline.json', 'w') as fh:
     json.dump(rows, fh, indent=1)
@@ -441,6 +538,11 @@ md(r"""
 
 Recorded here so they are not silently carried forward:
 
+0. **Stage 3 open items.** Four captures of one dark magazine cover (#58-61) trim ~20%
+   off the right edge -- the cover's own dark right side reads as a "darker plateau" and
+   is mistaken for a fore-edge block. Five flat-lying spreads (#24, 26, 28, 35, 77) report
+   no gutter, which is the honest answer: their deepest spine dip is 7-13 levels against
+   a 13-level threshold. Boundaries on all five are correct.
 0. **Closed books are now rejected up front** by the scope gate (#17, 18, 30–33), with
    zero valid pages wrongly skipped. Single-page documents stay in scope on a no-gutter
    path.

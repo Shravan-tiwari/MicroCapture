@@ -469,6 +469,183 @@ def check_scope(img: np.ndarray, paper: PaperResult) -> ScopeResult:
     return ScopeResult(True, 'single', white, aspect, "")
 
 
+# ───────────── stage 3: front-page boundary + gutter ─────────────
+
+@dataclass
+class PageBoundary:
+    """Vertical structure of the capture, in deskewed working-image coordinates.
+
+    left/right are the OUTER edges of the printed pages -- the operator's "front
+    pages, not side pages" requirement.  The fore-edge block (the stack of
+    remaining leaves, which is paper and therefore inside the paper mask) sits
+    OUTSIDE these and is excluded.
+    """
+    left: int                    # x of the left page's outer edge
+    right: int                   # x of the right page's outer edge (exclusive)
+    top: int
+    bottom: int
+    gutter: Optional[int]        # x of the spine, or None for a single sheet
+    kind: str                    # 'spread' | 'single'
+    block_left: int              # px of fore-edge block / blob trimmed on the left
+    block_right: int             # px trimmed on the right
+    found: bool = True
+    profile: Optional[np.ndarray] = None   # brightness profile, for plots
+    page_level: float = 0.0
+    note: str = ""
+
+
+def _column_brightness(gray, mask, bbox):
+    """Mean brightness per column over the vertical middle of the book.
+
+    The middle band is used rather than the full height because the top and
+    bottom of a spread curve away, and are where fingers usually sit; the middle
+    is the most reliable cross-section.  Masked-out pixels are excluded so the
+    dark stand cannot drag a column's mean down.
+    """
+    x, y, bw, bh = bbox
+    y0, y1 = y + int(bh * 0.30), y + int(bh * 0.70)
+    band = gray[y0:y1, x:x + bw].astype(np.float32)
+    mband = (mask[y0:y1, x:x + bw] > 0).astype(np.float32)
+    denom = np.maximum(mband.sum(axis=0), 1.0)
+    prof = (band * mband).sum(axis=0) / denom
+    prof[mband.sum(axis=0) < (y1 - y0) * 0.25] = 0.0   # too little paper here
+    return prof
+
+
+def _smooth(a, k):
+    if k < 3:
+        return a
+    k = int(k) | 1
+    return np.convolve(a, np.ones(k) / k, mode='same')
+
+
+def _longest_run(flags):
+    """(lo, hi) of the longest True run; hi exclusive.  (0, 0) if none."""
+    best_lo, best_hi, lo = 0, 0, None
+    for i, v in enumerate(np.append(np.asarray(flags, bool), False)):
+        if v and lo is None:
+            lo = i
+        elif not v and lo is not None:
+            if i - lo > best_hi - best_lo:
+                best_lo, best_hi = lo, i
+            lo = None
+    return best_lo, best_hi
+
+
+def detect_boundary(img, paper, scope):
+    """Stage 3 -- find the printed pages' outer edges and the gutter.
+
+    Evidence is the per-column MEAN BRIGHTNESS of the paper region, not a
+    gradient.  Measured on the corpus this profile has exactly the structure we
+    need, and page content barely perturbs it:
+
+      * the fore-edge block, and the lit-wall blob, read as a wide flat DARKER
+        plateau (~140-155) ending in a sharp cliff up to page level (~215-230)
+        -- clearly visible on #124 and #109;
+      * the gutter reads as a NARROW deep dip inside the page region (#43 at
+        x~430, #124 at x~730);
+      * printed content is only a few levels of high-frequency noise on top of
+        the page plateau -- which is precisely why this works where gradient
+        tracing failed (text reaches the same |Gx| magnitude as the true edge,
+        but it does not move the column MEAN).
+
+    Page level is a high percentile so heavy ink does not drag it down.  The page
+    span is the LONGEST sustained run of near-page-level columns: taking the
+    longest run rather than the first is what rejects both the fore-edge block
+    and the wall blob, since each is a separate and shorter run.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    x, y, bw, bh = paper.bbox
+    if bw < 40 or bh < 40:
+        return PageBoundary(x, x + bw, y, y + bh, None, scope.kind, 0, 0,
+                            False, None, 0.0, "paper bbox too small")
+
+    prof = _column_brightness(gray, paper.mask, paper.bbox)
+    sm = _smooth(prof, max(5, bw // 120))
+    nz = sm[sm > 0]
+    if nz.size < 10:
+        return PageBoundary(x, x + bw, y, y + bh, None, scope.kind, 0, 0,
+                            False, prof, 0.0, "no lit columns")
+    page_level = float(np.percentile(nz, 75))
+
+    # A column counts as page when it is within this much of the page plateau.
+    # The block/blob sits 60-80 levels below page level, so 0.88 separates them
+    # while still tolerating the shading gradient across a curved page.
+    on_page = sm > page_level * 0.88
+
+    # CLOSE narrow gaps before taking the longest run.  The gutter is a deep but
+    # NARROW spike that dips below the on-page threshold (measured: #124 at
+    # x~950, #109 at x~930), and a plain longest-run then returns only ONE PAGE
+    # of the spread -- the first version of this function did exactly that,
+    # reporting left=957 right=1491 for #124, which is the right-hand page alone.
+    # A gutter is tens of columns wide; the block plateau is hundreds.  Closing
+    # gaps up to ~8% of the book width therefore bridges the spine without ever
+    # bridging the block, so the span covers BOTH pages and the gutter can then be
+    # located inside it.
+    gap_close = max(5, int(bw * 0.08))
+    closed = cv2.morphologyEx(on_page.astype(np.uint8).reshape(1, -1),
+                              cv2.MORPH_CLOSE,
+                              np.ones((1, gap_close), np.uint8)).ravel() > 0
+    lo, hi = _longest_run(closed)
+    if hi <= lo:
+        return PageBoundary(x, x + bw, y, y + bh, None, scope.kind, 0, 0,
+                            False, prof, page_level, "no sustained page run")
+
+    # The brightness run gives the printed-page span, but ONLY where the page is
+    # bright enough to read as "page level".  On ink-heavy material (full-bleed
+    # photos, colour magazine spreads) the ink drags the column mean below the
+    # threshold and the run stops short: measured 37 of 124 in-scope captures
+    # under-detecting, every one of them with white fraction <= 0.75, some as
+    # low as span 0.20 of the paper bbox.
+    #
+    # Stage 2's paper mask does not have that problem -- it segments paper vs
+    # stand, which ink barely moves -- so the mask's own extent is the honest
+    # outer bound.  Only trim inward from it where a genuinely DARKER PLATEAU (a
+    # fore-edge block or wall blob) was found: that is a sustained low run at the
+    # frame edge, not merely a dark page.  Trimming is capped so a dark page can
+    # never lose more than a quarter of its width.
+    max_trim = int(bw * 0.25)
+    trim_lo = lo if lo <= max_trim else 0
+    trim_hi = (bw - hi) if (bw - hi) <= max_trim else 0
+
+    # Require the trimmed strip to actually be a dark plateau, not just the point
+    # where brightness happened to dip.
+    if trim_lo > 0:
+        strip = sm[:trim_lo]
+        if not (strip.size and np.median(strip[strip > 0]) < page_level * 0.90):
+            trim_lo = 0
+    if trim_hi > 0:
+        strip = sm[bw - trim_hi:]
+        if not (strip.size and np.median(strip[strip > 0]) < page_level * 0.90):
+            trim_hi = 0
+
+    left, right = x + trim_lo, x + bw - trim_hi
+    block_left, block_right = trim_lo, trim_hi
+    lo, hi = trim_lo, bw - trim_hi
+
+    # ---- gutter: the deepest narrow dip INSIDE the page span ---------------
+    gutter, note = None, ""
+    if scope.kind == 'spread':
+        inner = sm[lo:hi]
+        if inner.size > 60:
+            # Ignore the outer 15% of the span: a page edge's own roll-off is not
+            # a gutter, and a real spine sits well inside.
+            m = int(inner.size * 0.15)
+            core = inner[m:inner.size - m]
+            k = int(np.argmin(core))
+            depth = page_level - float(core[k])
+            # 6% of page level (~13 levels).  Lowered from 10% after measuring the
+            # real distribution: a flat-lying book has a genuine but shallow spine
+            # shadow, and 10% found a gutter on only 14 of 108 spreads.
+            if depth > page_level * 0.06:
+                gutter = left + m + k
+            else:
+                note = (f"no gutter dip (deepest {depth:.0f}, "
+                        f"need {page_level * 0.06:.0f})")
+
+    return PageBoundary(left, right, y, y + bh, gutter, scope.kind,
+                        block_left, block_right, True, prof, page_level, note)
+
 # ─────────────── difficulty probe (why a stage will struggle) ───────────────
 
 @dataclass
