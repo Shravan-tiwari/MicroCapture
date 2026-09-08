@@ -502,6 +502,31 @@ nb = {
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    'boundary_prototype_v2.ipynb')
+
+# Carry over outputs from the previous build wherever the cell SOURCE is
+# unchanged.  run_notebook.py writes rendered plots back into this file so the
+# operator sees them in Jupyter; regenerating would otherwise blank every cell
+# and make it look like nothing had ever run.  Cells whose source changed are
+# deliberately left empty -- their old output no longer describes the new code.
+carried = 0
+if os.path.exists(out):
+    try:
+        with open(out) as fh:
+            prev = json.load(fh)
+        old = {}
+        for c in prev.get('cells', []):
+            if c.get('cell_type') == 'code' and c.get('outputs'):
+                old[''.join(c['source'])] = (c['outputs'], c.get('execution_count'))
+        for c in CELLS:
+            if c['cell_type'] != 'code':
+                continue
+            hit = old.get(''.join(c['source']))
+            if hit:
+                c['outputs'], c['execution_count'] = hit
+                carried += 1
+    except (ValueError, KeyError):
+        pass   # unreadable previous build: just write a clean notebook
+
 with open(out, 'w') as fh:
     json.dump(nb, fh, indent=1)
-print('wrote', out, f'({len(CELLS)} cells)')
+print('wrote', out, f'({len(CELLS)} cells, {carried} with carried-over outputs)')

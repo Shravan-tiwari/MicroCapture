@@ -8,9 +8,17 @@ runs the ACTUAL notebook (same cells the operator runs, real kernel, real
 matplotlib output), writes the executed copy with outputs embedded, and dumps
 each figure as a PNG so the rendered result can be inspected directly.
 
+By default the outputs are written back INTO boundary_prototype_v2.ipynb, so the
+notebook the operator has open in Jupyter/VS Code shows the plots after a run,
+exactly as if they had pressed Run All themselves.  Without this the run happens
+in a separate executed copy and the operator's own file stays blank -- which is
+confusing and looks like nothing ran.  Pass --no-inplace to keep the original
+untouched.
+
 Usage:
-    python3 run_notebook.py                    # run all cells
-    python3 run_notebook.py --out run1         # write figures to run1/
+    python3 run_notebook.py                    # run, write outputs into the notebook
+    python3 run_notebook.py --no-inplace       # leave the source notebook blank
+    python3 run_notebook.py --out run1         # figures to run1/
     python3 run_notebook.py --timeout 1800
 """
 import argparse
@@ -33,6 +41,8 @@ def main():
     ap.add_argument('--nb', default=NB)
     ap.add_argument('--out', default='run_output')
     ap.add_argument('--timeout', type=int, default=1800)
+    ap.add_argument('--no-inplace', action='store_true',
+                    help="don't write outputs back into the source notebook")
     args = ap.parse_args()
 
     outdir = os.path.join(HERE, args.out)
@@ -53,6 +63,11 @@ def main():
 
     executed = os.path.join(outdir, 'executed.ipynb')
     nbformat.write(nb, executed)
+
+    if not args.no_inplace:
+        # Write the outputs back into the notebook the operator actually opens,
+        # so the plots are visible there rather than only in the executed copy.
+        nbformat.write(nb, args.nb)
 
     n_fig = 0
     n_err = 0
