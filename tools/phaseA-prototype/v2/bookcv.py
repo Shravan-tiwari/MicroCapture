@@ -391,6 +391,84 @@ def classify_content(img: np.ndarray, paper_mask: np.ndarray) -> ContentStats:
 CLASS_ORDER = ['TEXT-HEAVY', 'DIAGRAM/SPARSE', 'IMAGE-HEAVY', 'MIXED', 'EMPTY/BLANK']
 
 
+# ───────────── scope gate: is this a capture we should process? ─────────────
+
+@dataclass
+class ScopeResult:
+    in_scope: bool
+    kind: str                    # 'spread' | 'single' | 'closed-book'
+    white_frac: float            # fraction of the paper region that is near-white
+    aspect: float                # region bbox width/height
+    reason: str = ""
+
+
+def check_scope(img: np.ndarray, paper: PaperResult) -> ScopeResult:
+    """Decide whether this capture is something the pipeline should process.
+
+    OUT OF SCOPE: closed books (a photographed cover).  The operator confirmed
+    these are not to be processed -- there is no page to flatten, no gutter, and
+    no split.  In the corpus these are #17, 18, 30, 31, 32, 33.
+
+    IN SCOPE: open spreads AND single-page documents (flyers, magazine covers,
+    brochures -- #55-61, 68-73).  Single sheets are kept because they are
+    genuinely EASIER than spreads, not harder: measured rect_fill 0.88-0.997
+    against 0.95-0.99 for spreads, i.e. they segment at least as cleanly.  They
+    simply take the no-gutter path -- boundary and crop, no split.
+
+    The discriminator is the fraction of the detected region that is near-white
+    PAPER.  This works because it keys on what the material physically IS rather
+    than on its size or brightness, both of which were tried and failed:
+
+      * area fraction    -- #43 (a valid spread) sits at 0.226, right among the
+                            closed books; no threshold separates them.
+      * region brightness-- #71/#73 (valid single sheets) have median 102-104,
+                            BELOW several closed books at 112-153.
+
+    White fraction separates cleanly: closed books 0.010-0.069, valid pages
+    0.157-0.924.  That is a 2.3x gap at the boundary.
+
+    The one genuine ambiguity is a full-bleed colour spread with almost no white
+    margin (#115, white 0.093).  Aspect resolves it: an open spread is landscape
+    (measured 1.14-1.59) while a closed book or portrait sheet is not, so a wide
+    region is accepted as a spread regardless of how little white it shows.
+    """
+    white_thresh = 200
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    m = paper.mask > 0
+    if m.sum() < 100:
+        return ScopeResult(False, 'closed-book', 0.0, 0.0,
+                           "no paper region detected")
+
+    vals = gray[m]
+    white = float((vals > white_thresh).mean())
+    x, y, bw, bh = paper.bbox
+    aspect = bw / float(bh) if bh > 0 else 0.0
+
+    # A clearly landscape region is an open spread: both pages side by side.  Even
+    # a full-bleed colour spread with no white margin is in scope.
+    #
+    # The aspect band is bounded ABOVE as well as below.  On a dark cover the
+    # brightness segmentation catches only the bright title strip, which is a thin
+    # sliver -- #17 and #18 measure aspect 3.77 and 2.48 that way and would sail
+    # through an unbounded "wide means spread" test.  A real open spread measures
+    # 1.14-1.59 across this corpus, so anything beyond 2.0 is not a spread, it is a
+    # fragment of something else.
+    if 1.10 <= aspect <= 2.00:
+        return ScopeResult(True, 'spread', white, aspect, "")
+
+    if aspect > 2.00:
+        return ScopeResult(False, 'closed-book', white, aspect,
+                           f"region aspect {aspect:.2f} is a sliver, not a page "
+                           f"-- partial detection on a dark cover?")
+
+    if white < 0.12:
+        return ScopeResult(False, 'closed-book', white, aspect,
+                           f"only {white:.1%} of region is paper-white and "
+                           f"aspect {aspect:.2f} is not a spread -- closed book?")
+
+    return ScopeResult(True, 'single', white, aspect, "")
+
+
 # ─────────────── difficulty probe (why a stage will struggle) ───────────────
 
 @dataclass

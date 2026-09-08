@@ -110,6 +110,7 @@ def run_all(files=FILES, work_w=B.WORK_W):
         t = time.time()
         dsk = B.deskew(work)                       # stage 1
         pap = B.segment_paper(dsk.rotated)         # stage 2
+        scp = B.check_scope(dsk.rotated, pap)      # scope gate
         cls = B.classify_content(dsk.rotated, pap.mask)
         sig = B.edge_signal(dsk.rotated)
         ms = (time.time() - t) * 1000
@@ -117,7 +118,7 @@ def run_all(files=FILES, work_w=B.WORK_W):
         out.append(dict(
             idx=n + 1, name=os.path.basename(f), path=f,
             work=work, scale=scale,
-            deskew=dsk, paper=pap, content=cls, signal=sig, ms=ms))
+            deskew=dsk, paper=pap, scope=scp, content=cls, signal=sig, ms=ms))
         if (n + 1) % 25 == 0:
             print(f'  ...{n+1}/{len(files)}', flush=True)
     print(f'done: {len(out)} images in {time.time()-t0:.1f}s')
@@ -132,6 +133,10 @@ LABELS   = [r['content'].label for r in R]
 ANGLES   = [r['deskew'].angle for r in R]
 PAPER    = [r['paper'].area_frac for r in R]
 RECTFILL = [r['paper'].rect_fill for r in R]
+KIND     = [r['scope'].kind for r in R]
+INSCOPE  = [r['scope'].in_scope for r in R]
+WHITE    = [r['scope'].white_frac for r in R]
+ASPECT   = [r['scope'].aspect for r in R]
 CONTRAST = [r['paper'].contrast for r in R]
 PTR      = [r['signal'].peak_to_interior for r in R]
 RIVALS   = [r['signal'].rival_columns for r in R]
@@ -140,6 +145,7 @@ MS       = [r['ms'] for r in R]
 from collections import Counter
 print()
 print('content classes:', Counter(LABELS).most_common())
+print('capture kinds  :', Counter(KIND).most_common())
 print(f'per-image time: median {np.median(MS):.0f} ms')
 """)
 
@@ -301,8 +307,10 @@ V.by_class(RECTFILL, LABELS,
            title='Mask rectangularity by content class',
            ylabel='rect fill fraction')
 
-paper_bad = [(p < 0.10 or p > 0.75 or rf < 0.75)
-              for p, rf in zip(PAPER, RECTFILL)]
+# Out-of-scope captures (closed books) are excluded: their masks are SUPPOSED to be
+# poor, so scoring them as segmentation failures would understate the stage.
+paper_bad = [ins and (p < 0.10 or p > 0.75 or rf < 0.75)
+             for p, rf, ins in zip(PAPER, RECTFILL, INSCOPE)]
 V.scorecard(LABELS, [not b for b in paper_bad],
             'Stage 2 paper segmentation (0.10 <= fraction <= 0.75)')
 """)
@@ -323,6 +331,71 @@ reasons = [r['paper'].note or
            for r in R]
 V.show_flagged(ov, NAMES, paper_bad, reasons, cols=3, width=520,
                title='Stage 2 FLAGGED — inspect these')
+""")
+
+# ────────────────────────────────────────────────────────────────
+md(r"""
+## 5b. Scope gate — reject closed books, keep single sheets
+
+Closed books (a photographed cover) are **out of scope**: no page to flatten, no gutter,
+no split. Single-page documents (flyers, magazine covers, brochures) **stay in scope** —
+they are genuinely *easier* than spreads, measuring `rect_fill` 0.88–0.997 against
+0.95–0.99 for spreads. They simply take the no-gutter path.
+
+The discriminator is the **fraction of the detected region that is near-white paper**,
+because it keys on what the material physically *is*. Two simpler signals were tried and
+both failed:
+
+* **area fraction** — #43, a valid spread, sits at 0.226, right among the closed books;
+* **region brightness** — #71/#73, valid single sheets, have median 102–104, *below*
+  several closed books at 112–153.
+
+White fraction separates cleanly: closed books 0.010–0.069, valid pages 0.157–0.924.
+Aspect resolves the two edge cases — a full-bleed colour spread with no white margin
+(#115, white 0.093) is accepted because it is landscape, and a dark cover where only the
+title strip segments (#17/#18, aspect 3.77/2.48) is rejected because a real spread never
+exceeds ~1.6.
+""")
+
+code(r"""
+plt.figure(figsize=(9, 5.5))
+cols = {'spread': '#2e7d32', 'single': '#1565c0', 'closed-book': '#c62828'}
+for k, c in cols.items():
+    ix = [i for i, kk in enumerate(KIND) if kk == k]
+    if not ix:
+        continue
+    plt.scatter([WHITE[i] for i in ix], [ASPECT[i] for i in ix],
+                c=c, label=f'{k} (n={len(ix)})', s=42, alpha=0.8,
+                edgecolors='white', linewidths=0.5)
+    for i in ix:
+        if KIND[i] == 'closed-book':
+            plt.annotate(f'#{IDX[i]}', (WHITE[i], ASPECT[i]),
+                         fontsize=8, xytext=(4, 3), textcoords='offset points')
+plt.axvline(0.12, color='red', ls='--', lw=1.2, label='white 0.12')
+plt.axhline(1.10, color='gray', ls=':', lw=1.2, label='aspect 1.10 / 2.00')
+plt.axhline(2.00, color='gray', ls=':', lw=1.2)
+plt.xlabel('fraction of region that is near-white paper')
+plt.ylabel('region aspect (w/h)')
+plt.title('Scope gate — closed books separate on white fraction + aspect')
+plt.legend(fontsize=8); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+V.scorecard(LABELS, INSCOPE, 'Scope gate (in-scope captures)')
+""")
+
+code(r"""
+# Every rejected capture, shown large. These must ALL be closed books --
+# a valid page appearing here is a false positive and a bug.
+rej = [not s for s in INSCOPE]
+V.show_flagged([r['work'] for r in R], NAMES, rej,
+               [r['scope'].reason for r in R], cols=3, width=460,
+               title='REJECTED as out of scope — verify every one is a closed book')
+
+# And the single-sheet captures, which stay in scope on the no-gutter path.
+sng = [k == 'single' for k in KIND]
+V.grid([R[i]['work'] for i, b in enumerate(sng) if b],
+       [f"#{R[i]['idx']}" for i, b in enumerate(sng) if b],
+       cols=8, width=210,
+       title='IN SCOPE — single-page documents (no gutter, no split)')
 """)
 
 # ────────────────────────────────────────────────────────────────
@@ -354,6 +427,9 @@ rows = [dict(idx=r['idx'], name=r['name'], label=r['content'].label,
              rect_fill=round(r['paper'].rect_fill, 4),
              ptr=round(r['signal'].peak_to_interior, 3),
              rivals=r['signal'].rival_columns,
+             kind=r['scope'].kind, in_scope=r['scope'].in_scope,
+             white=round(r['scope'].white_frac, 4),
+             aspect=round(r['scope'].aspect, 3),
              note=r['paper'].note, ms=round(r['ms'], 1)) for r in R]
 with open('phase0_baseline.json', 'w') as fh:
     json.dump(rows, fh, indent=1)
@@ -365,15 +441,15 @@ md(r"""
 
 Recorded here so they are not silently carried forward:
 
+0. **Closed books are now rejected up front** by the scope gate (#17, 18, 30–33), with
+   zero valid pages wrongly skipped. Single-page documents stay in scope on a no-gutter
+   path.
 1. **Residual wall blob on ~6 images** (#109, #112, #117, #121–123). The occupancy trim
    removed it from the majority (#97–107, #113, #119, #124–130 are now clean), but where
    the blob overlaps the book's own row band it survives both the occupancy trim and
    `rect_fill` (min is now 0.832, so nothing flags). Needs a left-edge verticality test in
    Stage 3 — the book's true side edge is a long straight near-vertical line, the blob's is
    not.
-2. **Images 17, 18 (black covers)** — paper fraction 0.05/0.07; only the bright title
-   strip is caught. Brightness cannot segment a black cover against a dark stand. These
-   are single *closed* books, not open spreads — scope to be confirmed.
 3. **The fore-edge block is included in the paper mask.** Correct at this stage: the mask
    is *paper*, and the block *is* paper. Separating the front page from the block is
    Stage 3's job (the "front pages, not side pages" requirement).
