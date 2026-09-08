@@ -149,6 +149,12 @@ class PaperResult:
     contrast: float
     area_frac: float
     bbox: Tuple[int, int, int, int]   # x, y, w, h
+    # Fraction of the mask's own minAreaRect that the mask fills.  An open book is
+    # very nearly a filled rectangle (measured 0.81-0.95); a book with a wall blob
+    # or a hand fused onto it is not.  This metric exists because area_frac ALONE
+    # passed ~40 images whose masks were visibly contaminated -- the blob kept the
+    # area inside the accepted window.  Shape catches what area cannot.
+    rect_fill: float = 0.0
     found: bool = True
     note: str = ""
 
@@ -188,29 +194,41 @@ def segment_paper(img: np.ndarray) -> PaperResult:
     contrast = paper - bg
     note = ""
 
-    # Otsu on the whole frame, as the primary threshold.  A fixed offset from the
-    # corner background (bg + k*contrast) was tried first and FAILED on ~26 of the
-    # 130: images 90-121 are shot with a lit wall visible behind the stand, so the
-    # corner patches read ~47 (stand) while the frame median is ~150 (wall).  Any
-    # threshold anchored only on the corners lands below the wall's level and the
-    # wall floods in as "paper" -- measured paper fractions of 0.77..0.98 where the
-    # book really occupies about half the frame.  Otsu instead splits on the image's
-    # own bimodal histogram, which puts the wall on the dark side of the split where
-    # it belongs.
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Threshold is anchored on the PAPER level, not on Otsu's split and not on an
+    # offset from the corner background.  Both of those were tried on the real
+    # corpus and both failed, in opposite directions:
+    #
+    #   * bg + k*contrast  -- images 90-121 are shot with a lit wall behind the
+    #     stand.  Corner patches read ~47 (stand) while the frame median is ~150
+    #     (wall), so a corner-anchored threshold sits under the wall and the wall
+    #     floods in: paper fractions of 0.77-0.98 where the book covers ~half.
+    #
+    #   * Otsu -- better, but still lands at 126-148 on those same images while
+    #     the wall itself sits at 90-118.  Visual check of all 130 (not the area
+    #     metric, which happily passed them) showed a wall blob fused to the book
+    #     in ~40 masks, and because it is CONNECTED to the book, "largest
+    #     component" cannot drop it.
+    #
+    # Paper, however, is consistently ~220-240 while the wall is ~90-118: a gap of
+    # 116+ levels on every image measured.  So key the threshold on the paper mode
+    # and cut well below it but far above the wall.  This is the same
+    # content-invariance argument as the module docstring: ink lowers a
+    # neighbourhood mean by tens of levels, nothing like this gap.
     otsu_t = float(cv2.threshold(gray, 0, 255,
                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
 
     if contrast < 25:
         # Black cover / very dark material (imgs 17, 18): brightness alone cannot
         # separate object from stand.  Otsu is all we have; flag it.
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         note = f"low contrast ({contrast:.0f}) -- dark cover, Otsu only"
-    elif otsu_t < bg + 15:
-        # Degenerate split (threshold at or below the stand level) -- fall back to
-        # an offset from the background rather than accept a whole-frame mask.
-        t = bg + max(contrast * 0.35, 20)
+    else:
+        # 0.62 of the way from stand to paper.  Low enough to keep shadowed paper
+        # near the gutter and the darker fore-edge block; high enough to exclude a
+        # lit wall.  Also require the cut to clear Otsu, so on a plain dark-stand
+        # image (where Otsu is already correct) we never threshold lower than it.
+        t = max(bg + contrast * 0.62, otsu_t)
         _, th = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
-        note = f"otsu t={otsu_t:.0f} <= bg -- using bg offset {t:.0f}"
 
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
@@ -218,7 +236,7 @@ def segment_paper(img: np.ndarray) -> PaperResult:
     n, lab, stats, _ = cv2.connectedComponentsWithStats(th, 8)
     if n <= 1:
         return PaperResult(np.zeros_like(gray), bg, paper, contrast, 0.0,
-                           (0, 0, 0, 0), False, "no paper region found")
+                           (0, 0, 0, 0), 0.0, False, "no paper region found")
     k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     mask = np.where(lab == k, 255, 0).astype(np.uint8)
 
@@ -228,11 +246,70 @@ def segment_paper(img: np.ndarray) -> PaperResult:
     cv2.floodFill(ff, pad, (0, 0), 255)
     mask = mask | cv2.bitwise_not(ff)
 
+    # ---- trim side blobs by column/row occupancy -------------------------
+    # Raising the threshold shrank the lit-wall blob on images ~90-130 but did not
+    # remove it: the wall is bright enough in places to survive any brightness cut
+    # that still keeps shadowed paper, it is CONNECTED to the book so component
+    # selection cannot drop it, and it is convex enough that rect_fill only caught
+    # one of them.  So separate it structurally instead.
+    #
+    # The signature is unambiguous in the mask's own column-occupancy profile: a
+    # wall/hand blob occupies ~0.17-0.19 of the column height, while a real book
+    # column occupies ~0.7+.  Keep only the central run of columns (and then rows)
+    # that clear a fraction of the profile's own peak -- so this adapts per image
+    # rather than assuming a fixed page height.  A book is one solid horizontal
+    # run by construction, so taking the run CONTAINING THE PEAK column can never
+    # split a genuine spread.
+    def _trim(m: np.ndarray, axis: int, keep_frac: float = 0.45) -> np.ndarray:
+        occ = (m > 0).sum(axis=axis).astype(np.float32)
+        if occ.max() <= 0:
+            return m
+        good = occ >= occ.max() * keep_frac
+        if not good.any():
+            return m
+        peak = int(np.argmax(occ))
+        lo = peak
+        while lo > 0 and good[lo - 1]:
+            lo -= 1
+        hi = peak
+        while hi < len(good) - 1 and good[hi + 1]:
+            hi += 1
+        out = np.zeros_like(m)
+        if axis == 0:      # occ indexed by column -> keep columns lo..hi
+            out[:, lo:hi + 1] = m[:, lo:hi + 1]
+        else:              # occ indexed by row
+            out[lo:hi + 1, :] = m[lo:hi + 1, :]
+        return out
+
+    trimmed = _trim(_trim(mask, axis=0), axis=1)
+    if (trimmed > 0).sum() > 0.25 * max((mask > 0).sum(), 1):
+        # Only accept the trim if it kept the bulk of the region; otherwise the
+        # occupancy profile was not book-shaped and we keep the untrimmed mask
+        # rather than silently discarding most of the page.
+        mask = trimmed
+    else:
+        note = ((note + "; " if note else "")
+                + "occupancy trim rejected (would remove >75% of mask)")
+
     x, y, bw, bh = cv2.boundingRect(mask)
     frac = float((mask > 0).mean())
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        c = max(cnts, key=cv2.contourArea)
+        (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+        rect_area = rw * rh
+        rect_fill = float(cv2.contourArea(c) / rect_area) if rect_area > 0 else 0.0
+    else:
+        rect_fill = 0.0
+
     if frac < 0.08:
         note = (note + "; " if note else "") + f"paper only {frac:.1%} of frame"
-    return PaperResult(mask, bg, paper, contrast, frac, (x, y, bw, bh), True, note)
+    if rect_fill and rect_fill < 0.75:
+        note = ((note + "; " if note else "")
+                + f"mask fills only {rect_fill:.0%} of its rect -- blob attached?")
+    return PaperResult(mask, bg, paper, contrast, frac, (x, y, bw, bh),
+                       rect_fill, True, note)
 
 
 # ───────────────── content classification (diagnostic) ─────────────────
