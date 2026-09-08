@@ -150,6 +150,13 @@ brightness, which content barely perturbs.
 code_section("boundary")
 
 md(r"""
+### Stage 3b — top/bottom edge trace and notch gutter
+Ported from the original `boundary_prototype.ipynb`. Reads the gutter off the SHAPE of the
+traced top/bottom edges rather than looking for it directly.
+""")
+code_section("tracer")
+
+md(r"""
 ### Stage 4 — finger mask and page-colour fill
 """)
 code_section("finger")
@@ -182,6 +189,7 @@ def run_all(files=FILES, work_w=WORK_W):
         pap = segment_paper(dsk.rotated)         # stage 2
         scp = check_scope(dsk.rotated, pap)      # scope gate
         bnd = detect_boundary(dsk.rotated, pap, scp) if scp.in_scope else None
+        trc = trace_edges(dsk.rotated, pap, bnd) if bnd else None
         fng = detect_fingers(dsk.rotated, pap, bnd) if bnd else None
         cls = classify_content(dsk.rotated, pap.mask)
         sig = edge_signal(dsk.rotated)
@@ -190,7 +198,7 @@ def run_all(files=FILES, work_w=WORK_W):
         out.append(dict(
             idx=n + 1, name=os.path.basename(f), path=f,
             work=work, scale=scale,
-            deskew=dsk, paper=pap, scope=scp, bound=bnd, finger=fng,
+            deskew=dsk, paper=pap, scope=scp, bound=bnd, trace=trc, finger=fng,
             content=cls, signal=sig, ms=ms))
         if (n + 1) % 25 == 0:
             print(f'  ...{n+1}/{len(files)}', flush=True)
@@ -214,6 +222,8 @@ SPAN     = [((r['bound'].right - r['bound'].left) / float(r['paper'].bbox[2]))
             if r['bound'] else 0.0 for r in R]
 HASGUT   = [bool(r['bound'] and r['bound'].gutter is not None) for r in R]
 BLOCKL   = [r['bound'].block_left if r['bound'] else 0 for r in R]
+NOTCH    = [bool(r['trace'] and r['trace'].notch_found) for r in R]
+GUTTER2  = [(r['trace'].gutter_x if r['trace'] else None) for r in R]
 NFING    = [r['finger'].n_regions if r['finger'] else 0 for r in R]
 FAREA    = [r['finger'].area_frac if r['finger'] else 0.0 for r in R]
 OVERTEXT = [bool(r['finger'] and r['finger'].over_text) for r in R]
@@ -561,6 +571,82 @@ nogut = [KIND[i] == 'spread' and not HASGUT[i] for i in range(len(R))]
 show_flagged(ovb, NAMES, nogut,
                [R[i]['bound'].note if R[i]['bound'] else '' for i in range(len(R))],
                cols=3, width=520, title='Stage 3 - spreads with NO gutter detected')
+""")
+
+# ────────────────────────────────────────────────────────────────
+md(r"""
+## 8b. Stage 3b results — traced edges and notch gutter
+
+The original prototype's approach, and it is a better idea than the brightness dip used
+in Stage 3. The gutter is a **crease, not an edge**: searching for it directly makes a
+per-row scan wander by ~200px chasing text and shadow contrast near the spine. Instead,
+trace the top and bottom page edges — which *are* strong and continuous — and read the
+gutter off their **shape**. As the pages bend into the spine both curves dip toward each
+other, producing a V-notch at the gutter by construction.
+
+Why that matters here: a notch is a **geometric** consequence of the binding, so it
+survives full-bleed colour and dense text, which flatten or fake a brightness dip. It also
+yields the gutter as two anchor points with a real slope, rather than one vertical line.
+
+Two guards carried over from the original, both learned the hard way there:
+
+* the trace is **continuity-constrained** — a free per-column argmax over Gy falls into
+  text-line edges, which are the same order of magnitude in the gradient as the true page
+  edge, so each step may only move ±6 rows from the previous column;
+* the notch must be a **genuine interior turning point with prominence**, never the most
+  extreme value in the window — both curves are noisy and sloped, so a plain argmax often
+  lands on the window boundary, which is not a turning point but simply where the search
+  stopped.
+""")
+
+code(r"""
+tr = [i for i, r in enumerate(R) if r['trace'] is not None]
+spread_i = [i for i in tr if KIND[i] == 'spread']
+print(f'notch gutter found on {sum(NOTCH[i] for i in spread_i)}/{len(spread_i)} spreads')
+print(f'brightness-dip gutter (Stage 3) on {sum(HASGUT[i] for i in spread_i)}/{len(spread_i)}')
+
+both = [i for i in spread_i if NOTCH[i] and HASGUT[i]]
+d = [abs(GUTTER2[i] - R[i]['bound'].gutter) for i in both]
+print(f'\nboth methods agree on {len(both)} spreads; |difference| in px:')
+print(f'  median {np.median(d):.0f}   p90 {np.percentile(d, 90):.0f}   max {max(d)}')
+hist(d, title='Gutter: notch method vs brightness dip - disagreement (px)',
+     xlabel='|difference| px',
+     vlines=[(40, '40px - materially different', 'red')])
+""")
+
+code(r"""
+def draw_trace(r):
+    o = r['deskew'].rotated.copy()
+    t = r['trace']
+    if t is None or t.top.size == 0:
+        return o
+    for i in range(t.top.size):
+        x = t.x0 + i
+        cv2.circle(o, (x, int(t.top[i])), 1, (0, 255, 255), -1)
+        cv2.circle(o, (x, int(t.bottom[i])), 1, (255, 255, 0), -1)
+    if t.notch_found:
+        cv2.line(o, t.top_notch, t.bot_notch, (255, 0, 255), 5)
+        cv2.circle(o, t.top_notch, 11, (0, 0, 255), -1)
+        cv2.circle(o, t.bot_notch, 11, (0, 0, 255), -1)
+    b = r['bound']
+    if b.gutter is not None:      # Stage 3's answer, for comparison
+        cv2.line(o, (b.gutter, b.top), (b.gutter, b.bottom), (0, 255, 0), 2)
+    return o
+
+ovt = [draw_trace(r) for r in R]
+grid([ovt[i] for i in tr],
+     [f"#{R[i]['idx']}{' N' if NOTCH[i] else ''}" for i in tr],
+     cols=8, width=200, flags=[not NOTCH[i] and KIND[i] == 'spread' for i in tr],
+     title='Stage 3b - traced top (yellow) / bottom (cyan) edges, magenta = notch gutter, '
+           'green = Stage 3 brightness gutter')
+""")
+
+code(r"""
+# Spreads where the notch method found no gutter.
+miss = [KIND[i] == 'spread' and not NOTCH[i] for i in range(len(R))]
+show_flagged(ovt, NAMES, miss,
+             [(R[i]['trace'].note if R[i]['trace'] else '') for i in range(len(R))],
+             cols=3, width=520, title='Stage 3b - no notch found')
 """)
 
 # ────────────────────────────────────────────────────────────────
