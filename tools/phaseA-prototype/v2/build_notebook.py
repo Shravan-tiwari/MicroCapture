@@ -112,6 +112,7 @@ def run_all(files=FILES, work_w=B.WORK_W):
         pap = B.segment_paper(dsk.rotated)         # stage 2
         scp = B.check_scope(dsk.rotated, pap)      # scope gate
         bnd = B.detect_boundary(dsk.rotated, pap, scp) if scp.in_scope else None
+        fng = B.detect_fingers(dsk.rotated, pap, bnd) if bnd else None
         cls = B.classify_content(dsk.rotated, pap.mask)
         sig = B.edge_signal(dsk.rotated)
         ms = (time.time() - t) * 1000
@@ -119,7 +120,7 @@ def run_all(files=FILES, work_w=B.WORK_W):
         out.append(dict(
             idx=n + 1, name=os.path.basename(f), path=f,
             work=work, scale=scale,
-            deskew=dsk, paper=pap, scope=scp, bound=bnd,
+            deskew=dsk, paper=pap, scope=scp, bound=bnd, finger=fng,
             content=cls, signal=sig, ms=ms))
         if (n + 1) % 25 == 0:
             print(f'  ...{n+1}/{len(files)}', flush=True)
@@ -143,6 +144,9 @@ SPAN     = [((r['bound'].right - r['bound'].left) / float(r['paper'].bbox[2]))
             if r['bound'] else 0.0 for r in R]
 HASGUT   = [bool(r['bound'] and r['bound'].gutter is not None) for r in R]
 BLOCKL   = [r['bound'].block_left if r['bound'] else 0 for r in R]
+NFING    = [r['finger'].n_regions if r['finger'] else 0 for r in R]
+FAREA    = [r['finger'].area_frac if r['finger'] else 0.0 for r in R]
+OVERTEXT = [bool(r['finger'] and r['finger'].over_text) for r in R]
 CONTRAST = [r['paper'].contrast for r in R]
 PTR      = [r['signal'].peak_to_interior for r in R]
 RIVALS   = [r['signal'].rival_columns for r in R]
@@ -491,6 +495,84 @@ V.show_flagged(ovb, NAMES, nogut,
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
+## 5d. Stage 4 — finger mask and page-colour fill
+
+The requirement: **fill the finger region with the colour of the page.** Deliberately not
+content reconstruction — nothing is invented that could pass as real text. A flat fill
+either looks right (on a margin, the dominant case here: thumbs holding the book open) or
+looks obviously like a patch, which is a safe failure.
+
+Two things make this work that the old pipeline's skin detector did not have:
+
+1. **Stage 3 already knows where the page is**, so only skin *inside* the page bounds is
+   considered — a hand resting on the stand is irrelevant.
+2. **Printed photos of people are rejected structurally.** A real finger enters from
+   outside the page, so its region must touch the page boundary. A skin-toned region fully
+   enclosed by page content never does, however finger-shaped it looks.
+
+The chroma window had to be tightened after measuring: textbook YCrCb bounds
+(Cr 135–180, Cb 85–135) fired on **105 of 124** captures with regions up to **53% of the
+page** — aged cream book paper sits close to skin in chroma. Adding a luma test (skin is
+markedly darker than lit paper, ratio < 0.82) and an area cap brought this to 69/124
+(56%), median region 1.3% of page area, which matches the visible rate in the corpus.
+
+The fill colour is sampled **locally** from surrounding page pixels, not as one global
+page colour: a curved page shades noticeably from gutter to fore-edge, so a single flat
+value would show as a mismatched rectangle.
+""")
+
+code(r"""
+fin = [i for i, r in enumerate(R) if r['finger']]
+print(f'fingers detected on {sum(1 for i in fin if NFING[i])} / {len(fin)} in-scope captures')
+print(f'regions overlapping inked content: {sum(OVERTEXT)}')
+
+V.hist([FAREA[i] for i in fin if NFING[i]],
+       title='Stage 4 - finger region as fraction of page area',
+       xlabel='area fraction',
+       vlines=[(0.22, '0.22 - rejected above this', 'red')])
+V.by_class([FAREA[i] for i in fin], [LABELS[i] for i in fin],
+           title='Finger area by content class - IMAGE-HEAVY is the false-positive risk',
+           ylabel='area fraction')
+""")
+
+code(r"""
+# Mask overlay for every capture where a finger was found.
+fmask = [i for i in fin if NFING[i]]
+V.grid([V.overlay_mask(R[i]['deskew'].rotated, R[i]['finger'].mask, (0, 0, 255), 0.55)
+        for i in fmask],
+       [f"#{R[i]['idx']} {FAREA[i]:.3f}{' TEXT' if OVERTEXT[i] else ''}" for i in fmask],
+       cols=8, width=200, flags=[OVERTEXT[i] for i in fmask],
+       title='Stage 4 - detected finger mask (red). Red border = overlaps inked content')
+""")
+
+code(r"""
+# Before / after fill, on the largest detections -- this is where a bad mask shows.
+top = sorted(fmask, key=lambda i: -FAREA[i])[:8]
+fig, axes = plt.subplots(len(top), 2, figsize=(13, 3.1 * len(top)))
+for row, i in enumerate(top):
+    r = R[i]
+    axes[row, 0].imshow(cv2.cvtColor(V.thumb(r['deskew'].rotated, 420), cv2.COLOR_BGR2RGB))
+    axes[row, 0].set_title(f"#{r['idx']} original"); axes[row, 0].axis('off')
+    axes[row, 1].imshow(cv2.cvtColor(V.thumb(r['finger'].filled, 420), cv2.COLOR_BGR2RGB))
+    axes[row, 1].set_title(f"filled with page colour ({FAREA[i]:.1%} of page)"
+                           + ('  -- OVER TEXT' if OVERTEXT[i] else ''))
+    axes[row, 1].axis('off')
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+# Fingers sitting on inked content: the fill ERASES that text. Shown so the
+# operator can decide policy (fill anyway vs flag for recapture) with the real
+# cases in front of them rather than in the abstract.
+V.show_flagged([r['finger'].filled if r['finger'] else r['work'] for r in R],
+               NAMES, OVERTEXT,
+               [r['finger'].note if r['finger'] else '' for r in R],
+               cols=3, width=520,
+               title='Stage 4 - finger over inked content (fill erases it)')
+""")
+
+# ────────────────────────────────────────────────────────────────
+md(r"""
 ## 6. Phase 0 baseline scorecard
 
 Where we stand **before** any boundary/gutter/finger work. Every later change is measured
@@ -505,6 +587,8 @@ V.scorecard(LABELS, [not b for b in big],      'Stage 1  deskew')
 V.scorecard(LABELS, [not b for b in paper_bad],'Stage 2  paper segmentation')
 V.scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
             'Stage 3  front-page boundary')
+V.scorecard([LABELS[i] for i in fin], [not OVERTEXT[i] for i in fin],
+            'Stage 4  finger fill (safe = not over inked content)')
 
 print(f"\nper-image time: median {np.median(MS):.0f} ms  "
       f"(full corpus {np.sum(MS)/1000:.1f}s)")

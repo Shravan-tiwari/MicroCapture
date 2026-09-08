@@ -646,6 +646,132 @@ def detect_boundary(img, paper, scope):
     return PageBoundary(left, right, y, y + bh, gutter, scope.kind,
                         block_left, block_right, True, prof, page_level, note)
 
+# ───────────── stage 4: finger mask + page-colour fill ─────────────
+
+@dataclass
+class FingerResult:
+    mask: np.ndarray             # uint8 0/255, skin overlapping the page
+    filled: np.ndarray           # image with the mask filled in page colour
+    n_regions: int
+    area_frac: float             # fraction of the page area covered
+    over_text: bool              # any region sits on inked content, not margin
+    note: str = ""
+
+
+# YCrCb skin bounds.  Cr/Cb are chroma channels, so this is largely invariant to
+# how brightly the hand is lit -- which matters because the same hand is lit very
+# differently at the edge of the stand than over the page.
+# Tightened after measuring the corpus: the first (textbook) bounds Cr 135-180 /
+# Cb 85-135 fired on 105 of 124 in-scope captures with regions up to 53% of the
+# page, i.e. warm-toned PAPER was being classified as skin.  Aged/cream book paper
+# sits close to skin in chroma, so the window has to be narrow and paired with the
+# brightness test below -- skin is markedly darker than lit paper.
+SKIN_CR = (138, 173)
+SKIN_CB = (77, 127)
+# Skin is darker than the page it covers.  Measured on this rig, page sits ~215-240
+# while a lit hand sits well below; this ratio rejects warm paper outright.
+SKIN_MAX_LUMA_RATIO = 0.82
+# A finger region larger than this fraction of the page is not a finger.
+FINGER_MAX_AREA_FRAC = 0.22
+
+
+def detect_fingers(img: np.ndarray, paper: PaperResult,
+                   bound: 'PageBoundary') -> FingerResult:
+    """Stage 4 -- find fingers over the page and fill them with page colour.
+
+    The operator's spec is explicit: fill the finger region with the colour of the
+    page.  That is deliberately NOT content reconstruction -- nothing is invented
+    that could pass as real text.  A flat fill either looks right (on a margin,
+    which is the dominant case: thumbs holding the book open at the page edges) or
+    looks obviously like a patch, which is a safe failure.
+
+    Two things make this reliable here that were not available to the old
+    pipeline's skin detector:
+
+      1. Stage 3 already knows where the printed page is, so we only consider skin
+         INSIDE the page bounds.  A hand resting on the stand is irrelevant.
+      2. A printed photograph of a person is the classic false positive.  It is
+         rejected structurally: a real finger enters from outside the page, so its
+         region must touch the page boundary.  A skin-toned region fully enclosed
+         by page content never does, however finger-shaped it looks.
+
+    The fill colour is sampled LOCALLY from a dilated ring of page pixels around
+    each region, not as one global page colour: a curved page shades noticeably
+    from gutter to fore-edge, so a single flat value would show as a mismatched
+    rectangle.
+    """
+    h, w = img.shape[:2]
+    page = np.zeros((h, w), np.uint8)
+    page[bound.top:bound.bottom, bound.left:bound.right] = 255
+    page = cv2.bitwise_and(page, (paper.mask > 0).astype(np.uint8) * 255)
+
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+    gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    pp = gray0[page > 0]
+    plevel = float(np.percentile(pp, 75)) if pp.size else 220.0
+    skin = ((cr >= SKIN_CR[0]) & (cr <= SKIN_CR[1]) &
+            (cb >= SKIN_CB[0]) & (cb <= SKIN_CB[1]) &
+            (gray0 < plevel * SKIN_MAX_LUMA_RATIO)).astype(np.uint8) * 255
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    # Only skin that is ON the page matters.
+    skin_on_page = cv2.bitwise_and(skin, page)
+
+    page_area = float(max((page > 0).sum(), 1))
+    keep = np.zeros((h, w), np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(skin_on_page, 8)
+    kept = 0
+    for k in range(1, n):
+        area = stats[k, cv2.CC_STAT_AREA]
+        if area < page_area * 0.002:          # noise / skin-toned print speckle
+            continue
+        x0, y0, ww, hh = (stats[k, cv2.CC_STAT_LEFT], stats[k, cv2.CC_STAT_TOP],
+                          stats[k, cv2.CC_STAT_WIDTH], stats[k, cv2.CC_STAT_HEIGHT])
+        # Must touch the page boundary: a real finger enters from outside it.
+        m = 6
+        touches = (x0 <= bound.left + m or y0 <= bound.top + m or
+                   x0 + ww >= bound.right - m or y0 + hh >= bound.bottom - m)
+        if not touches:
+            continue
+        if area > page_area * FINGER_MAX_AREA_FRAC:
+            continue          # too big to be a finger -- shadow band or dark page
+        keep[lab == k] = 255
+        kept += 1
+
+    if kept == 0:
+        return FingerResult(keep, img.copy(), 0, 0.0, False, "no finger on page")
+
+    keep = cv2.dilate(keep, np.ones((13, 13), np.uint8))   # cover the soft edge
+    keep = cv2.bitwise_and(keep, page)
+
+    # ---- does any region sit on inked content rather than blank margin? -----
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ring = cv2.dilate(keep, np.ones((41, 41), np.uint8)) & ~keep & page
+    page_px = gray[page > 0]
+    page_level = float(np.percentile(page_px, 75)) if page_px.size else 220.0
+    ring_px = gray[ring > 0]
+    over_text = bool(ring_px.size and (ring_px < page_level * 0.75).mean() > 0.18)
+
+    # ---- fill with LOCAL page colour ---------------------------------------
+    filled = img.copy()
+    # Blur the image heavily with the finger pixels excluded, so each filled pixel
+    # takes the colour of nearby PAGE, following the page's own shading gradient.
+    src = img.copy()
+    src[keep > 0] = 0
+    valid = (page > 0) & (keep == 0)
+    vf = valid.astype(np.float32)
+    k = 121
+    num = cv2.blur(src.astype(np.float32) * vf[..., None], (k, k))
+    den = cv2.blur(vf, (k, k))[..., None]
+    local = num / np.maximum(den, 1e-3)
+    filled[keep > 0] = np.clip(local[keep > 0], 0, 255).astype(np.uint8)
+
+    frac = float((keep > 0).sum() / page_area)
+    note = "finger overlaps inked content -- fill will erase it" if over_text else ""
+    return FingerResult(keep, filled, kept, frac, over_text, note)
+
 # ─────────────── difficulty probe (why a stage will struggle) ───────────────
 
 @dataclass
