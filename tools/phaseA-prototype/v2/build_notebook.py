@@ -9,6 +9,21 @@ import os
 
 CELLS = []
 
+# Stage source is loaded from _sections.json rather than embedded in a
+# code(r"""...""") literal: the stage functions contain their own """ docstrings,
+# which would terminate the wrapper early.
+import json as _json, os as _os
+_SEC = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                     '_sections.json')))
+
+
+def code_section(key):
+    """Emit one section of stage source as its own code cell."""
+    CELLS.append({"cell_type": "code", "metadata": {}, "outputs": [],
+                  "execution_count": None,
+                  "source": _lines(_SEC[key])})
+
+
 
 def _lines(src):
     """nbformat wants each source line to KEEP its trailing newline.  Splitting
@@ -68,19 +83,13 @@ strength.**
 """)
 
 code(r"""
-import sys, os, glob, time, json
-sys.path.insert(0, os.path.abspath('.'))
+import os, glob, time, json, math
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
 
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-
-import bookcv as B
-import viz as V
-
-# Reload on edit, so tweaking bookcv.py doesn't need a kernel restart.
-%load_ext autoreload
-%autoreload 2
 
 DATA = os.path.expanduser(
     '~/Micrographics/MicroCapture/Dataset-Training/output')
@@ -88,33 +97,94 @@ FILES = sorted(glob.glob(os.path.join(DATA, '*.jpg')))
 print(f'{len(FILES)} images found in {DATA}')
 im0 = cv2.imread(FILES[0])
 print('native resolution:', im0.shape[1], 'x', im0.shape[0])
-print('working width    :', B.WORK_W)
 """)
+
+md(r"""
+### Configuration and shared helpers
+""")
+code_section("config")
+
+md(r"""
+### Display helpers
+
+Every stage below shows **all 130** images: a contact sheet with the
+stage's overlay, a metric histogram, the auto-flagged failures large with reasons, and the
+metric by content class. No stage is ever judged on a single picture.
+""")
+code_section("viz")
+
+md(r"""
+## 1. Stage code — the whole pipeline
+
+Every algorithm lives here, in the notebook. Edit a function and re-run this cell, then
+re-run the driver below to see the effect across all 130 images. Nothing is imported from
+an external module.
+""")
+
+md(r"""
+### Stage 1 — deskew
+Ported from `bookcurve (8).ipynb`: Otsu -> largest contour -> minAreaRect -> rotate. Keys on
+the book SILHOUETTE, not page content, so it is content-invariant by construction.
+""")
+code_section("deskew")
+
+md(r"""
+### Stage 2 — paper-region segmentation
+The core change vs the old pipeline: segment paper as a REGION instead of tracing the
+strongest gradient, which page content defeats.
+""")
+code_section("paper")
+
+md(r"""
+### Scope gate + content classifier
+Rejects closed books; keeps single sheets. The classifier is diagnostic only and never
+routes the algorithm.
+""")
+code_section("scope_content")
+
+md(r"""
+### Stage 3 — front-page boundary and gutter
+Bounds the printed pages, excluding the fore-edge block. Keyed on per-column mean
+brightness, which content barely perturbs.
+""")
+code_section("boundary")
+
+md(r"""
+### Stage 4 — finger mask and page-colour fill
+""")
+code_section("finger")
+
+md(r"""
+### Difficulty probe
+Measures how badly page content competes with the page edge in the |Gx| profile.
+""")
+code_section("probe")
+
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 1. Run all stages over all 130 images
+## 2. Run every stage over all 130 images
 
 Pure stage functions, one pass, results kept in memory. ~0.12 s/image → ~15 s total,
 which is fast enough to re-run after every threshold change.
 """)
 
 code(r"""
-def run_all(files=FILES, work_w=B.WORK_W):
+def run_all(files=FILES, work_w=WORK_W):
     out = []
     t0 = time.time()
     for n, f in enumerate(files):
         raw = cv2.imread(f)
-        work, scale = B.to_work(raw, work_w)
+        work, scale = to_work(raw, work_w)
 
         t = time.time()
-        dsk = B.deskew(work)                       # stage 1
-        pap = B.segment_paper(dsk.rotated)         # stage 2
-        scp = B.check_scope(dsk.rotated, pap)      # scope gate
-        bnd = B.detect_boundary(dsk.rotated, pap, scp) if scp.in_scope else None
-        fng = B.detect_fingers(dsk.rotated, pap, bnd) if bnd else None
-        cls = B.classify_content(dsk.rotated, pap.mask)
-        sig = B.edge_signal(dsk.rotated)
+        dsk = deskew(work)                       # stage 1
+        pap = segment_paper(dsk.rotated)         # stage 2
+        scp = check_scope(dsk.rotated, pap)      # scope gate
+        bnd = detect_boundary(dsk.rotated, pap, scp) if scp.in_scope else None
+        fng = detect_fingers(dsk.rotated, pap, bnd) if bnd else None
+        cls = classify_content(dsk.rotated, pap.mask)
+        sig = edge_signal(dsk.rotated)
         ms = (time.time() - t) * 1000
 
         out.append(dict(
@@ -161,18 +231,18 @@ print(f'per-image time: median {np.median(MS):.0f} ms')
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 2. The corpus — every image, grouped by content class
+## 3. The corpus — every image, grouped by content class
 
 First look at what we are actually working with. Tiles are grouped so each content
 class can be judged as a group.
 """)
 
 code(r"""
-for cls in B.CLASS_ORDER:
+for cls in CLASS_ORDER:
     sel = [r for r in R if r['content'].label == cls]
     if not sel:
         continue
-    V.grid([r['work'] for r in sel],
+    grid([r['work'] for r in sel],
            [f"#{r['idx']}" for r in sel],
            cols=8, width=200,
            title=f'{cls}  —  {len(sel)} images')
@@ -180,7 +250,7 @@ for cls in B.CLASS_ORDER:
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 3. Difficulty probe — why content type predicts failure
+## 4. Difficulty probe — why content type predicts failure
 
 `peak/interior ratio` = strength of the strongest column gradient divided by the median
 gradient inside the page. **High = the page edge stands out. Low = page content is as
@@ -190,15 +260,15 @@ This is the plot that justifies the whole v2 redesign.
 """)
 
 code(r"""
-V.by_class(PTR, LABELS,
+by_class(PTR, LABELS,
            title='Edge/content separability by content class  (higher = easier)',
            ylabel='peak / interior |Gx| ratio')
 
-V.by_class(RIVALS, LABELS,
+by_class(RIVALS, LABELS,
            title='Competing columns (>50% of peak strength)  — lower = easier',
            ylabel='rival column count')
 
-V.hist(PTR, title='peak/interior ratio — whole corpus',
+hist(PTR, title='peak/interior ratio — whole corpus',
        xlabel='ratio',
        vlines=[(2.0, 'ratio 2.0 — tracer cannot separate', 'red'),
                (3.0, 'ratio 3.0 — marginal', 'orange')])
@@ -213,7 +283,7 @@ code(r"""
 fig, axes = plt.subplots(3, 2, figsize=(16, 11))
 for row, idx in enumerate([43, 96, 17]):
     r = R[idx - 1]
-    axes[row, 0].imshow(cv2.cvtColor(V.thumb(r['work'], 420), cv2.COLOR_BGR2RGB))
+    axes[row, 0].imshow(cv2.cvtColor(thumb(r['work'], 420), cv2.COLOR_BGR2RGB))
     axes[row, 0].axis('off')
     axes[row, 0].set_title(f"#{idx}  {r['content'].label}  "
                            f"ratio={r['signal'].peak_to_interior:.2f}")
@@ -230,7 +300,7 @@ plt.show()
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 4. Stage 1 — Deskew
+## 5. Stage 1 results — Deskew
 
 Ported from the operator's `bookcurve (8).ipynb`: Otsu → largest contour → `minAreaRect`
 → rotate. It keys on the **book silhouette**, not page content, so it is content-invariant
@@ -243,19 +313,19 @@ Reference run: 130/130, range −16.66°…+15.33°, mean abs 2.68°.
 """)
 
 code(r"""
-V.hist(ANGLES, title='Stage 1 — detected skew angle, all 130',
+hist(ANGLES, title='Stage 1 — detected skew angle, all 130',
        xlabel='degrees', bins=40)
-V.by_class(np.abs(ANGLES), LABELS,
+by_class(np.abs(ANGLES), LABELS,
            title='|skew angle| by content class — should be FLAT if content-invariant',
            ylabel='|degrees|')
 
 big = [abs(a) > 10 for a in ANGLES]
-V.scorecard(LABELS, [not b for b in big], 'Stage 1 deskew (|angle| <= 10 deg)')
+scorecard(LABELS, [not b for b in big], 'Stage 1 deskew (|angle| <= 10 deg)')
 """)
 
 code(r"""
 # Every image, deskewed, with its angle. Flagged = large rotation, worth eyeballing.
-V.grid([r['deskew'].rotated for r in R],
+grid([r['deskew'].rotated for r in R],
        [f"#{r['idx']}  {r['deskew'].angle:+.1f}°" for r in R],
        cols=8, width=200, flags=big,
        title='Stage 1 — deskewed output, ALL 130 (red = |angle| > 10°)')
@@ -267,9 +337,9 @@ order = np.argsort(-np.abs(ANGLES))[:6]
 fig, axes = plt.subplots(len(order), 2, figsize=(13, 3.4 * len(order)))
 for row, i in enumerate(order):
     r = R[i]
-    axes[row, 0].imshow(cv2.cvtColor(V.thumb(r['work'], 380), cv2.COLOR_BGR2RGB))
+    axes[row, 0].imshow(cv2.cvtColor(thumb(r['work'], 380), cv2.COLOR_BGR2RGB))
     axes[row, 0].set_title(f"#{r['idx']} original"); axes[row, 0].axis('off')
-    axes[row, 1].imshow(cv2.cvtColor(V.thumb(r['deskew'].rotated, 380),
+    axes[row, 1].imshow(cv2.cvtColor(thumb(r['deskew'].rotated, 380),
                                      cv2.COLOR_BGR2RGB))
     axes[row, 1].set_title(f"deskewed {r['deskew'].angle:+.2f}°")
     axes[row, 1].axis('off')
@@ -278,7 +348,7 @@ plt.tight_layout(); plt.show()
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 5. Stage 2 — Paper-region segmentation
+## 6. Stage 2 results — Paper segmentation
 
 **The core design change.** Instead of "where is the strongest vertical gradient"
 (which text defeats), we ask **"which pixels are paper"**. Paper stays bright where it
@@ -294,26 +364,26 @@ side where it belongs.
 """)
 
 code(r"""
-V.hist(PAPER, title='Stage 2 — paper area as fraction of frame, all 130',
+hist(PAPER, title='Stage 2 — paper area as fraction of frame, all 130',
        xlabel='paper fraction',
        vlines=[(0.10, 'too small — under-segmented', 'red'),
                (0.75, 'too large — background leaked in', 'red')])
 
-V.by_class(PAPER, LABELS,
+by_class(PAPER, LABELS,
            title='Paper fraction by content class — should be FLAT if content-invariant',
            ylabel='paper area fraction')
 
-V.by_class(CONTRAST, LABELS,
+by_class(CONTRAST, LABELS,
            title='Paper-to-background contrast by content class',
            ylabel='levels')
 
 # Shape, not just area. An open book nearly fills its own minAreaRect; a mask with a
 # wall blob or hand fused on does not. This metric exists because area alone passed
 # ~40 visibly contaminated masks -- the blob kept the area inside the accepted window.
-V.hist(RECTFILL, title='Stage 2 - mask fill of its own minAreaRect (shape check)',
+hist(RECTFILL, title='Stage 2 - mask fill of its own minAreaRect (shape check)',
        xlabel='filled fraction',
        vlines=[(0.75, '0.75 - blob attached below this', 'red')])
-V.by_class(RECTFILL, LABELS,
+by_class(RECTFILL, LABELS,
            title='Mask rectangularity by content class',
            ylabel='rect fill fraction')
 
@@ -321,16 +391,16 @@ V.by_class(RECTFILL, LABELS,
 # poor, so scoring them as segmentation failures would understate the stage.
 paper_bad = [ins and (p < 0.10 or p > 0.75 or rf < 0.75)
              for p, rf, ins in zip(PAPER, RECTFILL, INSCOPE)]
-V.scorecard(LABELS, [not b for b in paper_bad],
+scorecard(LABELS, [not b for b in paper_bad],
             'Stage 2 paper segmentation (0.10 <= fraction <= 0.75)')
 """)
 
 code(r"""
 # ALL 130 with the paper mask tinted and its bounding box drawn.
-ov = [V.draw_bbox(V.overlay_mask(r['deskew'].rotated, r['paper'].mask,
+ov = [draw_bbox(overlay_mask(r['deskew'].rotated, r['paper'].mask,
                                  (0, 0, 255), 0.40),
                   r['paper'].bbox, (0, 255, 0), 3) for r in R]
-V.grid(ov, [f"#{r['idx']} {r['paper'].area_frac:.2f}" for r in R],
+grid(ov, [f"#{r['idx']} {r['paper'].area_frac:.2f}" for r in R],
        cols=8, width=200, flags=paper_bad,
        title='Stage 2 — paper mask (red) + bbox (green), ALL 130')
 """)
@@ -339,13 +409,13 @@ code(r"""
 reasons = [r['paper'].note or
            ('paper fraction %.2f out of range' % r['paper'].area_frac)
            for r in R]
-V.show_flagged(ov, NAMES, paper_bad, reasons, cols=3, width=520,
+show_flagged(ov, NAMES, paper_bad, reasons, cols=3, width=520,
                title='Stage 2 FLAGGED — inspect these')
 """)
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 5b. Scope gate — reject closed books, keep single sheets
+## 7. Scope gate — reject closed books, keep single sheets
 
 Closed books (a photographed cover) are **out of scope**: no page to flatten, no gutter,
 no split. Single-page documents (flyers, magazine covers, brochures) **stay in scope** —
@@ -389,20 +459,20 @@ plt.ylabel('region aspect (w/h)')
 plt.title('Scope gate — closed books separate on white fraction + aspect')
 plt.legend(fontsize=8); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
 
-V.scorecard(LABELS, INSCOPE, 'Scope gate (in-scope captures)')
+scorecard(LABELS, INSCOPE, 'Scope gate (in-scope captures)')
 """)
 
 code(r"""
 # Every rejected capture, shown large. These must ALL be closed books --
 # a valid page appearing here is a false positive and a bug.
 rej = [not s for s in INSCOPE]
-V.show_flagged([r['work'] for r in R], NAMES, rej,
+show_flagged([r['work'] for r in R], NAMES, rej,
                [r['scope'].reason for r in R], cols=3, width=460,
                title='REJECTED as out of scope — verify every one is a closed book')
 
 # And the single-sheet captures, which stay in scope on the no-gutter path.
 sng = [k == 'single' for k in KIND]
-V.grid([R[i]['work'] for i, b in enumerate(sng) if b],
+grid([R[i]['work'] for i, b in enumerate(sng) if b],
        [f"#{R[i]['idx']}" for i, b in enumerate(sng) if b],
        cols=8, width=210,
        title='IN SCOPE — single-page documents (no gutter, no split)')
@@ -410,7 +480,7 @@ V.grid([R[i]['work'] for i, b in enumerate(sng) if b],
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 5c. Stage 3 — front-page boundary and gutter
+## 8. Stage 3 results — front-page boundary and gutter
 
 The operator's requirement: bound the **printed left and right pages**, not the side
 pages. Between the page and the stand sits the **fore-edge block** — the stack of
@@ -446,16 +516,16 @@ print(f'gutter found on {sum(HASGUT[i] for i in spreads)}/{len(spreads)} spreads
 print(f'gutter wrongly found on {sum(HASGUT[i] for i in singles)}/{len(singles)} singles'
       '  (must be 0 -- a single sheet has no gutter)')
 
-V.hist([SPAN[i] for i in inb],
+hist([SPAN[i] for i in inb],
        title='Stage 3 - detected page span as fraction of the paper bbox',
        xlabel='span / bbox width',
        vlines=[(0.80, '0.80 - under-detection below this', 'red')])
-V.by_class([SPAN[i] for i in inb], [LABELS[i] for i in inb],
+by_class([SPAN[i] for i in inb], [LABELS[i] for i in inb],
            title='Page span by content class - FLAT means content-invariant',
            ylabel='span / bbox width')
 
 span_bad = [bool(r['bound']) and s < 0.80 for r, s in zip(R, SPAN)]
-V.scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
+scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
             'Stage 3 boundary (span >= 0.80 of paper bbox)')
 """)
 
@@ -472,7 +542,7 @@ def draw_bounds(r):
     return o
 
 ovb = [draw_bounds(r) for r in R]
-V.grid([ovb[i] for i in inb],
+grid([ovb[i] for i in inb],
        [f"#{R[i]['idx']} {'g' if HASGUT[i] else '-'} {SPAN[i]:.2f}" for i in inb],
        cols=8, width=200, flags=[span_bad[i] for i in inb],
        title='Stage 3 - green = page edges, magenta = gutter, ALL in-scope captures')
@@ -481,21 +551,21 @@ V.grid([ovb[i] for i in inb],
 code(r"""
 # The under-detected cases, large. Green lines cutting into the printed page here
 # means the boundary is wrong and needs work -- not a metric to be tuned away.
-V.show_flagged(ovb, NAMES, span_bad,
+show_flagged(ovb, NAMES, span_bad,
                [f'span {SPAN[i]:.2f} of bbox' for i in range(len(R))],
                cols=3, width=520, title='Stage 3 FLAGGED - under-detected span')
 
 # Spreads where no gutter was found. Some are genuinely flat-lying books with no
 # spine shadow; any that clearly show a spine are a miss.
 nogut = [KIND[i] == 'spread' and not HASGUT[i] for i in range(len(R))]
-V.show_flagged(ovb, NAMES, nogut,
+show_flagged(ovb, NAMES, nogut,
                [R[i]['bound'].note if R[i]['bound'] else '' for i in range(len(R))],
                cols=3, width=520, title='Stage 3 - spreads with NO gutter detected')
 """)
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 5d. Stage 4 — finger mask and page-colour fill
+## 9. Stage 4 results — finger mask and page-colour fill
 
 The requirement: **fill the finger region with the colour of the page.** Deliberately not
 content reconstruction — nothing is invented that could pass as real text. A flat fill
@@ -526,11 +596,11 @@ fin = [i for i, r in enumerate(R) if r['finger']]
 print(f'fingers detected on {sum(1 for i in fin if NFING[i])} / {len(fin)} in-scope captures')
 print(f'regions overlapping inked content: {sum(OVERTEXT)}')
 
-V.hist([FAREA[i] for i in fin if NFING[i]],
+hist([FAREA[i] for i in fin if NFING[i]],
        title='Stage 4 - finger region as fraction of page area',
        xlabel='area fraction',
        vlines=[(0.22, '0.22 - rejected above this', 'red')])
-V.by_class([FAREA[i] for i in fin], [LABELS[i] for i in fin],
+by_class([FAREA[i] for i in fin], [LABELS[i] for i in fin],
            title='Finger area by content class - IMAGE-HEAVY is the false-positive risk',
            ylabel='area fraction')
 """)
@@ -538,7 +608,7 @@ V.by_class([FAREA[i] for i in fin], [LABELS[i] for i in fin],
 code(r"""
 # Mask overlay for every capture where a finger was found.
 fmask = [i for i in fin if NFING[i]]
-V.grid([V.overlay_mask(R[i]['deskew'].rotated, R[i]['finger'].mask, (0, 0, 255), 0.55)
+grid([overlay_mask(R[i]['deskew'].rotated, R[i]['finger'].mask, (0, 0, 255), 0.55)
         for i in fmask],
        [f"#{R[i]['idx']} {FAREA[i]:.3f}{' TEXT' if OVERTEXT[i] else ''}" for i in fmask],
        cols=8, width=200, flags=[OVERTEXT[i] for i in fmask],
@@ -551,9 +621,9 @@ top = sorted(fmask, key=lambda i: -FAREA[i])[:8]
 fig, axes = plt.subplots(len(top), 2, figsize=(13, 3.1 * len(top)))
 for row, i in enumerate(top):
     r = R[i]
-    axes[row, 0].imshow(cv2.cvtColor(V.thumb(r['deskew'].rotated, 420), cv2.COLOR_BGR2RGB))
+    axes[row, 0].imshow(cv2.cvtColor(thumb(r['deskew'].rotated, 420), cv2.COLOR_BGR2RGB))
     axes[row, 0].set_title(f"#{r['idx']} original"); axes[row, 0].axis('off')
-    axes[row, 1].imshow(cv2.cvtColor(V.thumb(r['finger'].filled, 420), cv2.COLOR_BGR2RGB))
+    axes[row, 1].imshow(cv2.cvtColor(thumb(r['finger'].filled, 420), cv2.COLOR_BGR2RGB))
     axes[row, 1].set_title(f"filled with page colour ({FAREA[i]:.1%} of page)"
                            + ('  -- OVER TEXT' if OVERTEXT[i] else ''))
     axes[row, 1].axis('off')
@@ -564,7 +634,7 @@ code(r"""
 # Fingers sitting on inked content: the fill ERASES that text. Shown so the
 # operator can decide policy (fill anyway vs flag for recapture) with the real
 # cases in front of them rather than in the abstract.
-V.show_flagged([r['finger'].filled if r['finger'] else r['work'] for r in R],
+show_flagged([r['finger'].filled if r['finger'] else r['work'] for r in R],
                NAMES, OVERTEXT,
                [r['finger'].note if r['finger'] else '' for r in R],
                cols=3, width=520,
@@ -573,7 +643,7 @@ V.show_flagged([r['finger'].filled if r['finger'] else r['work'] for r in R],
 
 # ────────────────────────────────────────────────────────────────
 md(r"""
-## 6. Phase 0 baseline scorecard
+## 10. Scorecard
 
 Where we stand **before** any boundary/gutter/finger work. Every later change is measured
 against this table.
@@ -583,11 +653,11 @@ code(r"""
 print('=' * 64)
 print('PHASE 0 BASELINE'.center(64))
 print('=' * 64)
-V.scorecard(LABELS, [not b for b in big],      'Stage 1  deskew')
-V.scorecard(LABELS, [not b for b in paper_bad],'Stage 2  paper segmentation')
-V.scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
+scorecard(LABELS, [not b for b in big],      'Stage 1  deskew')
+scorecard(LABELS, [not b for b in paper_bad],'Stage 2  paper segmentation')
+scorecard([LABELS[i] for i in inb], [not span_bad[i] for i in inb],
             'Stage 3  front-page boundary')
-V.scorecard([LABELS[i] for i in fin], [not OVERTEXT[i] for i in fin],
+scorecard([LABELS[i] for i in fin], [not OVERTEXT[i] for i in fin],
             'Stage 4  finger fill (safe = not over inked content)')
 
 print(f"\nper-image time: median {np.median(MS):.0f} ms  "
