@@ -32,3 +32,6 @@ __pycache__/
 # Installer build output/tools
 /installer/output/
 /installer/tools/
+
+# Training/eval corpus (1.4GB, not for git)
+/Dataset-Training/
