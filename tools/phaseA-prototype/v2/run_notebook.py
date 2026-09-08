@@ -97,6 +97,20 @@ def main():
     with open(os.path.join(outdir, 'stdout.txt'), 'w') as fh:
         fh.write('\n'.join(log))
 
+    # Also export a standalone HTML report.  VS Code keeps its own in-memory copy
+    # of an open notebook and does not reliably reload a 40MB file changed
+    # underneath it, so a run can look like it did nothing.  The HTML opens in a
+    # browser with no editor state involved.
+    html = os.path.join(HERE, 'report.html')
+    try:
+        from nbconvert import HTMLExporter
+        body, _ = HTMLExporter().from_notebook_node(nb)
+        with open(html, 'w') as fh:
+            fh.write(body)
+        print(f'html report -> {html}')
+    except ImportError:
+        print('nbconvert not installed -- skipping HTML report')
+
     print(f'\n{n_fig} figures -> {outdir}')
     print(f'{n_err} cell errors')
     print(f'executed notebook -> {executed}')
