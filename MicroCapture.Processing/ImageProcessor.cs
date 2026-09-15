@@ -3044,6 +3044,19 @@ public partial class ImageProcessor
     // A genuine top/bottom background band (desk, book cover) reads far darker than this.
     private const double GutterMinDropBelowBaselineTopBottom = 45;
 
+    // A real shadow/background band is dark starting AT the physical edge — confirmed across
+    // every real photo checked this session, the darkest point in a genuine shadow sits within
+    // the first ~1-9% of the search window. A false positive (ordinary lighting variation, a
+    // darker margin, paper texture) instead has its darkest point deep into the search window
+    // (confirmed: 62% of the way in on a real photo where this crop wrongly sliced off a whole
+    // column of real text) — a shallow, gradual dip that happens to bottom out far from the
+    // edge is content, not shadow, no matter how dark it gets by the time it does. Capping how
+    // far in the true minimum may sit is a second, independent gate alongside minDrop: minDrop
+    // alone can't tell them apart, since a shallow gradual dip and a real shadow can produce
+    // near-identical total brightness drops (confirmed: 19.6 vs 19.0 units on two real photos,
+    // one real shadow and one false positive).
+    private const double GutterMinPosMaxFraction = 0.30;
+
     /// <summary>Walks <paramref name="colMeans"/> inward from one edge, tracking the darkest
     /// column seen so far WITHIN a contiguous dark run that starts at the physical edge. Stops
     /// as soon as brightness recovers to near <paramref name="baseline"/> for
@@ -3052,8 +3065,11 @@ public partial class ImageProcessor
     /// that happens to be darker than baseline (body text, a photo) must never extend the crop.
     /// Returns the crop distance (in px, from that edge) up to and including the darkest point
     /// found before recovery — or 0 if the edge is at/near baseline from the start (no shadow),
-    /// or if it never drops far enough below baseline (past <paramref name="minDrop"/>, default
-    /// <see cref="GutterMinDropBelowBaseline"/>) to count as shadow.</summary>
+    /// if it never drops far enough below baseline (past <paramref name="minDrop"/>, default
+    /// <see cref="GutterMinDropBelowBaseline"/>) to count as shadow, or if the darkest point
+    /// found sits too far from the edge (past <see cref="GutterMinPosMaxFraction"/> of the
+    /// search window) to plausibly be a shadow band rather than ordinary content/lighting
+    /// variation that happens to bottom out partway in.</summary>
     private static int FindGutterCropPx(double[] colMeans, int width, bool fromLeft, double baseline, double minDrop = GutterMinDropBelowBaseline)
     {
         var searchPx = Math.Max(5, (int)(width * GutterSearchFraction));
@@ -3084,6 +3100,7 @@ public partial class ImageProcessor
         }
 
         if (minPos < 0 || baseline - minVal < minDrop) return 0;
+        if (minPos > searchPx * GutterMinPosMaxFraction) return 0;
         return minPos + 1;
     }
 
