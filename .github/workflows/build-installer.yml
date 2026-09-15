@@ -26,6 +26,16 @@ jobs:
         run: Remove-Item -Recurse -Force publish/windows/*.pdb
         shell: pwsh
 
+      - name: Check out page_dewarp
+        uses: actions/checkout@v4
+        with:
+          repository: mzucker/page_dewarp
+          path: page_dewarp
+
+      - name: Stage bundled Python runtime + page_dewarp.py
+        run: pwsh installer/prepare-python-runtime.ps1 -PageDewarpScriptPath "${{ github.workspace }}/page_dewarp/page_dewarp.py"
+        shell: pwsh
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
