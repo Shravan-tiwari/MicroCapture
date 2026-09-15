@@ -2967,25 +2967,51 @@ public partial class ImageProcessor
         }
     }
 
+    // How many consecutive columns of near-baseline brightness (see GutterRecoveryTolerance)
+    // end the search — a real gutter/spine shadow is a contiguous dark run starting AT the
+    // physical edge; anything past a genuine recovery back to page-white is ordinary page
+    // content (text, a photo, mid-page brightness variation), not shadow, no matter how dark
+    // it dips. Confirmed necessary on a real photo (Trapezoid_Image004) where a global
+    // darkest-point-in-window search reached 300+px in from the edge and cropped off real,
+    // legible column text — the true edge there was already back near baseline the whole time.
+    private const int GutterRecoveryRunPx = 20;
+    private const double GutterRecoveryTolerance = 6; // brightness units within baseline to count as "recovered"
+
     /// <summary>Walks <paramref name="colMeans"/> inward from one edge, tracking the darkest
-    /// column seen so far. Returns the crop distance (in px, from that edge) up to and including
-    /// the darkest point found — or 0 if nothing dropped far enough below <paramref
-    /// name="baseline"/> to count as shadow. A trough followed by recovery is the shadow
-    /// signature; a page edge that stays near baseline the whole way isn't cropped at all.</summary>
+    /// column seen so far WITHIN a contiguous dark run that starts at the physical edge. Stops
+    /// as soon as brightness recovers to near <paramref name="baseline"/> for
+    /// <see cref="GutterRecoveryRunPx"/> consecutive columns — a real shadow band is dark right
+    /// at the edge and fades back to page-white close by; content deeper in the search window
+    /// that happens to be darker than baseline (body text, a photo) must never extend the crop.
+    /// Returns the crop distance (in px, from that edge) up to and including the darkest point
+    /// found before recovery — or 0 if the edge is at/near baseline from the start (no shadow),
+    /// or if it never drops far enough below baseline to count as shadow.</summary>
     private static int FindGutterCropPx(double[] colMeans, int width, bool fromLeft, double baseline)
     {
         var searchPx = Math.Max(5, (int)(width * GutterSearchFraction));
         var minVal = baseline;
         var minPos = -1;
+        var recoveredRun = 0;
 
         for (var i = 0; i < searchPx; i++)
         {
             var x = fromLeft ? i : width - 1 - i;
             var v = colMeans[x];
+
             if (v < minVal - 1)
             {
                 minVal = v;
                 minPos = i;
+                recoveredRun = 0;
+            }
+            else if (v >= baseline - GutterRecoveryTolerance)
+            {
+                recoveredRun++;
+                if (recoveredRun >= GutterRecoveryRunPx) break; // back to page-white — stop extending
+            }
+            else
+            {
+                recoveredRun = 0; // still below baseline-tolerance but not a new minimum; keep walking
             }
         }
 
