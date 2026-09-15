@@ -1373,6 +1373,7 @@ public partial class ImageProcessor
         {
             working = TryDeskew(working, result);
             working = TryApplyDewarp(working, result, dewarpEnabled);
+            working = TryTrimGutterShadow(working, result);
             working = TryApplyLineMesh(working, result) ?? working;
         }
 
@@ -2901,6 +2902,95 @@ public partial class ImageProcessor
             result.Warnings.Add($"Book curve correction failed: {ex.Message}");
             return src;
         }
+    }
+
+    // Tunables for TryTrimGutterShadow — confirmed on real book-spine photos where
+    // page_dewarp.py's own crop leaves a dark gutter/binding shadow band along one edge (its
+    // text-span detection bounds the crop by where TEXT is found, not by where the true page
+    // edge is, so a shadow with no text on it just rides along inside the crop). Kept separate
+    // from MinMeshLines/MeshMaxDisplacementFraction etc. since this fixes a different defect.
+    private const double GutterSearchFraction = 0.18; // how far into the page each edge is searched
+    private const double GutterMinDropBelowBaseline = 15; // brightness units; below this, treat as normal page-edge noise, not shadow
+    private const double GutterMaxCropFraction = 0.22; // refuse to crop more than this fraction of the page width from one edge — a bigger "trough" is more likely a real photo (colored illustration, dark page edge) than shadow
+
+    /// <summary>Crops off a dark gutter/spine-shadow band page_dewarp.py's own crop left behind
+    /// on one side of the page. page_dewarp.py bounds its crop by detected text spans, not by
+    /// the physical page edge, so a photo where the book's gutter shadow (or the spine binding
+    /// itself) extends past the last line of text rides along inside the crop as a dark strip —
+    /// confirmed on real book-spine photos where the fix meaningfully improves on the script's
+    /// own output. Scans each edge's column-brightness profile for a trough (darkest point)
+    /// noticeably below the page's own core brightness, walking inward from the edge, and crops
+    /// up to and including that trough. Never throws; declines (returns <paramref name="src"/>
+    /// unchanged) if neither edge shows a real shadow, or if the implied crop is implausibly
+    /// large to be shadow rather than real content.</summary>
+    private Mat TryTrimGutterShadow(Mat src, ProcessingResult result)
+    {
+        try
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+
+            var width = src.Cols;
+            var colMeans = new double[width];
+            for (var x = 0; x < width; x++)
+                colMeans[x] = Cv2.Mean(gray.Col(x)).Val0;
+
+            var coreStart = (int)(width * 0.25);
+            var coreEnd = (int)(width * 0.75);
+            var core = colMeans.Skip(coreStart).Take(Math.Max(1, coreEnd - coreStart)).OrderBy(v => v).ToList();
+            var baseline = core[core.Count / 2]; // median
+
+            var leftCrop = FindGutterCropPx(colMeans, width, fromLeft: true, baseline);
+            var rightCrop = FindGutterCropPx(colMeans, width, fromLeft: false, baseline);
+
+            var maxCropPx = (int)(width * GutterMaxCropFraction);
+            leftCrop = Math.Min(leftCrop, maxCropPx);
+            rightCrop = Math.Min(rightCrop, maxCropPx);
+
+            if (leftCrop <= 0 && rightCrop <= 0) return src;
+
+            var newWidth = width - leftCrop - rightCrop;
+            if (newWidth < width * 0.5) return src; // sanity floor — never lose more than half the page
+
+            var cropped = new Mat(src, new Rect(leftCrop, 0, newWidth, src.Rows));
+            var result2 = cropped.Clone();
+            var parts = new List<string>();
+            if (leftCrop > 0) parts.Add($"left {leftCrop}px");
+            if (rightCrop > 0) parts.Add($"right {rightCrop}px");
+            result.Warnings.Add($"Trimmed gutter shadow ({string.Join(", ", parts)}).");
+            return result2;
+        }
+        catch (Exception ex)
+        {
+            result.Warnings.Add($"Gutter shadow trim failed: {ex.Message}");
+            return src;
+        }
+    }
+
+    /// <summary>Walks <paramref name="colMeans"/> inward from one edge, tracking the darkest
+    /// column seen so far. Returns the crop distance (in px, from that edge) up to and including
+    /// the darkest point found — or 0 if nothing dropped far enough below <paramref
+    /// name="baseline"/> to count as shadow. A trough followed by recovery is the shadow
+    /// signature; a page edge that stays near baseline the whole way isn't cropped at all.</summary>
+    private static int FindGutterCropPx(double[] colMeans, int width, bool fromLeft, double baseline)
+    {
+        var searchPx = Math.Max(5, (int)(width * GutterSearchFraction));
+        var minVal = baseline;
+        var minPos = -1;
+
+        for (var i = 0; i < searchPx; i++)
+        {
+            var x = fromLeft ? i : width - 1 - i;
+            var v = colMeans[x];
+            if (v < minVal - 1)
+            {
+                minVal = v;
+                minPos = i;
+            }
+        }
+
+        if (minPos < 0 || baseline - minVal < GutterMinDropBelowBaseline) return 0;
+        return minPos + 1;
     }
 
     /// <summary>The user's own proposed fix for residual interior curvature that boundary-curve

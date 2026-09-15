@@ -89,14 +89,13 @@
 
                     <StackPanel Spacing="8" Margin="0,4,0,0">
                         <TextBlock Text="PROCESSING" Classes="sectionLabel"/>
+                        <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction"/>
                         <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource InkTertiaryBrush}"
                                    Text="These are being built and can't be switched on yet. They're listed here so you can see what's coming."/>
                         <!-- Shown but not operable. Listing them communicates the roadmap; leaving
                              them clickable would let an operator set an option that silently does
                              nothing to their batch. -->
                         <StackPanel Spacing="8" IsEnabled="False" Opacity="0.55">
-                            <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction  (in development)"
-                                      Foreground="{DynamicResource InkMutedBrush}"/>
                             <CheckBox IsChecked="{Binding SplitBookPages}" Content="Split book pages  (in development)"
                                       Foreground="{DynamicResource InkMutedBrush}"/>
                             <CheckBox IsChecked="{Binding BinarizeEnabled}" Content="Binarize (black &amp; white)  (in development)"
