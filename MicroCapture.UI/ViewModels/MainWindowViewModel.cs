@@ -656,7 +656,8 @@ public partial class MainWindowViewModel : ViewModelBase
     /// against the live feed, so this is the feed's own size; a batch calibrated before live-view
     /// editing existed keeps its original full-resolution reference instead, so editing such a
     /// batch doesn't make its frames jump. Persisted as Batch.FixedFrameImageWidth/Height and
-    /// honored by ImageProcessor.ProcessFixedFrames when it projects frames onto a capture.</summary>
+    /// used by <see cref="CaptureAsync"/> to scale each frame rect onto the real capture's own
+    /// resolution before it becomes that frame's crop box.</summary>
     public int FrameReferenceWidth { get; private set; }
     public int FrameReferenceHeight { get; private set; }
 
@@ -725,12 +726,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // Book curve correction is fixed per batch, like split/fixed-frames/DPI — processing runs
     // in the background queue, off the capture path, so toggling this never affects shutter
-    // responsiveness. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
+    // responsiveness. See MicroCapture.Processing/PythonDewarpRunner.cs.
     [ObservableProperty] private bool _dewarpEnabled = false;
 
-    // Converts processed pages to pure black-and-white (Sauvola local threshold, written as a
+    // Converts processed pages to pure black-and-white (adaptive mean threshold, written as a
     // genuine 1-bit/CCITT-G4 TIFF) — smaller files and crisper OCR input, at the cost of any
-    // color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
+    // color/grayscale content. See ImageProcessor.ApplyAdaptiveMeanBinarization/WriteBitonalTiff.
     [ObservableProperty] private bool _binarizeEnabled = false;
 
     // Suppresses show-through from the reverse side of a thin page bleeding into the scan.

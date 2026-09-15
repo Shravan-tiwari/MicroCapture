@@ -82,20 +82,12 @@ public class BackgroundProcessingWorker
                     var outputDir = ProcessedFilePaths.OutputDirectoryFor(job.OriginalFilePath);
 
                     bool splitPages = job.Batch?.SplitBookPages ?? false;
-                    // A fixed-frame capture now creates one independent CaptureJob per frame,
-                    // each already carrying its own single-frame crop box with
-                    // ManualOverrideApplied set (see MainWindowViewModel.CaptureAsync) — that
-                    // job must go through Process()'s ordinary manual-crop path, exactly like
-                    // any other hand-cropped page, NOT ProcessFixedFrames (which re-reads
-                    // Batch.FixedFrames — the FULL set of frame rects — and would crop out every
-                    // frame all over again from this one job alone, producing duplicate output
-                    // and skipping FinishPageProcessing's adjustment step entirely). Batch.
-                    // UseFixedFrames/FixedFrames are batch-level authoring state for the live-
-                    // view frame editor, not a per-job processing instruction; job.
-                    // ManualOverrideApplied is what actually says how THIS job should be cropped.
-                    bool useFixedFrames = job.Batch?.UseFixedFrames == true
-                        && !string.IsNullOrWhiteSpace(job.Batch?.FixedFrames)
-                        && !job.ManualOverrideApplied;
+                    // Every capture — a fixed-frame job included — creates its own CaptureJob
+                    // carrying its own crop box (see MainWindowViewModel.CaptureAsync), and
+                    // always goes through Process()'s crop-quad path (ProcessFixedFrames is gone
+                    // — dead in production even before it was removed, since every real
+                    // fixed-frame capture already carried its own crop box and never reached
+                    // it).
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
                     // job.Dpi (not job.Batch?.Dpi) — DPI is stamped onto each capture at the
@@ -143,9 +135,7 @@ public class BackgroundProcessingWorker
                     var outputNameOverride = job.ManualOverrideApplied && !splitPages
                         ? $"{Path.GetFileNameWithoutExtension(job.OriginalFilePath)}_p{job.PageNumber:D6}"
                         : null;
-                    var result = useFixedFrames
-                        ? _processor.ProcessFixedFrames(job.OriginalFilePath, outputDir, job.Batch!.FixedFrames!, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, frameReferenceWidth: job.Batch!.FixedFrameImageWidth, frameReferenceHeight: job.Batch!.FixedFrameImageHeight, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat)
-                        : _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.ManualOverrideApplied, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, job.DewarpCurve, job.DewarpManualOverrideApplied, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat, outputFileNameOverride: outputNameOverride);
+                    var result = _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat, outputFileNameOverride: outputNameOverride);
                     // Stamped so JobCompleted's UI handler can match the one thumbnail this
                     // result is for — several sibling jobs (one per fixed frame) can share the
                     // same OriginalFilePath, so that alone is no longer a unique key.

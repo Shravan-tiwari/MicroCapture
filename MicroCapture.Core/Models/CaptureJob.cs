@@ -21,12 +21,6 @@ public class CaptureJob
     public string? LeftCropBox { get; set; } // Format: "X,Y,Width,Height"
     public string? RightCropBox { get; set; }
 
-    // Manual Dewarp Override — 5 control points per edge, pixel coords in this page's own
-    // (post-crop) image space. Format: "top:x1,y1,x2,y2,x3,y3,x4,y4,x5,y5;bottom:x1,y1,...".
-    // See ImageProcessor.ParseDewarpCurve/FormatDewarpCurve.
-    public bool DewarpManualOverrideApplied { get; set; } = false;
-    public string? DewarpCurve { get; set; }
-
     // Manual post-capture adjustments (rotate/flip/tone/color/sharpen) — applied after the
     // rest of the automatic pipeline (crop, dewarp, CLAHE enhancement), immediately before the
     // final TIFF write. See ImageProcessor.ApplyManualAdjustments/AdjustmentGeometry.
@@ -43,12 +37,12 @@ public class CaptureJob
     public double WhiteBalance { get; set; } = 0.0; // -1.0 (cool/blue) .. +1.0 (warm/amber)
 
     // Exact on-disk path(s) of this job's processed derivative(s), written by
-    // BackgroundProcessingWorker after a successful Process/ProcessFixedFrames run — lets
-    // downstream readers (BatchExportService.GetProcessedFilesForJob, export/cleanup code) find
-    // the real output file(s) directly instead of globbing a folder by filename prefix. Multiple
-    // outputs (split left/right pages, or one per fixed frame) are joined by ';', the same
-    // convention Batch.FixedFrames/CaptureJob.DewarpCurve already use for multi-value string
-    // fields. Null for older rows written before this field existed, and for any job still
+    // BackgroundProcessingWorker after a successful Process run — lets downstream readers
+    // (BatchExportService.GetProcessedFilesForJob, export/cleanup code) find the real output
+    // file(s) directly instead of globbing a folder by filename prefix. Multiple outputs (split
+    // left/right pages, or one per fixed frame) are joined by ';', the same convention
+    // Batch.FixedFrames already uses for multi-value string fields. Null for older rows written
+    // before this field existed, and for any job still
     // Pending/InProgress/Failed — callers must fall back to a folder glob (or OriginalFilePath)
     // in that case; see GetProcessedFilesForJob's own three-tier fallback.
     public string? ProcessedFilePath { get; set; }

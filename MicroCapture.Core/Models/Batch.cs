@@ -26,19 +26,21 @@ public class Batch
     public string? FolderPath { get; set; }
 
     // NOTE: this batch used to carry a UseAltBoundaryPipeline opt-in toggle, selecting between
-    // the original contour/confidence-based pipeline and an alternative ported from
-    // tools/phaseA-prototype/boundary_prototype.ipynb. That toggle is gone — the notebook-ported
-    // pipeline (now with a true Method 4 side-edge detector, not just the notebook's diagnostic-
-    // only Cell 6A baseline) is the ONLY automatic boundary/dewarp path ImageProcessor.Process/
-    // ProcessFixedFrames run; there is no longer a choice to make. The underlying DB column
+    // the original contour/confidence-based pipeline and an alternative ("Method 4") ported from
+    // tools/phaseA-prototype/boundary_prototype.ipynb. That toggle, and Method 4 itself
+    // (AltBoundaryPipeline.cs), are both gone — every capture now goes through
+    // ImageProcessor.Process's single crop-quad path, with book curve correction (when
+    // DewarpEnabled) handled by a real page_dewarp.py subprocess call (see
+    // MicroCapture.Processing/PythonDewarpRunner.cs). The underlying DB column
     // (Batches.UseAltBoundaryPipeline) is left in place on existing databases as a harmless
     // orphaned column — see CaptureQueueService.EnsureCompatibleSchema — rather than migrated
     // away, since no code reads or writes it anymore.
 
     // Fixed-frame capture: one or more operator-calibrated rectangles reused for every
-    // capture in the batch, instead of per-shot auto-crop detection. FixedFrames holds
-    // "X,Y,Width,Height" rects (in FixedFrameImageWidth/Height's pixel space) joined by
-    // ';' — see ImageProcessor.ParseFixedFrames/FormatFixedFrames.
+    // capture in the batch — each fixed frame IS the page boundary (no separate C# auto-crop
+    // detection runs). FixedFrames holds "X,Y,Width,Height" rects (in
+    // FixedFrameImageWidth/Height's pixel space) joined by ';' — see
+    // ImageProcessor.ParseFixedFrames/FormatFixedFrames.
     public bool UseFixedFrames { get; set; } = false;
     public string? FixedFrames { get; set; }
     public int FixedFrameImageWidth { get; set; }
@@ -51,15 +53,19 @@ public class Batch
     // baseline/scaling convention (150 = native captured size, higher values upsample).
     public int Dpi { get; set; } = 150;
 
-    // Corrects spine-curvature distortion on bound-book captures (the page bulging away from
-    // flat near the gutter) — a per-column vertical remap, distinct from the perspective/quad
-    // crop every batch already gets. See ImageProcessor.DetectDewarpCurve/ApplyDewarp.
+    // Corrects book-curvature distortion (the page bowing away from flat) by calling the real,
+    // unmodified "page_dewarp" script (https://mzucker.github.io/2016/08/15/page-dewarping.html)
+    // as a subprocess — text-line-based camera-pose + curvature fit, distinct from the
+    // perspective/quad crop every batch already gets, and the only boundary detection an
+    // automatic capture gets when this is on. See
+    // MicroCapture.Processing/PythonDewarpRunner.cs (RunPythonDewarp).
     public bool DewarpEnabled { get; set; } = false;
 
-    // Converts every processed page to pure black-and-white via Sauvola local-adaptive
-    // thresholding, written out as a genuine 1-bit/CCITT-Group-4 TIFF (not just an 8-bit image
-    // that happens to look bitonal) — smaller files and crisper OCR input, at the cost of
-    // losing color/grayscale content. See ImageProcessor.ApplySauvolaBinarization/WriteBitonalTiff.
+    // Converts every processed page to pure black-and-white via adaptive mean thresholding
+    // (matching page_dewarp.py's own binary output mode), written out as a genuine
+    // 1-bit/CCITT-Group-4 TIFF (not just an 8-bit image that happens to look bitonal) — smaller
+    // files and crisper OCR input, at the cost of losing color/grayscale content. See
+    // ImageProcessor.ApplyAdaptiveMeanBinarization/WriteBitonalTiff.
     public bool BinarizeEnabled { get; set; } = false;
 
     // Suppresses show-through from text/images printed on the reverse side of a thin page

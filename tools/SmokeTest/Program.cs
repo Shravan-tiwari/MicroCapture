@@ -48,10 +48,6 @@ await TestSupersedeRaceDoesNotDuplicateExport();
 await TestBatchResumeDoesNotDuplicateBatch();
 TestDocumentBoundaryDetection();
 TestGutterSplitDetection();
-TestAutoSplitTriggersOnConfidentSpineShadow();
-TestAutoSplitDoesNotTriggerOnPlainSinglePage();
-TestAutoSplitDoesNotTriggerOnPageEdgeInsideGutterBand();
-TestBoundaryCurveStaysSafeOnNotchedEdge();
 TestManualOverrideLegacyRectCrop();
 TestManualOverrideQuadCrop();
 TestConvexityClampRejectsSelfIntersection();
@@ -96,19 +92,16 @@ await TestBatchAdoptedOnAnotherMachine();
 TestBrightnessPassExcludesHandOverlap();
 TestUniformBrightnessImageStaysUndetected();
 TestBorderTouchingPageIsNotOverPadded();
-TestMediumConfidenceCropIsStillApplied();
 TestFixedFramesRoundTrip();
-TestProcessFixedFramesProducesNOutputs();
-TestFixedFramesFallsBackToCalibratedRectOnFeaturelessImage();
+TestFixedFrameCropsProduceNIndependentOutputs();
 TestFrameGeometryEditing();
 await TestFramePersistDoesNotLeakAcrossBatchSwitch();
-TestFixedFramesScaleFromReferenceResolution();
-TestFixedFramesZeroReferenceIsBackCompatible();
+TestFixedFrameCropsScaleFromReferenceResolution();
 TestCheckLiveRegionsDetectsPerRegionContentChange();
 TestCheckLiveRegionsSharpnessIsPerRegion();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
-TestDewarpControlPointsStayWithinPageBounds();
+TestDewarpStaysSaneOnOffCenterLines();
 TestLineMeshFlattensSharedPageWideBow();
 TestLineMeshDeclinesOnPlainUniformPage();
 TestFingerRemovalCleansEdgeTouchingSkinBlob();
@@ -117,7 +110,7 @@ TestBleedthroughSuppressesFaintGhostPreservesRealInk();
 TestWriteTiffPreservesLargeColorImagePixelData();
 TestCaptureTiffFormatHonorsCompressionChoice();
 await TestDeleteCaptureExcludesFromExport();
-TestMockCameraStyleFrameAutoCrops();
+TestMockCameraStyleFrameProcessesWithoutAutoCrop();
 await TestManualCropReviewFlowOnMockCameraStyleFrame();
 await TestRealUiFlowCaptureCropSaveThumbnailAndExport();
 TestDayAndNightModeRepaintTheWholeInterface();
@@ -427,25 +420,6 @@ string WriteSolidImage(string path, int width, int height)
     return path;
 }
 
-/// <summary>Several solid black horizontal bars on white — stands in for text lines (the
-/// line-blob detector behind dewarp/deskew only cares about blob geometry, not glyph shapes)
-/// so dewarp curve-fitting can be exercised without needing real rendered text.</summary>
-string WriteMultiBarTestImage(string path, int imageWidth, int imageHeight, (int X, int Y, int Width, int Height)[] bars)
-{
-    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-    using var bitmap = new SKBitmap(imageWidth, imageHeight);
-    using var canvas = new SKCanvas(bitmap);
-    canvas.Clear(SKColors.White);
-    using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
-    foreach (var bar in bars)
-        canvas.DrawRect(new SKRect(bar.X, bar.Y, bar.X + bar.Width, bar.Y + bar.Height), paint);
-    using var image = SKImage.FromBitmap(bitmap);
-    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
-    using var stream = File.Create(path);
-    data.SaveTo(stream);
-    return path;
-}
-
 /// <summary>Several black horizontal bars, each following the *same* smooth curve shape (a
 /// centered parabola bowing upward toward the page's horizontal center) but at different
 /// vertical baselines — stands in for real text lines that share one systematic page-wide bend
@@ -669,90 +643,6 @@ void TestGutterSplitDetection()
         Math.Abs(splitPercent - 43.0) <= 3.0);
 }
 
-void TestAutoSplitTriggersOnConfidentSpineShadow()
-{
-    Console.WriteLine("\n-- Process() auto-splits a spread it was never told about, off a confident spine shadow --");
-    var workDir = TempWorkDir();
-    const int imageWidth = 1000, imageHeight = 400;
-    const int gutterCenterX = 430; // same fixture as TestGutterSplitDetection — known-confident gutter.
-    var sourcePath = WriteGutterTestImage(Path.Combine(workDir, "auto_spread.png"), imageWidth, imageHeight, gutterCenterX, gutterBandWidth: 30);
-    var outDir = Path.Combine(workDir, "Processed");
-
-    // splitPages: false and manualOverride: false — nobody asked for a split; this is exactly
-    // the automatic-capture path an operator who forgot to check Batch.SplitBookPages hits.
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
-
-    Check("Processing succeeds", result.Success);
-    Check("A confident spine shadow alone promotes to a two-file split", result.OutputFilePaths.Count == 2);
-    if (result.OutputFilePaths.Count == 2)
-    {
-        Check("First output is the left half", result.OutputFilePaths[0].Contains("_1_left"));
-        Check("Second output is the right half", result.OutputFilePaths[1].Contains("_2_right"));
-    }
-    Check("A warning explains the auto-detected split", result.Warnings.Any(w => w.Contains("auto-detected")));
-}
-
-void TestAutoSplitDoesNotTriggerOnPlainSinglePage()
-{
-    Console.WriteLine("\n-- Process() leaves a real single page alone (no spine shadow to promote on) --");
-    var workDir = TempWorkDir();
-    var sourcePath = WriteSolidImage(Path.Combine(workDir, "auto_single.png"), 1000, 400);
-    var outDir = Path.Combine(workDir, "Processed");
-
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
-
-    Check("Processing succeeds", result.Success);
-    Check("No gutter signal means exactly one output file, not a false-positive split", result.OutputFilePaths.Count == 1);
-    if (result.OutputFilePaths.Count == 1)
-        Check("The single output is the whole-page path", result.OutputFilePaths[0].Contains("_processed"));
-}
-
-void TestAutoSplitDoesNotTriggerOnPageEdgeInsideGutterBand()
-{
-    Console.WriteLine("\n-- Process() does not split a single angled page whose own edge falls inside the gutter search band --");
-    var workDir = TempWorkDir();
-    const int imageWidth = 1000, imageHeight = 400;
-    // Page starts at 31% of width — just inside the 30% search-band boundary, same shape as
-    // the real Trapezoid_Image003.JPG failure: dark background up to the boundary, uniform
-    // bright page for the entire rest of the frame, no second bright region beyond a real dip.
-    var sourcePath = WritePageEdgeInsideGutterBandTestImage(Path.Combine(workDir, "page_edge_in_band.png"), imageWidth, imageHeight, pageStartX: 310);
-    var outDir = Path.Combine(workDir, "Processed");
-
-    var splitPercent = new ImageProcessor().DetectGutterSplitPercent(sourcePath);
-    Check("Gutter detection falls back to an even 50/50 rather than trusting the page-edge boundary artifact", splitPercent == 50.0);
-
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
-    Check("Processing succeeds", result.Success);
-    Check("A single page's own edge inside the search band does not trigger a false-positive split", result.OutputFilePaths.Count == 1);
-}
-
-void TestBoundaryCurveStaysSafeOnNotchedEdge()
-{
-    Console.WriteLine("\n-- A page edge with a genuine evidence gap (real notch) still produces a real, uncorrupted crop --");
-    var workDir = TempWorkDir();
-    const int imageWidth = 1000, imageHeight = 1200;
-    var pageRect = new SKRectI(200, 100, 900, 1100);
-    // Notch spans the middle third of the left edge, 60px deep — comfortably past
-    // BoundaryCurveBandPx (30px default), so that region contributes zero inlier evidence
-    // while the top/bottom thirds (each 300px, well past the 15%/85% span gate) still do.
-    var sourcePath = WriteNotchedEdgeTestImage(Path.Combine(workDir, "notched_edge.png"), imageWidth, imageHeight, pageRect, notchDepth: 60, notchTop: 400, notchBottom: 800);
-    var outDir = Path.Combine(workDir, "Processed");
-
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: false);
-    Check("Processing succeeds", result.Success);
-    Check("Produces exactly one output file", result.OutputFilePaths.Count == 1);
-    if (result.OutputFilePaths.Count == 1)
-    {
-        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Grayscale);
-        Check("Output is a real, non-trivial image", output.Width > 10 && output.Height > 10);
-        Cv2.MeanStdDev(output, out var mean, out _);
-        // The confirmed real regression pulled in background/off-page pixels, dragging mean
-        // brightness far down toward black; the page interior here is solid white (255) on a
-        // dark (20) backdrop, so a correctly-cropped-or-safely-declined result must read bright.
-        Check($"Output isn't corrupted-dark (mean brightness {mean.Val0:F0}, expect page-bright)", mean.Val0 > 150);
-    }
-}
-
 void TestManualOverrideLegacyRectCrop()
 {
     Console.WriteLine("\n-- Manual override with a legacy \"x,y,w,h\" rect string crops to the expected size --");
@@ -762,7 +652,7 @@ void TestManualOverrideLegacyRectCrop()
 
     // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about crop geometry,
     // not DPI-driven resampling.
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: true, leftCrop: "50,50,200,150",
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, leftCrop: "50,50,200,150",
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
 
     Check("Processing succeeds", result.Success);
@@ -786,7 +676,7 @@ void TestManualOverrideQuadCrop()
     const string quad = "40,40,340,60,360,260,20,240";
     // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about warp geometry,
     // not DPI-driven resampling.
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, manualOverride: true, leftCrop: quad,
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, leftCrop: quad,
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
 
     Check("Processing succeeds", result.Success);
@@ -2994,7 +2884,7 @@ void TestManualOverrideSplitCrop()
 
     // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about split geometry,
     // not DPI-driven resampling.
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, manualOverride: true, leftCrop: leftCrop, rightCrop: rightCrop,
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, leftCrop: leftCrop, rightCrop: rightCrop,
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
 
     Check("Processing succeeds", result.Success);
@@ -3042,7 +2932,7 @@ async Task TestSplitCropReviewSaveThenExport()
     // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about split/export
     // geometry, not DPI-driven resampling.
     var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
-    var processResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
+    var processResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
     Check("Worker-equivalent reprocessing succeeds", processResult.Success);
     Check("Worker-equivalent reprocessing writes two files", processResult.OutputFilePaths.Count == 2);
@@ -3130,7 +3020,7 @@ async Task TestTwoQuadCropReviewSaveReloadReSaveThenExport()
     // crop/export geometry, not DPI-driven resampling.
     var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
     var pinnedDpiMeta = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
-    var firstResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
+    var firstResult = new ImageProcessor().Process(job.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
         metadata: pinnedDpiMeta);
     Check("First reprocess succeeds", firstResult.Success && firstResult.OutputFilePaths.Count == 2);
     await queue.UpdateJobStatusAsync(job.Id, "processing", "Completed");
@@ -3159,7 +3049,7 @@ async Task TestTwoQuadCropReviewSaveReloadReSaveThenExport()
     // BackgroundProcessingWorker.ProcessLoop does on every real poll iteration (reusing the
     // original stale-tracked `queue` here would be a test-harness bug, not a real one: its
     // locally-tracked entity wouldn't see reopenDb's "Pending" write below the ORM layer).
-    var secondResult = new ImageProcessor().Process(reopenedJob.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, manualOverride: reopenedJob.ManualOverrideApplied, leftCrop: reopenedJob.LeftCropBox, rightCrop: reopenedJob.RightCropBox,
+    var secondResult = new ImageProcessor().Process(reopenedJob.OriginalFilePath, outputDir, splitPages: batch.SplitBookPages, leftCrop: reopenedJob.LeftCropBox, rightCrop: reopenedJob.RightCropBox,
         metadata: pinnedDpiMeta);
     Check("Re-save reprocess succeeds", secondResult.Success && secondResult.OutputFilePaths.Count == 2);
     using (var workerDb = new AppDbContext(dbPath))
@@ -3201,7 +3091,7 @@ void TestIndependentSkewedQuadsPerPage()
     const string leftQuad = "20,30,460,10,470,470,10,490";     // slightly tilted left page
     const string rightQuad = "540,15,980,25,975,480,545,460"; // differently tilted right page
 
-    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, manualOverride: true, leftCrop: leftQuad, rightCrop: rightQuad);
+    var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: true, leftCrop: leftQuad, rightCrop: rightQuad);
 
     Check("Processing succeeds", result.Success);
     Check("Exactly two output files are produced", result.OutputFilePaths.Count == 2);
@@ -3216,38 +3106,13 @@ void TestIndependentSkewedQuadsPerPage()
     }
 }
 
-void TestMediumConfidenceCropIsStillApplied()
-{
-    Console.WriteLine("\n-- A medium-confidence detection (below CropConfidenceThreshold) is still auto-cropped, not silently skipped --");
-    var workDir = TempWorkDir();
-    const int imageWidth = 800, imageHeight = 600;
-    var knownRect = new SKRectI(50, 50, 750, 550);
-    var sourcePath = WriteBoundaryTestImage(Path.Combine(workDir, "medium_conf.png"), imageWidth, imageHeight, knownRect);
-    var outDir = Path.Combine(workDir, "Processed");
-
-    // Raising CropConfidenceThreshold above what this (otherwise clean) detection will ever
-    // score simulates a real-world medium-confidence photo without needing to hand-craft an
-    // exact numeric contour. MediumConfidenceThreshold is left at its default (0.3) — the
-    // bar TryAutoCrop must now actually apply the crop, matching what Crop Review already
-    // shows as its default suggestion. Before this fix, TryAutoCrop gated on
-    // CropConfidenceThreshold directly, so this same setup would have kept the full,
-    // uncropped frame — exactly the "cropped images aren't saved" bug reported from real
-    // hardware.
-    // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about crop geometry,
-    // not DPI-driven resampling.
-    var processor = new ImageProcessor { CropConfidenceThreshold = 0.99 };
-    var result = processor.Process(sourcePath, outDir, splitPages: false, manualOverride: false,
-        metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
-
-    Check("Processing succeeds", result.Success);
-    Check("A medium-confidence detection is still cropped", result.WasCropped);
-    if (result.Success && result.OutputFilePaths.Count > 0)
-    {
-        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
-        Check("Output is genuinely smaller than the full source frame (a real crop happened)",
-            output.Width < imageWidth && output.Height < imageHeight);
-    }
-}
+// TestMediumConfidenceCropIsStillApplied removed: it asserted TryAutoCrop's own confidence-gate
+// behavior (crop applied even at medium confidence, matching Crop Review's default suggestion
+// bar). TryAutoCrop itself was removed — a real photo confirmed it disagreeing with
+// page_dewarp.py's own boundary detection and clipping real page content (header/margin text)
+// before dewarp ever saw the image. Book Curve Correction's boundary detection is now entirely
+// page_dewarp.py's own job; a capture with no saved crop quad passes straight through
+// ProcessSinglePage untouched until TryApplyDewarp runs.
 
 // TestLowConfidenceCropIsSkippedAndFlagged removed: it asserted the legacy TryAutoCrop
 // pipeline's confidence-gate behavior (CropConfidenceThreshold/MediumConfidenceThreshold
@@ -3278,9 +3143,16 @@ void TestFixedFramesRoundTrip()
     }
 }
 
-void TestProcessFixedFramesProducesNOutputs()
+/// <summary>Crops N frames from one capture, each via its own <see cref="ImageProcessor.Process"/>
+/// call with an explicit crop box — this is what the real app actually does today (see
+/// MainWindowViewModel.CaptureAsync, which enqueues one CaptureJob per fixed frame, each
+/// ManualOverrideApplied with its own crop box; BackgroundProcessingWorker then calls
+/// Process(..., leftCrop: job.LeftCropBox) per job). ProcessFixedFrames (which used to own this
+/// N-independent-crops behavior) was dead in production before it was deleted — every real
+/// fixed-frame capture already went through this per-job Process() path instead.</summary>
+void TestFixedFrameCropsProduceNIndependentOutputs()
 {
-    Console.WriteLine("\n-- ProcessFixedFrames crops N independent, correctly-sized outputs, no whole-frame extra --");
+    Console.WriteLine("\n-- N fixed frames, each processed via its own Process() call, crop to N independent, correctly-sized outputs --");
     var workDir = TempWorkDir();
     var sourcePath = WriteSolidImage(Path.Combine(workDir, "source_fixed.png"), 400, 300);
     var outDir = Path.Combine(workDir, "Processed");
@@ -3291,54 +3163,46 @@ void TestProcessFixedFramesProducesNOutputs()
         new FixedFrameRect(200, 150, 120, 80),
         new FixedFrameRect(50, 200, 90, 70)
     };
-    var spec = ImageProcessor.FormatFixedFrames(frames);
     // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about crop geometry,
     // not DPI-driven resampling.
-    var result = new ImageProcessor().ProcessFixedFrames(sourcePath, outDir, spec,
-        metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
+    var meta = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
 
-    Check("Processing succeeds", result.Success);
-    Check("Produces exactly N output files (one per frame, no whole-frame extra)", result.OutputFilePaths.Count == frames.Length);
-    if (result.OutputFilePaths.Count == frames.Length)
+    for (var i = 0; i < frames.Length; i++)
     {
-        var sorted = result.OutputFilePaths.OrderBy(f => f, StringComparer.Ordinal).ToArray();
-        Check("Output filenames already sort in frame order (zero-padded _frameNN)", sorted.SequenceEqual(result.OutputFilePaths));
-        for (var i = 0; i < frames.Length; i++)
+        var f = frames[i];
+        var cropBox = FormattableString.Invariant($"{f.X},{f.Y},{f.Width},{f.Height}");
+        var result = new ImageProcessor().Process(sourcePath, outDir, splitPages: false, leftCrop: cropBox,
+            metadata: meta, outputFileNameOverride: $"frame{i + 1:D2}");
+
+        Check($"Frame {i + 1}: processing succeeds", result.Success);
+        Check($"Frame {i + 1}: produces exactly one output file", result.OutputFilePaths.Count == 1);
+        if (result.OutputFilePaths.Count == 1)
         {
-            using var output = Cv2.ImRead(sorted[i], ImreadModes.Unchanged);
-            Check($"Frame {i + 1} output size matches its own calibrated rectangle",
-                Math.Abs(output.Width - (int)frames[i].Width) <= 1 && Math.Abs(output.Height - (int)frames[i].Height) <= 1);
+            using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+            Check($"Frame {i + 1} output size matches its own crop rectangle",
+                Math.Abs(output.Width - (int)f.Width) <= 1 && Math.Abs(output.Height - (int)f.Height) <= 1);
         }
     }
 }
 
-void TestFixedFramesFallsBackToCalibratedRectOnFeaturelessImage()
-{
-    Console.WriteLine("\n-- Fixed frames fall back to the calibrated rectangle on a featureless image Method 4 can't refine --");
-    var workDir = TempWorkDir();
-    // A flat, featureless image: nothing for Method 4's gradient-based edge trace to find —
-    // exercises AltFlattenPage/ProcessFixedFrames' own defensive fallback (FoundRealEdges/
-    // Method4Result "no span found" path) rather than the confidence-gate concept this test
-    // used to assert (retired — see the removed TestLowConfidenceCropIsSkippedAndFlagged's
-    // comment above for why the automatic path no longer has a confidence gate at all). DPI
-    // pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about crop geometry.
-    var sourcePath = WriteSolidImage(Path.Combine(workDir, "flat.png"), 500, 400);
-    var pinnedDpiMeta = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
-
-    var frameSpec = ImageProcessor.FormatFixedFrames(new[] { new FixedFrameRect(50, 50, 200, 150) });
-    var fixedResult = new ImageProcessor().ProcessFixedFrames(sourcePath, Path.Combine(workDir, "Processed_fixed"), frameSpec, metadata: pinnedDpiMeta);
-    Check("Fixed-frame processing succeeds on a featureless image", fixedResult.Success);
-    if (fixedResult.Success && fixedResult.OutputFilePaths.Count > 0)
-    {
-        using var fixedOutput = Cv2.ImRead(fixedResult.OutputFilePaths[0], ImreadModes.Unchanged);
-        Check("Fixed-frame output falls back to the calibrated rectangle's own size, not a degenerate crop",
-            Math.Abs(fixedOutput.Width - 200) <= 1 && Math.Abs(fixedOutput.Height - 150) <= 1);
-    }
-}
-
+/// <summary>Full flow through the actual production shape: N fixed frames become N independent
+/// CaptureJobs (mirrors MainWindowViewModel.CaptureAsync, which enqueues one job per frame, each
+/// ManualOverrideApplied with its own already-scaled crop box), the background worker processes
+/// each via Process()'s crop-quad path, and export produces one page per frame. This supersedes
+/// the old ProcessFixedFrames-based version of this test, which fed one job through the (now
+/// deleted, and already dead in production before that) ProcessFixedFrames — real fixed-frame
+/// batches never worked that way.</summary>
+/// <summary>Full flow through the actual production shape: N fixed frames become N independent
+/// CaptureJobs (mirrors MainWindowViewModel.CaptureAsync, which enqueues one job per frame, each
+/// ManualOverrideApplied with its own already-scaled crop box), each processed the way
+/// BackgroundProcessingWorker.ProcessLoop actually processes it (Process()'s crop-quad path,
+/// then SetProcessedFilePathAsync/UpdateJobStatusAsync — driven directly rather than through a
+/// real polling BackgroundProcessingWorker instance, since that worker opens its own concurrent
+/// AppDbContext against the same SQLite file and contends/hangs against a long-lived context
+/// held open by the rest of this test), and export produces one page per frame.</summary>
 async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
 {
-    Console.WriteLine("\n-- Full flow: fixed-frame batch -> worker branch -> export produces one page per frame --");
+    Console.WriteLine("\n-- Full flow: fixed-frame batch -> N per-frame jobs -> per-job Process() -> export produces one page per frame --");
     var dbPath = TempDbPath();
     var workDir = TempWorkDir();
 
@@ -3369,19 +3233,35 @@ async Task TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet()
     await db.SaveChangesAsync();
 
     var originalPath = WriteSolidImage(Path.Combine(workDir, "capture.png"), calibW, calibH);
-    var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, 1);
+    var outputDir = ProcessedFilePaths.OutputDirectoryFor(originalPath);
 
-    // Mirrors BackgroundProcessingWorker.ProcessLoop's branch for a batch with UseFixedFrames set,
-    // including the reference dims it passes so frames get projected onto the capture's own size.
-    var outputDir = Path.Combine(Path.GetDirectoryName(job.OriginalFilePath) ?? ".", "Processed");
-    var processResult = new ImageProcessor().ProcessFixedFrames(job.OriginalFilePath, outputDir, batch.FixedFrames!,
-        frameReferenceWidth: batch.FixedFrameImageWidth, frameReferenceHeight: batch.FixedFrameImageHeight);
-    Check("Worker-equivalent fixed-frame processing succeeds", processResult.Success);
-    Check("Worker-equivalent processing writes exactly one file per frame", processResult.OutputFilePaths.Count == frames.Length);
-    await queue.UpdateJobStatusAsync(job.Id, "processing", processResult.Success ? "Completed" : "Failed");
+    // One CaptureJob per frame, each carrying its own crop box — the real shape
+    // MainWindowViewModel.CaptureAsync produces (reference resolution == capture resolution
+    // here, so the scale factor is 1.0 and the crop box is the frame rect verbatim).
+    var processor = new ImageProcessor();
+    for (var i = 0; i < frames.Length; i++)
+    {
+        var f = frames[i];
+        var cropBox = FormattableString.Invariant($"{(int)f.X},{(int)f.Y},{(int)f.Width},{(int)f.Height}");
+        var job = await queue.EnqueueCaptureAsync(batch.Id, originalPath, i + 1, leftCropBox: cropBox);
 
-    using var exportDb = new AppDbContext(dbPath);
-    var exporter = new BatchExportService(exportDb);
+        // Mirrors BackgroundProcessingWorker.ProcessLoop's own per-job call shape.
+        var outputNameOverride = $"{Path.GetFileNameWithoutExtension(originalPath)}_p{job.PageNumber:D6}";
+        var result = processor.Process(job.OriginalFilePath, outputDir, splitPages: false, leftCrop: job.LeftCropBox,
+            metadata: new TiffMetadata(job.Dpi, batch.Operator, job.Timestamp), outputFileNameOverride: outputNameOverride);
+        Check($"Frame {i + 1}: worker-equivalent processing succeeds", result.Success);
+        if (result.Success && result.OutputFilePaths.Count > 0)
+        {
+            await queue.UpdateJobStatusAsync(job.Id, "processing", "Completed");
+            await queue.SetProcessedFilePathAsync(job.Id, string.Join(";", result.OutputFilePaths));
+        }
+        else
+        {
+            await queue.UpdateJobStatusAsync(job.Id, "processing", "Failed");
+        }
+    }
+
+    var exporter = new BatchExportService(db);
     var exportDir = Path.Combine(workDir, "Export");
     var resultDir = await exporter.ExportBatchAsync(batch.Id, exportDir, "PNG");
     var exportedFiles = Directory.GetFiles(resultDir, "*.png").OrderBy(f => f).ToArray();
@@ -3571,9 +3451,17 @@ async Task TestFramePersistDoesNotLeakAcrossBatchSwitch()
         storedA.FixedFrameImageWidth == 960 && storedB.FixedFrameImageWidth == 0);
 }
 
-void TestFixedFramesScaleFromReferenceResolution()
+/// <summary>Frame rects authored at one reference resolution (e.g. a 960x640 live view) must be
+/// scaled onto the real capture's own resolution before they're usable as a crop box — this
+/// scaling now happens in MainWindowViewModel.CaptureAsync itself (frame.X * scaleX, etc.,
+/// where scaleX = capturedWidth / FrameReferenceWidth) before the crop box ever reaches
+/// Process(), not inside ImageProcessor as ProcessFixedFrames used to do it. This test
+/// reproduces that same scaling math directly, then verifies Process() crops to the scaled
+/// rectangle it's given — the same shape as <see cref="TestFixedFrameCropsProduceNIndependentOutputs"/>,
+/// with a non-1.0 scale factor.</summary>
+void TestFixedFrameCropsScaleFromReferenceResolution()
 {
-    Console.WriteLine("\n-- Fixed frames authored at live-view size crop correctly from a full-res capture --");
+    Console.WriteLine("\n-- Frame rects authored at live-view size scale correctly onto a full-res capture's crop box --");
     var workDir = TempWorkDir();
 
     // Frames drawn on a 960x640 live view, but the real capture is 6x/4.5x larger. Before
@@ -3586,63 +3474,59 @@ void TestFixedFramesScaleFromReferenceResolution()
         new FixedFrameRect(100, 80, 300, 400),
         new FixedFrameRect(500, 80, 300, 400)
     };
-    var spec = ImageProcessor.FormatFixedFrames(frames);
 
     var capturePath = WriteSolidImage(Path.Combine(workDir, "capture.png"), captureW, captureH);
     var outputDir = Path.Combine(workDir, "Processed");
     // Target DPI == measuredDpi so ResizeForDpi is a no-op — this test is about crop geometry,
     // and DPI resampling would otherwise rewrite the output dimensions on top of it.
     var neutralDpi = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
-    var result = new ImageProcessor().ProcessFixedFrames(capturePath, outputDir, spec, neutralDpi,
-        frameReferenceWidth: liveW, frameReferenceHeight: liveH);
 
-    Check("Live-view-authored fixed frames process successfully against a full-res capture", result.Success);
-    Check("One output file per frame", result.OutputFilePaths.Count == frames.Length);
-
-    if (result.Success && result.OutputFilePaths.Count == frames.Length)
+    var sx = (double)captureW / liveW;
+    var sy = (double)captureH / liveH;
+    var allScaled = true;
+    for (var i = 0; i < frames.Length; i++)
     {
-        var sx = (double)captureW / liveW;
-        var sy = (double)captureH / liveH;
-        var allScaled = true;
-        for (var i = 0; i < frames.Length; i++)
+        var f = frames[i];
+        var px = (int)Math.Round(f.X * sx);
+        var py = (int)Math.Round(f.Y * sy);
+        var pw = (int)Math.Round(f.Width * sx);
+        var ph = (int)Math.Round(f.Height * sy);
+        var cropBox = FormattableString.Invariant($"{px},{py},{pw},{ph}");
+        var result = new ImageProcessor().Process(capturePath, outputDir, splitPages: false, leftCrop: cropBox,
+            metadata: neutralDpi, outputFileNameOverride: $"scaledframe{i + 1:D2}");
+
+        Check($"Frame {i + 1}: processing succeeds against a full-res capture", result.Success);
+        if (result.Success && result.OutputFilePaths.Count > 0)
         {
-            using var output = Cv2.ImRead(result.OutputFilePaths[i], ImreadModes.Unchanged);
-            var expectedW = frames[i].Width * sx;
-            var expectedH = frames[i].Height * sy;
-            // Tolerance covers rounding in ClampRectToBounds plus DPI resampling rounding.
-            if (Math.Abs(output.Width - expectedW) > 2 || Math.Abs(output.Height - expectedH) > 2)
+            using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+            if (Math.Abs(output.Width - pw) > 2 || Math.Abs(output.Height - ph) > 2)
             {
                 allScaled = false;
-                Console.WriteLine($"   frame {i + 1}: got {output.Width}x{output.Height}, expected ~{expectedW:F0}x{expectedH:F0}");
+                Console.WriteLine($"   frame {i + 1}: got {output.Width}x{output.Height}, expected ~{pw}x{ph}");
             }
         }
-        Check("Each crop is scaled from live-view space onto the capture's real resolution", allScaled);
+        else
+        {
+            allScaled = false;
+        }
     }
-}
+    Check("Each crop is scaled from live-view space onto the capture's real resolution", allScaled);
 
-void TestFixedFramesZeroReferenceIsBackCompatible()
-{
-    Console.WriteLine("\n-- Fixed frames with no reference dims keep the historical direct-pixel behavior --");
-    var workDir = TempWorkDir();
-
-    // Batches calibrated before reference dims were recorded pass 0, which must reproduce the
-    // pre-change behavior exactly: frame coordinates treated as direct capture pixels.
-    const int captureW = 800, captureH = 600;
-    var frames = new[] { new FixedFrameRect(50, 40, 300, 200) };
-    var spec = ImageProcessor.FormatFixedFrames(frames);
-
-    var capturePath = WriteSolidImage(Path.Combine(workDir, "capture.png"), captureW, captureH);
-    var outputDir = Path.Combine(workDir, "Processed");
-    var neutralDpi = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
-    var result = new ImageProcessor().ProcessFixedFrames(capturePath, outputDir, spec, neutralDpi,
-        frameReferenceWidth: 0, frameReferenceHeight: 0);
-
-    Check("Zero-reference fixed-frame processing succeeds", result.Success);
-    if (result.Success && result.OutputFilePaths.Count > 0)
+    // Zero reference dims (a batch calibrated before reference dims were recorded) must
+    // reproduce the historical direct-pixel behavior: scale factor 1.0, frame coordinates
+    // treated as direct capture pixels — same "FrameReferenceWidth > 0 ? ... : 1.0" fallback
+    // MainWindowViewModel.CaptureAsync itself applies.
+    const int zeroRefCaptureW = 800, zeroRefCaptureH = 600;
+    var zeroRefFrame = new FixedFrameRect(50, 40, 300, 200);
+    var zeroRefCapturePath = WriteSolidImage(Path.Combine(workDir, "capture_zeroref.png"), zeroRefCaptureW, zeroRefCaptureH);
+    var zeroRefCropBox = FormattableString.Invariant($"{(int)zeroRefFrame.X},{(int)zeroRefFrame.Y},{(int)zeroRefFrame.Width},{(int)zeroRefFrame.Height}");
+    var zeroRefResult = new ImageProcessor().Process(zeroRefCapturePath, outputDir, splitPages: false, leftCrop: zeroRefCropBox, metadata: neutralDpi);
+    Check("Zero-reference-dims processing succeeds", zeroRefResult.Success);
+    if (zeroRefResult.Success && zeroRefResult.OutputFilePaths.Count > 0)
     {
-        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        using var zeroRefOutput = Cv2.ImRead(zeroRefResult.OutputFilePaths[0], ImreadModes.Unchanged);
         Check("Zero reference dims crop at the frame's literal pixel size (unscaled)",
-            Math.Abs(output.Width - 300) <= 2 && Math.Abs(output.Height - 200) <= 2);
+            Math.Abs(zeroRefOutput.Width - 300) <= 2 && Math.Abs(zeroRefOutput.Height - 200) <= 2);
     }
 }
 
@@ -3681,36 +3565,72 @@ void TestTiffDisplayDecodeRoundTrip()
     Check("A missing file returns null instead of throwing", ImageDecodeHelper.GetDisplayBytes(Path.Combine(workDir, "missing.tif")) == null);
 }
 
-void TestDewarpControlPointsStayWithinPageBounds()
+/// <summary>Several lines of real rendered text, one confined to a narrow right-hand portion of
+/// the page — for the new cubic-sheet dewarp's text-blob/span detector, which (like the real
+/// page_dewarp.py it's ported from) needs actual glyph-stroke texture to find text-shaped
+/// contours; a solid filled bar has no internal texture and is correctly rejected by its
+/// TEXT_MAX_THICKNESS filter as "too thick to be a line of text," unlike the old per-column
+/// detector which only needed a plain dark/light edge.</summary>
+string WriteMultiTextLineImage(string path, int imageWidth, int imageHeight, (int X, int Y, int Width)[] lines)
 {
-    Console.WriteLine("\n-- Dewarp baseline anchoring never extrapolates control points far outside the page (regression) --");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    using var bitmap = new SkiaSharp.SKBitmap(imageWidth, imageHeight);
+    using var canvas = new SkiaSharp.SKCanvas(bitmap);
+    canvas.Clear(SkiaSharp.SKColors.White);
+    using var paint = new SkiaSharp.SKPaint { Color = SkiaSharp.SKColors.Black, IsAntialias = true };
+    using var font = new SkiaSharp.SKFont { Size = 22 };
+    const string sample = "The quick brown fox jumps over the lazy dog and runs away quickly today ";
+    foreach (var (x, y, w) in lines)
+    {
+        var repeated = string.Concat(Enumerable.Repeat(sample, Math.Max(1, w / 300 + 1)));
+        canvas.Save();
+        canvas.ClipRect(new SkiaSharp.SKRect(x, y - 30, x + w, y + 10));
+        canvas.DrawText(repeated, x, y, SkiaSharp.SKTextAlign.Left, font, paint);
+        canvas.Restore();
+    }
+    using var image = SkiaSharp.SKImage.FromBitmap(bitmap);
+    using var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+    using var stream = File.Create(path);
+    data.SaveTo(stream);
+    return path;
+}
+
+/// <summary>Regression guard against a wildly-wrong or crashing dewarp result on an
+/// off-center/narrow-topmost-line page — the same shape of real-photo failure a prior
+/// (now-replaced) C# dewarp implementation's own fitted-model regression test guarded against.
+/// Dewarp is now an opaque call into the real page_dewarp.py subprocess (see
+/// PythonDewarpRunner.cs) — there is no fitted internal model left to inspect from C#, so the
+/// honest regression check here is end-to-end: Process() with Book Curve Correction on must
+/// still succeed and produce a real, non-degenerate, finite-sized output on this tricky page,
+/// not hang, crash, or emit a garbage-sized image.</summary>
+void TestDewarpStaysSaneOnOffCenterLines()
+{
+    Console.WriteLine("\n-- Book Curve Correction stays sane (no crash/hang, real output) on an off-center multi-line page (regression) --");
     var workDir = TempWorkDir();
     const int width = 1200, height = 900;
 
-    // The topmost "line" only spans the page's right portion — mirrors the exact real-photo
-    // failure this was built to fix: the original design anchored the curve's vertical
-    // baseline by evaluating a narrow-domain line's own cubic fit at x=0 (far outside that
-    // line's own data), which extrapolated to a Y value many times the page's own height and
-    // produced a wildly wrong dewarp on a real capture. Anchoring through the line's own real
-    // (median X, median Y) point instead must keep every control point sane regardless of how
-    // narrow/off-center the anchor line is.
-    var bars = new (int, int, int, int)[]
+    // The topmost line only spans the page's right portion — the same off-center/narrow-line
+    // shape that broke a prior dewarp implementation's baseline anchoring on a real photo.
+    var lines = new (int, int, int)[]
     {
-        (900, 100, 250, 20), // topmost — narrow, confined to the right portion
-        (50, 250, 1100, 20),
-        (50, 400, 1100, 20),
-        (50, 550, 1100, 20),
-        (50, 700, 1100, 20), // bottommost — full width
+        (900, 120, 250), // topmost — narrow, confined to the right portion
+        (50, 270, 1100),
+        (50, 420, 1100),
+        (50, 570, 1100),
+        (50, 720, 1100), // bottommost — full width
     };
-    var path = WriteMultiBarTestImage(Path.Combine(workDir, "multibar.png"), width, height, bars);
+    var path = WriteMultiTextLineImage(Path.Combine(workDir, "multitext.png"), width, height, lines);
+    var outDir = Path.Combine(workDir, "Processed");
 
-    var model = ImageProcessor.DetectDewarpCurveFromBytes(File.ReadAllBytes(path));
-    Check("A curve model is detected from the multi-line page", model != null);
-    if (model is { } m)
+    var result = new ImageProcessor().Process(path, outDir, splitPages: false, dewarpEnabled: true,
+        metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
+
+    Check("Processing succeeds with Book Curve Correction on", result.Success);
+    if (result.Success && result.OutputFilePaths.Count > 0)
     {
-        var maxAbsY = m.TopControlPoints.Concat(m.BottomControlPoints).Max(p => Math.Abs(p.Y));
-        Check($"All control point Y values stay within a sane multiple of the page height (max |Y|={maxAbsY:F0}, page height={height})",
-            maxAbsY < height * 3);
+        using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
+        Check($"Output is a real, finite-sized image (got {output.Width}x{output.Height})",
+            output.Width > 100 && output.Height > 100 && output.Width < width * 10 && output.Height < height * 10);
     }
 }
 
@@ -3903,7 +3823,7 @@ void TestWriteTiffPreservesLargeColorImagePixelData()
     // fidelity, not detection. DPI is pinned to BaselineDpi (not 300) so ResizeForDpi is a
     // no-op here too — this test's whole point is pixel-for-pixel round-trip fidelity, which
     // a real (correct, deliberate) DPI-driven resize would otherwise obscure.
-    var result = processor.Process(sourcePath, outDir, manualOverride: true,
+    var result = processor.Process(sourcePath, outDir,
         leftCrop: $"0,0,{width},{height}",
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, "Smoke Test Operator", DateTime.UtcNow));
 
@@ -3959,9 +3879,9 @@ void TestCaptureTiffFormatHonorsCompressionChoice()
 
     var plainDir = Path.Combine(workDir, "plain");
     var lzwDir = Path.Combine(workDir, "lzw");
-    var plain = processor.Process(sourcePath, plainDir, manualOverride: true,
+    var plain = processor.Process(sourcePath, plainDir,
         leftCrop: $"0,0,{width},{height}", metadata: meta, captureFormat: "TIFF");
-    var lzw = processor.Process(sourcePath, lzwDir, manualOverride: true,
+    var lzw = processor.Process(sourcePath, lzwDir,
         leftCrop: $"0,0,{width},{height}", metadata: meta, captureFormat: "TIFF LZW");
 
     Check("Both captures succeed and write one .tif each",
@@ -4095,34 +4015,28 @@ string WriteMockCameraStyleImage(string path, int width, int height)
     return path;
 }
 
-void TestMockCameraStyleFrameAutoCrops()
+void TestMockCameraStyleFrameProcessesWithoutAutoCrop()
 {
-    Console.WriteLine("\n-- A mock-camera-style frame (text over a stroked rect, 3840x2160) auto-crops --");
+    Console.WriteLine("\n-- A mock-camera-style frame (text over a stroked rect, 3840x2160) processes to a real, non-degenerate output --");
     var workDir = TempWorkDir();
     var path = WriteMockCameraStyleImage(Path.Combine(workDir, "mock_realistic.jpg"), 3840, 2160);
     var outDir = Path.Combine(workDir, "Processed");
 
-    // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about auto-crop
-    // geometry, not DPI-driven resampling.
-    var result = new ImageProcessor().Process(path, outDir, splitPages: false, manualOverride: false,
+    // DPI pinned to BaselineDpi so ResizeForDpi is a no-op — this test is about output geometry,
+    // not DPI-driven resampling.
+    var result = new ImageProcessor().Process(path, outDir, splitPages: false,
         metadata: new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow));
 
     Check("Processing succeeds", result.Success);
     if (result.Success && result.OutputFilePaths.Count > 0)
     {
         using var output = Cv2.ImRead(result.OutputFilePaths[0], ImreadModes.Unchanged);
-        // This synthetic fixture (solid background, thin 5px stroked-outline "page", sparse
-        // text) has too little interior gradient/texture content for Method 4's sign-change
-        // signal to separate page from background — confirmed by comparison against all 8 real
-        // fixtures in tools/SmokeTest/Fixtures/real-photos (book-curve + trapezoid), which all
-        // crop to real, page-sized dimensions with no degenerate output. On a genuine detection
-        // failure the pipeline's own defensive fallback (AltFlattenSinglePage's narrow-span
-        // guard) correctly produces a non-degenerate, real page-height output rather than
-        // inventing a false-confidence crop — per product direction ("robust methods which will
-        // always work", no confidence-gate fallback to a plain uncropped frame — see the removed
-        // TestLowConfidenceCropIsSkippedAndFlagged's comment). So this asserts "produces a real,
-        // non-degenerate image" rather than "is smaller than the source", which no longer holds
-        // for a synthetic fixture this far from a real photo's texture profile.
+        // No separate C# auto-crop step runs anymore on a no-crop-given capture (see
+        // ImageProcessor.ProcessSinglePage) — boundary detection is page_dewarp.py's own job
+        // when Book Curve Correction is on. With dewarp off (this test's default), the frame
+        // passes straight through untouched, so the honest invariant here is "a real,
+        // non-degenerate image came out" (matches the full source size), not "was cropped
+        // smaller."
         Check("Output is a real, non-degenerate image (not a 1px-wide/near-zero-height sliver)",
             output.Width > 100 && output.Height > 100);
     }
@@ -4152,7 +4066,7 @@ async Task TestManualCropReviewFlowOnMockCameraStyleFrame()
     var pinnedDpiMeta = new TiffMetadata(ImageProcessor.BaselineDpi, null, DateTime.UtcNow);
 
     // First pass — worker auto-processes exactly like BackgroundProcessingWorker does.
-    var autoResult = processor.Process(job.OriginalFilePath, outputDir, splitPages: false, manualOverride: job.ManualOverrideApplied, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
+    var autoResult = processor.Process(job.OriginalFilePath, outputDir, splitPages: false, leftCrop: job.LeftCropBox, rightCrop: job.RightCropBox,
         metadata: pinnedDpiMeta);
     await queue.UpdateJobStatusAsync(job.Id, "processing", "Completed");
     await queue.UpdateJobStatusAsync(job.Id, "qc", autoResult.QcVerdict);
@@ -4174,7 +4088,7 @@ async Task TestManualCropReviewFlowOnMockCameraStyleFrame()
     Check("Crop Review save re-queues the job for reprocessing", pending.Count == 1);
     foreach (var pendingJob in pending)
     {
-        var reprocessResult = processor.Process(pendingJob.OriginalFilePath, outputDir, splitPages: false, manualOverride: pendingJob.ManualOverrideApplied, leftCrop: pendingJob.LeftCropBox, rightCrop: pendingJob.RightCropBox,
+        var reprocessResult = processor.Process(pendingJob.OriginalFilePath, outputDir, splitPages: false, leftCrop: pendingJob.LeftCropBox, rightCrop: pendingJob.RightCropBox,
             metadata: pinnedDpiMeta);
         Check("Reprocessing with the manual crop succeeds", reprocessResult.Success);
         if (reprocessResult.OutputFilePaths.Count > 0)

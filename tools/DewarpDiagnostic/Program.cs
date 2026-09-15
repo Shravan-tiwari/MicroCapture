@@ -5,20 +5,23 @@
 // visually judged, not asserted against a synthetic ground truth. See
 // tools/SmokeTest/Fixtures/real-photos/README.md.
 //
-// `process` is THE canonical command: it calls ImageProcessor.Process/ProcessFixedFrames, the
-// exact same entry points MicroCapture.Processing/BackgroundProcessingWorker.cs invokes for a
-// real batch — there is only one boundary/dewarp pipeline now (Method 4 side-edge detection +
-// cubic-bow single-pass remap, ported from tools/phaseA-prototype/boundary_prototype.ipynb),
-// not a choice between "the real one" and "an alternative," so this subcommand's output is
-// exactly what a real capture would produce. `altboundary`/`altflatten` were previously separate
-// subcommands exercising a genuinely different code path than `process` (a known, confirmed gap
-// — validating them didn't validate what the shipped app actually ran); they're kept below only
-// as finer-grained diagnostics INTO THE SAME pipeline `process` now runs (boundary trace only,
-// or flatten only, without the finger/bleedthrough/enhance/binarize tail) — not a different
-// pipeline anymore. `boundary`/`corners`/`rotfield`/`spread`/`points`/`mesh` are the OLD
-// contour/text-line-blob detector's own diagnostics — that detector only still runs for the
-// manual-crop-override path (Process's manualOverride branch), never for an automatic capture,
-// so treat their output as manual-path-only, not representative of `process`'s automatic result.
+// `process` is THE canonical command: it calls ImageProcessor.Process, the exact same entry
+// point MicroCapture.Processing/BackgroundProcessingWorker.cs invokes for a real batch. Book
+// curve correction (dewarpEnabled, the "Book Curve Correction" checkbox) calls the real,
+// unmodified page_dewarp.py (https://mzucker.github.io/2016/08/15/page-dewarping.html) as a
+// subprocess — see MicroCapture.Processing/PythonDewarpRunner.cs — rather than a C#
+// reimplementation of it; two earlier in-process approaches (a hand-ported "Method 4" side-edge
+// detector, and before that a C# port of page_dewarp.py itself) were both replaced after direct
+// comparison against the real script on real photos showed quality gaps. There is no separate
+// C# auto-crop step before dewarp anymore either — page_dewarp.py's own text-line-based
+// boundary detection is the only boundary detection an automatic capture gets when Book Curve
+// Correction is on; a capture with dewarp off passes straight through untouched.
+// `dewarp-model` below reports whether the subprocess produced output and what it warned about
+// — page_dewarp.py's own fitted camera-pose/cubic-surface state lives and dies inside the
+// subprocess, so there's no internal model left in C# to inspect the way the old ports had.
+// `boundary`/`corners`/`rotfield`/`spread`/`points`/`mesh` are the contour/text-line-blob
+// detector's own diagnostics for the OTHER geometric steps (deskew, line-mesh) that still run
+// in `ProcessSinglePage` alongside dewarp — unaffected by this change.
 //
 // Usage:
 //   dotnet run --project tools/DewarpDiagnostic -- process <input-dir> <output-dir> [--binarize]
@@ -38,20 +41,12 @@ switch (args[0])
         return RunProcess(args);
     case "calibrate":
         return RunCalibrate(args);
-    case "dewarp-lines":
-        return RunDewarpLines(args);
     case "dewarp-model":
         return RunDewarpModel(args);
     case "spread":
         return RunSpread(args);
     case "boundary":
         return RunBoundary(args);
-    case "altboundary":
-        return RunAltBoundary(args);
-    case "altflatten":
-        return RunAltFlatten(args);
-    case "singleflatten":
-        return RunSingleFlatten(args);
     case "corners":
         return RunCorners(args);
     case "rotfield":
@@ -72,14 +67,11 @@ switch (args[0])
 static void PrintUsage()
 {
     Console.WriteLine("Usage:");
-    Console.WriteLine("  process <input-dir> <output-dir> [--binarize] [--force-single]");
+    Console.WriteLine("  process <input-dir> <output-dir> [--binarize] [--no-dewarp]");
     Console.WriteLine("  calibrate <calibration-images-dir>");
-    Console.WriteLine("  dewarp-lines <cropped-page-image>");
+    Console.WriteLine("  dewarp-model <cropped-page-image>");
     Console.WriteLine("  spread <image-or-dir>");
     Console.WriteLine("  boundary <image-or-dir>");
-    Console.WriteLine("  altboundary <image-or-dir> [--out <out-dir>]");
-    Console.WriteLine("  altflatten <image-or-dir> <out-dir>");
-    Console.WriteLine("  singleflatten <image-or-dir> <out-dir>");
     Console.WriteLine("  corners <image-or-dir>");
     Console.WriteLine("  rotfield <image-or-dir>");
     Console.WriteLine("  points <image> [pointsPerEdge]");
@@ -94,16 +86,9 @@ static int RunProcess(string[] args)
     var inputDir = args[1];
     var outputDir = args[2];
     var binarize = args.Contains("--binarize");
-    // Dev-only escape hatch: disables the auto-split promotion entirely (see
-    // ImageProcessor.Process's GutterConfidenceThreshold check) so a real spread is forced
-    // through the single-page Method 4 flatten (AltFlattenSinglePage) instead of the two-page
-    // split (AltFlattenSpread), without needing to hand-edit ImageProcessor to compare the two.
-    var forceSingle = args.Contains("--force-single");
-    // NOTE: dewarpEnabled only affects the manual-crop-override path now (TryApplyDewarp, the
-    // legacy book-curve dewarp curve) — the automatic Method 4 path this tool actually exercises
-    // folds curve-straightening into its own single-pass remap unconditionally, so --no-dewarp
-    // has no effect on a normal (non-manual-override) `process` run. Kept for the manual-path
-    // diagnostics below (dewarp-lines/dewarp-model) and for the rare manual-crop fixture.
+    // dewarpEnabled gates the entire book-curve dewarp step (TryApplyDewarp ->
+    // PythonDewarpRunner.cs's page_dewarp.py subprocess call) — --no-dewarp turns it off,
+    // matching the "Book Curve Correction" checkbox off in the real app.
     var noDewarp = args.Contains("--no-dewarp");
 
     if (!Directory.Exists(inputDir))
@@ -126,7 +111,6 @@ static int RunProcess(string[] args)
     }
 
     var processor = new ImageProcessor();
-    if (forceSingle) processor.GutterConfidenceThreshold = double.MaxValue;
     Console.WriteLine($"Processing {images.Count} image(s) from {inputDir} (binarize={binarize})\n");
 
     foreach (var imagePath in images)
@@ -196,20 +180,11 @@ static int RunCalibrate(string[] args)
     return outcome.Success ? 0 : 1;
 }
 
-static int RunDewarpLines(string[] args)
-{
-    if (args.Length < 2) { PrintUsage(); return 1; }
-    var path = args[1];
-    if (!File.Exists(path))
-    {
-        Console.Error.WriteLine($"File not found: {path}");
-        return 1;
-    }
-    var bytes = File.ReadAllBytes(path);
-    Console.WriteLine(ImageProcessor.DebugDewarpLines(bytes));
-    return 0;
-}
-
+/// <summary>Reports whether the real page_dewarp.py subprocess (PythonDewarpRunner.cs)
+/// produced a flattened result for a cropped page image, and every warning the run generated,
+/// without running the rest of the pipeline. Supersedes two earlier generations of this
+/// subcommand — a Method-4-era `dewarp-lines`, and a later C#-ported-model `dewarp-model` — both
+/// of which pointed at detectors that no longer exist.</summary>
 static int RunDewarpModel(string[] args)
 {
     if (args.Length < 2) { PrintUsage(); return 1; }
@@ -220,7 +195,7 @@ static int RunDewarpModel(string[] args)
         return 1;
     }
     var bytes = File.ReadAllBytes(path);
-    Console.WriteLine(ImageProcessor.DebugDewarpModel(bytes));
+    Console.WriteLine(ImageProcessor.DebugPageDewarpModel(bytes));
     return 0;
 }
 
@@ -275,137 +250,6 @@ static int RunBoundary(string[] args)
         // through the same helper the UI uses to display a TIFF ImageProcessor itself wrote.
         var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
         Console.WriteLine(processor.DebugBoundaryDetection(bytes));
-    }
-    return 0;
-}
-
-static int RunAltBoundary(string[] args)
-{
-    if (args.Length < 2) { PrintUsage(); return 1; }
-    var target = args[1];
-    var outIdx = Array.IndexOf(args, "--out");
-    var outDir = outIdx >= 0 && args.Length > outIdx + 1 ? args[outIdx + 1] : null;
-    if (outDir != null) Directory.CreateDirectory(outDir);
-
-    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
-    IEnumerable<string> files = Directory.Exists(target)
-        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
-        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
-    var fileList = files.ToList();
-
-    if (fileList.Count == 0)
-    {
-        Console.Error.WriteLine($"No image(s) found at {target}");
-        return 1;
-    }
-
-    var processor = new ImageProcessor();
-    foreach (var path in fileList)
-    {
-        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
-        // Cv2.ImDecode (which the Alt* diagnostics use) doesn't handle TIFF — bridge through
-        // the same helper the UI uses to display a TIFF ImageProcessor itself wrote.
-        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
-        Console.WriteLine(processor.DebugAltBoundaryDetection(bytes));
-
-        if (outDir != null)
-        {
-            var overlay = processor.AltBoundaryOverlay(bytes);
-            var outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(path) + "_altboundary.png");
-            File.WriteAllBytes(outPath, overlay);
-            Console.WriteLine($"  -> {outPath}");
-        }
-    }
-    return 0;
-}
-
-static int RunAltFlatten(string[] args)
-{
-    if (args.Length < 3) { PrintUsage(); return 1; }
-    var target = args[1];
-    var outDir = args[2];
-    Directory.CreateDirectory(outDir);
-
-    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
-    IEnumerable<string> files = Directory.Exists(target)
-        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
-        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
-    var fileList = files.ToList();
-
-    if (fileList.Count == 0)
-    {
-        Console.Error.WriteLine($"No image(s) found at {target}");
-        return 1;
-    }
-
-    var processor = new ImageProcessor();
-    foreach (var path in fileList)
-    {
-        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
-        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
-        try
-        {
-            var (leftPng, rightPng, report) = processor.DebugAltFlatten(bytes);
-            Console.WriteLine(report);
-
-            var baseName = Path.GetFileNameWithoutExtension(path);
-            var leftPath = Path.Combine(outDir, baseName + "_altflat_left.png");
-            var rightPath = Path.Combine(outDir, baseName + "_altflat_right.png");
-            File.WriteAllBytes(leftPath, leftPng);
-            File.WriteAllBytes(rightPath, rightPng);
-            Console.WriteLine($"  -> {leftPath}");
-            Console.WriteLine($"  -> {rightPath}");
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"  FAILED: {ex.Message}");
-        }
-    }
-    return 0;
-}
-
-static int RunSingleFlatten(string[] args)
-{
-    if (args.Length < 3) { PrintUsage(); return 1; }
-    var target = args[1];
-    var outDir = args[2];
-    Directory.CreateDirectory(outDir);
-
-    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
-    IEnumerable<string> files = Directory.Exists(target)
-        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
-        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
-    var fileList = files.ToList();
-
-    if (fileList.Count == 0)
-    {
-        Console.Error.WriteLine($"No image(s) found at {target}");
-        return 1;
-    }
-
-    var processor = new ImageProcessor();
-    foreach (var path in fileList)
-    {
-        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
-        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
-        try
-        {
-            var png = processor.DebugAltFlattenSinglePage(bytes);
-            var baseName = Path.GetFileNameWithoutExtension(path);
-            var outPath = Path.Combine(outDir, baseName + "_singleflat.png");
-            File.WriteAllBytes(outPath, png);
-            Console.WriteLine($"  -> {outPath}");
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"  FAILED: {ex}");
-        }
     }
     return 0;
 }

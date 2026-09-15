@@ -16,11 +16,11 @@ namespace MicroCapture.UI.ViewModels;
 
 /// <summary>Post-capture touch-up window: rotate/flip/tone/color/sharpen adjustments only.
 /// Manual crop-quad/split-line/dewarp-curve editing has been removed — it was unreliable in
-/// practice, and boundary/curve correction is now handled entirely by the automatic Method 4
-/// pipeline (see ImageProcessor.Process/AltBoundaryPipeline.cs), which always re-detects the
-/// page boundary on reprocess. Saving from here re-queues the job through that same automatic
-/// path (or applies a delta directly to the derivative when the original is gone — see
-/// IsPostExportAdjustOnly).</summary>
+/// practice. Book-curve correction (when the batch's DewarpEnabled toggle is on) runs
+/// automatically on every capture via ImageProcessor.Process's crop-quad path (see
+/// MicroCapture.Processing/PythonDewarpRunner.cs), unconditionally re-applied on reprocess.
+/// Saving from here re-queues the job through that same path (or applies a delta directly to
+/// the derivative when the original is gone — see IsPostExportAdjustOnly).</summary>
 public partial class CropReviewViewModel : ViewModelBase, IDisposable
 {
     private readonly string _jobId;
@@ -491,12 +491,11 @@ public partial class CropReviewViewModel : ViewModelBase, IDisposable
         {
             // Manual crop-quad/split-line/dewarp-curve editing has been removed from this
             // window — this Save path only ever writes rotate/flip/tone/color/sharpen deltas
-            // now. LeftCropBox/RightCropBox/DewarpCurve/ManualOverrideApplied/
-            // DewarpManualOverrideApplied are intentionally left untouched here: a job re-queued
-            // from this window falls through to ImageProcessor.Process's automatic (Method 4)
-            // path exactly like a fresh capture, unless some OTHER mechanism (e.g. fixed-frame
-            // capture's own EnqueueCaptureAsync call) already marked it manual — that mechanism
-            // is untouched by this change and still owns those fields.
+            // now. LeftCropBox/RightCropBox/ManualOverrideApplied are intentionally left
+            // untouched here: whatever crop a job already carries (from EnqueueCaptureAsync at
+            // capture time) is reused verbatim on reprocess, book-curve correction re-runs
+            // automatically per the batch's DewarpEnabled toggle, and this Save path never
+            // changes any of that.
             job.RotationDegrees = RotationDegrees;
             job.FlipHorizontal = FlipHorizontal;
             job.FlipVertical = FlipVertical;

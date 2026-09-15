@@ -55,8 +55,13 @@ public class CaptureQueueService
         EnsureColumn("Batches", "PreferredExportFormat", "TEXT NOT NULL DEFAULT 'PDF'");
         EnsureColumn("Batches", "Dpi", "INTEGER NOT NULL DEFAULT 150");
         EnsureColumn("Batches", "DewarpEnabled", "INTEGER NOT NULL DEFAULT 0");
-        EnsureColumn("CaptureJobs", "DewarpManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
-        EnsureColumn("CaptureJobs", "DewarpCurve", "TEXT NULL");
+        // CaptureJobs.DewarpManualOverrideApplied/DewarpCurve are no longer read by
+        // ImageProcessor (the manual curve-editing feature they backed was replaced by a real
+        // page_dewarp.py subprocess call — see PythonDewarpRunner.cs — which has no
+        // manual-override concept) — left off this bootstrap on a fresh database, same "harmless
+        // orphaned column, not worth a destructive drop" precedent as UseAltBoundaryPipeline
+        // below. An existing database that already has these columns (added by an older build)
+        // keeps them; nothing reads or writes them anymore.
         EnsureColumn("Batches", "BinarizeEnabled", "INTEGER NOT NULL DEFAULT 0");
         // CameraCalibrations is a brand-new table, not just a new column — EnsureCreated()
         // only creates tables for a database that has no schema at all yet, so an existing
@@ -378,9 +383,9 @@ public class CaptureQueueService
     }
 
     /// <summary>Records exactly where a job's processed derivative(s) ended up on disk — the
-    /// single ';'-joined path (matching FixedFrames/DewarpCurve's own multi-value convention)
-    /// downstream readers (BatchExportService.GetProcessedFilesForJob, and eventually export
-    /// cleanup) prefer over globbing a folder by filename prefix. Same superseded-guard as
+    /// single ';'-joined path (matching FixedFrames' own multi-value convention) downstream
+    /// readers (BatchExportService.GetProcessedFilesForJob, and eventually export cleanup)
+    /// prefer over globbing a folder by filename prefix. Same superseded-guard as
     /// <see cref="UpdateJobStatusAsync"/> — a recapture can supersede this job while the old
     /// attempt is still mid-flight, and a stale write finishing afterward must not resurrect it.</summary>
     public async Task SetProcessedFilePathAsync(string jobId, string processedFilePath)
