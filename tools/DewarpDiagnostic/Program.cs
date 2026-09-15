@@ -7,21 +7,27 @@
 //
 // `process` is THE canonical command: it calls ImageProcessor.Process, the exact same entry
 // point MicroCapture.Processing/BackgroundProcessingWorker.cs invokes for a real batch. Book
-// curve correction (dewarpEnabled, the "Book Curve Correction" checkbox) calls the real,
-// unmodified page_dewarp.py (https://mzucker.github.io/2016/08/15/page-dewarping.html) as a
-// subprocess — see MicroCapture.Processing/PythonDewarpRunner.cs — rather than a C#
-// reimplementation of it; two earlier in-process approaches (a hand-ported "Method 4" side-edge
-// detector, and before that a C# port of page_dewarp.py itself) were both replaced after direct
-// comparison against the real script on real photos showed quality gaps. There is no separate
-// C# auto-crop step before dewarp anymore either — page_dewarp.py's own text-line-based
-// boundary detection is the only boundary detection an automatic capture gets when Book Curve
-// Correction is on; a capture with dewarp off passes straight through untouched.
+// curve correction (dewarpEnabled, the "Book Curve Correction" checkbox) calls page_dewarp.py
+// (https://mzucker.github.io/2016/08/15/page-dewarping.html — vendored at
+// MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py with one deliberate change from
+// upstream, see that file's header) as a subprocess — see
+// MicroCapture.Processing/PythonDewarpRunner.cs — rather than a C# reimplementation of it; two
+// earlier in-process approaches (a hand-ported "Method 4" side-edge detector, and before that a
+// C# port of page_dewarp.py itself) were both replaced after direct comparison against the real
+// script on real photos showed quality gaps. There is no separate C# auto-crop step before
+// dewarp anymore either — page_dewarp.py's own text-line-based boundary detection is the only
+// boundary detection an automatic capture gets when Book Curve Correction is on; a capture with
+// dewarp off passes straight through untouched. There's also no pre-dewarp C# deskew step
+// anymore — confirmed on real photos that page_dewarp.py's own optimizer solves camera
+// rotation as part of its fit and needs no pre-leveled input, and that a C# pre-rotation could
+// actively feed it a WORSE input on severely-tilted photos (its own text-line/Hough angle
+// estimators are unreliable above ~10° rotation).
 // `dewarp-model` below reports whether the subprocess produced output and what it warned about
 // — page_dewarp.py's own fitted camera-pose/cubic-surface state lives and dies inside the
 // subprocess, so there's no internal model left in C# to inspect the way the old ports had.
 // `boundary`/`corners`/`rotfield`/`spread`/`points`/`mesh` are the contour/text-line-blob
-// detector's own diagnostics for the OTHER geometric steps (deskew, line-mesh) that still run
-// in `ProcessSinglePage` alongside dewarp — unaffected by this change.
+// detector's own diagnostics for the line-mesh residual-bow correction that still runs after
+// dewarp — unaffected by this change.
 //
 // Usage:
 //   dotnet run --project tools/DewarpDiagnostic -- process <input-dir> <output-dir> [--binarize]

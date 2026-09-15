@@ -1,6 +1,8 @@
 # Stages a portable, no-install Python runtime + page_dewarp.py + its dependencies into
-# publish/windows/python/, so the packaged MicroCapture app can call the real page_dewarp.py
-# (https://mzucker.github.io/2016/08/15/page-dewarping.html) as a subprocess with nothing
+# publish/windows/python/, so the packaged MicroCapture app can call page_dewarp.py
+# (https://mzucker.github.io/2016/08/15/page-dewarping.html — vendored at
+# MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py, with one deliberate change from
+# upstream documented in that file's own header comment) as a subprocess with nothing
 # pre-installed on the operator's machine — see MicroCapture.Processing/PythonDewarpRunner.cs,
 # which looks for python.exe at "<app-dir>/python/python.exe" and the script at
 # "<app-dir>/python/page_dewarp/page_dewarp.py".
@@ -29,7 +31,7 @@ param(
     [string]$OpenCvVersion = "5.0.0.93",
     [string]$PillowVersion = "12.3.0",
     [string]$PublishDir = "publish/windows",
-    [string]$PageDewarpScriptPath = "" # defaults to a sibling checkout at ../page_dewarp/page_dewarp.py if not given
+    [string]$PageDewarpScriptPath = "" # defaults to this repo's own MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py if not given
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,12 +84,13 @@ Write-Host "Installing pinned dependencies (numpy $NumpyVersion, scipy $ScipyVer
     "opencv-python-headless==$OpenCvVersion" `
     "pillow==$PillowVersion"
 
-# --- 5. Copy in the real, unmodified page_dewarp.py ---
+# --- 5. Copy in page_dewarp.py (vendored copy, one deliberate change from upstream — see its
+# own header comment) ---
 if ([string]::IsNullOrWhiteSpace($PageDewarpScriptPath)) {
-    $PageDewarpScriptPath = Join-Path $repoRoot "..\page_dewarp\page_dewarp.py"
+    $PageDewarpScriptPath = Join-Path $repoRoot "MicroCapture.Processing\vendor\page_dewarp\page_dewarp.py"
 }
 if (-not (Test-Path $PageDewarpScriptPath)) {
-    throw "page_dewarp.py not found at '$PageDewarpScriptPath' — pass -PageDewarpScriptPath explicitly if it isn't checked out as a sibling of this repo."
+    throw "page_dewarp.py not found at '$PageDewarpScriptPath' — pass -PageDewarpScriptPath explicitly if it isn't at the usual vendored location."
 }
 $pageDewarpDestDir = Join-Path $pythonDir "page_dewarp"
 New-Item -ItemType Directory -Path $pageDewarpDestDir | Out-Null

@@ -6,16 +6,20 @@ using OpenCvSharp;
 
 namespace MicroCapture.Processing;
 
-/// <summary>Calls the real, unmodified `page_dewarp.py` (Matt Zucker's "cubic sheet" model,
+/// <summary>Calls `page_dewarp.py` (Matt Zucker's "cubic sheet" model,
 /// https://mzucker.github.io/2016/08/15/page-dewarping.html) as a subprocess for book-curve
 /// correction, rather than maintaining a hand-ported reimplementation in C#. A C# port
 /// (PageDewarpPipeline.cs) was built first and worked on the underlying geometry, but a
 /// side-by-side comparison against the original script on a real photo surfaced a real quality
 /// gap in binarized output (the port's Sauvola threshold vs. the script's plain
 /// cv2.adaptiveThreshold) and a since-fixed performance bug — the trust cost of chasing parity
-/// bugs against a script that already works was judged not worth paying. This mirrors
-/// OcrProcessor.cs's own external-CLI pattern: synchronous Process.Start + WaitForExit(timeout) +
-/// Kill() on timeout, never throws past its own boundary.</summary>
+/// bugs against a script that already works was judged not worth paying. The script itself is
+/// vendored at MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py with ONE deliberate
+/// change from upstream (REMAP_DECIMATE, see that file's header comment) that fixes real blur
+/// confirmed in the upstream script's own output on real photos — everything else about it is
+/// unmodified. This mirrors OcrProcessor.cs's own external-CLI pattern: synchronous
+/// Process.Start + WaitForExit(timeout) + Kill() on timeout, never throws past its own
+/// boundary.</summary>
 internal static class PythonDewarpRunner
 {
     // page_dewarp.py exits 0 even when it silently skips an image (too few text spans found —

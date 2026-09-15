@@ -1351,30 +1351,31 @@ public partial class ImageProcessor
     {
         var working = input.Clone();
 
-        // Deskew before dewarp: the curve fit assumes text lines run horizontally, so any
-        // residual global tilt corrupts the per-column curve sampling if left uncorrected
-        // first (both now share the same text-line detection, so this is coarse-to-fine —
-        // global rotation resolved before the finer per-column curve).
+        // No pre-dewarp deskew: page_dewarp.py's own optimizer solves camera pose (including
+        // in-plane rotation) jointly with the curve fit, so it does NOT need a pre-leveled
+        // input — confirmed on real photos with severe (~20°+) rotation, where running the
+        // real script directly on the untouched source produced a clean, level result on its
+        // own. Our own TryDeskew (built for this "flatten first" assumption) was found to
+        // actively hurt those same photos: on badly-angled captures its text-line/Hough angle
+        // estimators are unreliable (morphological line-blobs fragment past ~10° of rotation;
+        // Hough locks onto table gridlines instead of text baselines), so it fed page_dewarp.py
+        // a worse, pre-rotated input than the clean original — visible as residual tilt survivng
+        // all the way to the final output despite page_dewarp.py's own correction running fine.
         // Every geometric correction on this path is now behind the Book Curve Correction
-        // toggle, including the two that weren't.
+        // toggle.
         //
         // This path is reached by far more than manual crop-quad edits: a fixed-frame capture is
         // marked ManualOverrideApplied so it can carry a crop box (see
         // CaptureQueueService.EnqueueCaptureAsync), which routes EVERY framed capture through
-        // here. Deskew was ungated and line-mesh was deliberately ungated, so both silently
-        // rotated and bowed ordinary captures with the toggle switched off — pages came out
-        // visibly curved with nothing in the UI admitting to it.
-        //
-        // The line mesh was left ungated because the residual bow it corrects also appears on
-        // flat keystone photos, which is true — but an unrequested warp that can't be turned off
-        // is worse than an uncorrected bow the operator can see and decide about. It goes back
-        // under the toggle that claims to control curvature.
+        // here. Line-mesh was deliberately ungated in the past and silently bowed ordinary
+        // captures with the toggle switched off — pages came out visibly curved with nothing in
+        // the UI admitting to it. It goes back under the toggle that claims to control curvature.
         if (dewarpEnabled)
         {
-            working = TryDeskew(working, result);
             working = TryApplyDewarp(working, result, dewarpEnabled);
             working = TryTrimGutterShadow(working, result);
             working = TryApplyLineMesh(working, result) ?? working;
+            working = SharpenAfterDewarp(working);
         }
 
         return FinishPageProcessing(working, result, binarizeEnabled, dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
@@ -2883,10 +2884,11 @@ public partial class ImageProcessor
     /// <summary>Applies book-curve correction if enabled, and reports what happened via
     /// <paramref name="result"/>'s warnings — never throws, degrades to returning
     /// <paramref name="src"/> unchanged on any failure or low-confidence detection. See
-    /// PythonDewarpRunner.cs — this calls the real, unmodified page_dewarp.py as a subprocess
-    /// rather than a C# reimplementation of it. page_dewarp.py's own text-line-based boundary
-    /// detection is now the ONLY boundary detection an automatic capture gets — there is no
-    /// separate C# auto-crop step running beforehand anymore (see ProcessSinglePage).</summary>
+    /// PythonDewarpRunner.cs — this calls page_dewarp.py (vendored, one deliberate change from
+    /// upstream — see MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py's header) as a
+    /// subprocess rather than a C# reimplementation of it. page_dewarp.py's own text-line-based
+    /// boundary detection is now the ONLY boundary detection an automatic capture gets — there
+    /// is no separate C# auto-crop step running beforehand anymore (see ProcessSinglePage).</summary>
     private Mat TryApplyDewarp(Mat src, ProcessingResult result, bool dewarpEnabled)
     {
         if (!dewarpEnabled) return src;
@@ -2904,6 +2906,32 @@ public partial class ImageProcessor
         }
     }
 
+    // Upstream page_dewarp.py's remap_image() used to compute the pixel-remap coordinate grid
+    // at only 1/16 resolution (REMAP_DECIMATE=16) and upsample that grid with cubic
+    // interpolation before the final resample — confirmed by running the unmodified upstream
+    // script directly on real photos and getting visibly soft, ghosted text even in ITS OWN raw
+    // output (not something this C# wrapper added). The primary fix for that now lives in the
+    // vendored script itself (MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py sets
+    // REMAP_DECIMATE=1 — see its header comment) rather than here, since the real defect was in
+    // how the remap coordinate grid was computed, not something only fixable downstream. Even
+    // with that fix some residual softness remains on low-resolution source photos (less real
+    // detail for ANY remap to recover), so a light unsharp mask still runs unconditionally after
+    // dewarp — confirmed to meaningfully help the remaining soft cases and to add no visible
+    // artifacts on already-sharp pages, so it isn't worth gating behind a blur-detection
+    // heuristic.
+    private const double DewarpSharpenSigma = 3.0;
+    private const double DewarpSharpenAmount = 0.8; // weight of the high-frequency (original - blurred) component added back
+
+    private static Mat SharpenAfterDewarp(Mat src)
+    {
+        using var blurred = new Mat();
+        Cv2.GaussianBlur(src, blurred, new Size(0, 0), DewarpSharpenSigma);
+        var sharpened = new Mat();
+        Cv2.AddWeighted(src, 1.0 + DewarpSharpenAmount, blurred, -DewarpSharpenAmount, 0, sharpened);
+        src.Dispose();
+        return sharpened;
+    }
+
     // Tunables for TryTrimGutterShadow — confirmed on real book-spine photos where
     // page_dewarp.py's own crop leaves a dark gutter/binding shadow band along one edge (its
     // text-span detection bounds the crop by where TEXT is found, not by where the true page
@@ -2913,16 +2941,18 @@ public partial class ImageProcessor
     private const double GutterMinDropBelowBaseline = 15; // brightness units; below this, treat as normal page-edge noise, not shadow
     private const double GutterMaxCropFraction = 0.22; // refuse to crop more than this fraction of the page width from one edge — a bigger "trough" is more likely a real photo (colored illustration, dark page edge) than shadow
 
-    /// <summary>Crops off a dark gutter/spine-shadow band page_dewarp.py's own crop left behind
-    /// on one side of the page. page_dewarp.py bounds its crop by detected text spans, not by
-    /// the physical page edge, so a photo where the book's gutter shadow (or the spine binding
-    /// itself) extends past the last line of text rides along inside the crop as a dark strip —
-    /// confirmed on real book-spine photos where the fix meaningfully improves on the script's
-    /// own output. Scans each edge's column-brightness profile for a trough (darkest point)
-    /// noticeably below the page's own core brightness, walking inward from the edge, and crops
-    /// up to and including that trough. Never throws; declines (returns <paramref name="src"/>
-    /// unchanged) if neither edge shows a real shadow, or if the implied crop is implausibly
-    /// large to be shadow rather than real content.</summary>
+    /// <summary>Crops off a dark background/shadow band page_dewarp.py's own crop left behind on
+    /// any of the page's 4 edges. page_dewarp.py bounds its crop by detected text spans, not by
+    /// the physical page edge, so a photo where real background (desk, book cover, gutter
+    /// shadow) extends past the last line of text in ANY direction rides along inside the crop
+    /// as a dark strip — confirmed on real photos on all 4 sides, not just left/right (a photo
+    /// shot at a steep angle can leave background above the header or below the last line just
+    /// as easily as beside the spine). Scans each edge's brightness profile (column means for
+    /// left/right, row means for top/bottom) for a trough noticeably below the page's own core
+    /// brightness, walking inward from the edge, and crops up to and including that trough.
+    /// Never throws; declines (returns <paramref name="src"/> unchanged) on any edge that shows
+    /// no real shadow, or where the implied crop is implausibly large to be shadow rather than
+    /// real content.</summary>
     private Mat TryTrimGutterShadow(Mat src, ProcessingResult result)
     {
         try
@@ -2931,40 +2961,70 @@ public partial class ImageProcessor
             Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
 
             var width = src.Cols;
+            var height = src.Rows;
             var colMeans = new double[width];
             for (var x = 0; x < width; x++)
                 colMeans[x] = Cv2.Mean(gray.Col(x)).Val0;
+            var rowMeans = new double[height];
+            for (var y = 0; y < height; y++)
+                rowMeans[y] = Cv2.Mean(gray.Row(y)).Val0;
 
-            var coreStart = (int)(width * 0.25);
-            var coreEnd = (int)(width * 0.75);
-            var core = colMeans.Skip(coreStart).Take(Math.Max(1, coreEnd - coreStart)).OrderBy(v => v).ToList();
-            var baseline = core[core.Count / 2]; // median
+            var colBaseline = MedianOfCore(colMeans, width);
+            var rowBaseline = MedianOfCore(rowMeans, height);
 
-            var leftCrop = FindGutterCropPx(colMeans, width, fromLeft: true, baseline);
-            var rightCrop = FindGutterCropPx(colMeans, width, fromLeft: false, baseline);
+            var leftCrop = FindGutterCropPx(colMeans, width, fromLeft: true, colBaseline);
+            var rightCrop = FindGutterCropPx(colMeans, width, fromLeft: false, colBaseline);
+            // Top/bottom use a stricter drop threshold than left/right: a header or last body
+            // line naturally reads darker-on-average than a typical row (more ink per row than
+            // sparser paragraph text), producing a ~30-40 unit dip that looks identical to a
+            // shallow shadow — confirmed on a real photo where the default threshold cropped a
+            // real page header off entirely (rows read down to ~98-100 vs. a 138.7 baseline,
+            // indistinguishable from shadow at the left/right threshold). A real top/bottom
+            // background band (desk, book cover) reads much darker still, so raising the bar
+            // for these two edges only costs real shadow detection nothing while protecting
+            // real header/footer text.
+            var topCrop = FindGutterCropPx(rowMeans, height, fromLeft: true, rowBaseline, GutterMinDropBelowBaselineTopBottom);
+            var bottomCrop = FindGutterCropPx(rowMeans, height, fromLeft: false, rowBaseline, GutterMinDropBelowBaselineTopBottom);
 
-            var maxCropPx = (int)(width * GutterMaxCropFraction);
-            leftCrop = Math.Min(leftCrop, maxCropPx);
-            rightCrop = Math.Min(rightCrop, maxCropPx);
+            var maxCropPxW = (int)(width * GutterMaxCropFraction);
+            var maxCropPxH = (int)(height * GutterMaxCropFraction);
+            leftCrop = Math.Min(leftCrop, maxCropPxW);
+            rightCrop = Math.Min(rightCrop, maxCropPxW);
+            topCrop = Math.Min(topCrop, maxCropPxH);
+            bottomCrop = Math.Min(bottomCrop, maxCropPxH);
 
-            if (leftCrop <= 0 && rightCrop <= 0) return src;
+            if (leftCrop <= 0 && rightCrop <= 0 && topCrop <= 0 && bottomCrop <= 0) return src;
 
             var newWidth = width - leftCrop - rightCrop;
-            if (newWidth < width * 0.5) return src; // sanity floor — never lose more than half the page
+            var newHeight = height - topCrop - bottomCrop;
+            if (newWidth < width * 0.5 || newHeight < height * 0.5) return src; // sanity floor
 
-            var cropped = new Mat(src, new Rect(leftCrop, 0, newWidth, src.Rows));
+            var cropped = new Mat(src, new Rect(leftCrop, topCrop, newWidth, newHeight));
             var result2 = cropped.Clone();
             var parts = new List<string>();
             if (leftCrop > 0) parts.Add($"left {leftCrop}px");
             if (rightCrop > 0) parts.Add($"right {rightCrop}px");
-            result.Warnings.Add($"Trimmed gutter shadow ({string.Join(", ", parts)}).");
+            if (topCrop > 0) parts.Add($"top {topCrop}px");
+            if (bottomCrop > 0) parts.Add($"bottom {bottomCrop}px");
+            result.Warnings.Add($"Trimmed background/shadow ({string.Join(", ", parts)}).");
             return result2;
         }
         catch (Exception ex)
         {
-            result.Warnings.Add($"Gutter shadow trim failed: {ex.Message}");
+            result.Warnings.Add($"Background trim failed: {ex.Message}");
             return src;
         }
+    }
+
+    /// <summary>Median of the middle 50% of <paramref name="profile"/> (a column- or row-mean
+    /// brightness profile of length <paramref name="length"/>) — the page's own "core" brightness
+    /// away from either edge, used as the baseline a real edge shadow must dip below.</summary>
+    private static double MedianOfCore(double[] profile, int length)
+    {
+        var coreStart = (int)(length * 0.25);
+        var coreEnd = (int)(length * 0.75);
+        var core = profile.Skip(coreStart).Take(Math.Max(1, coreEnd - coreStart)).OrderBy(v => v).ToList();
+        return core[core.Count / 2];
     }
 
     // How many consecutive columns of near-baseline brightness (see GutterRecoveryTolerance)
@@ -2977,6 +3037,13 @@ public partial class ImageProcessor
     private const int GutterRecoveryRunPx = 20;
     private const double GutterRecoveryTolerance = 6; // brightness units within baseline to count as "recovered"
 
+    // Top/bottom edges need a stricter drop-below-baseline bar than left/right (the default
+    // GutterMinDropBelowBaseline) — see the call site's remark: a header or last body line's
+    // own ink density alone can produce a ~30-40 unit dip indistinguishable from shallow shadow
+    // at the default threshold, confirmed to crop a real header off entirely on a real photo.
+    // A genuine top/bottom background band (desk, book cover) reads far darker than this.
+    private const double GutterMinDropBelowBaselineTopBottom = 45;
+
     /// <summary>Walks <paramref name="colMeans"/> inward from one edge, tracking the darkest
     /// column seen so far WITHIN a contiguous dark run that starts at the physical edge. Stops
     /// as soon as brightness recovers to near <paramref name="baseline"/> for
@@ -2985,8 +3052,9 @@ public partial class ImageProcessor
     /// that happens to be darker than baseline (body text, a photo) must never extend the crop.
     /// Returns the crop distance (in px, from that edge) up to and including the darkest point
     /// found before recovery — or 0 if the edge is at/near baseline from the start (no shadow),
-    /// or if it never drops far enough below baseline to count as shadow.</summary>
-    private static int FindGutterCropPx(double[] colMeans, int width, bool fromLeft, double baseline)
+    /// or if it never drops far enough below baseline (past <paramref name="minDrop"/>, default
+    /// <see cref="GutterMinDropBelowBaseline"/>) to count as shadow.</summary>
+    private static int FindGutterCropPx(double[] colMeans, int width, bool fromLeft, double baseline, double minDrop = GutterMinDropBelowBaseline)
     {
         var searchPx = Math.Max(5, (int)(width * GutterSearchFraction));
         var minVal = baseline;
@@ -3015,7 +3083,7 @@ public partial class ImageProcessor
             }
         }
 
-        if (minPos < 0 || baseline - minVal < GutterMinDropBelowBaseline) return 0;
+        if (minPos < 0 || baseline - minVal < minDrop) return 0;
         return minPos + 1;
     }
 

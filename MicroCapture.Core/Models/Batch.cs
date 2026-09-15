@@ -53,11 +53,12 @@ public class Batch
     // baseline/scaling convention (150 = native captured size, higher values upsample).
     public int Dpi { get; set; } = 150;
 
-    // Corrects book-curvature distortion (the page bowing away from flat) by calling the real,
-    // unmodified "page_dewarp" script (https://mzucker.github.io/2016/08/15/page-dewarping.html)
-    // as a subprocess — text-line-based camera-pose + curvature fit, distinct from the
-    // perspective/quad crop every batch already gets, and the only boundary detection an
-    // automatic capture gets when this is on. See
+    // Corrects book-curvature distortion (the page bowing away from flat) by calling the
+    // "page_dewarp" script (https://mzucker.github.io/2016/08/15/page-dewarping.html, vendored
+    // at MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py with one deliberate change
+    // from upstream — see that file's header) as a subprocess — text-line-based camera-pose +
+    // curvature fit, distinct from the perspective/quad crop every batch already gets, and the
+    // only boundary detection an automatic capture gets when this is on. See
     // MicroCapture.Processing/PythonDewarpRunner.cs (RunPythonDewarp).
     public bool DewarpEnabled { get; set; } = false;
 
