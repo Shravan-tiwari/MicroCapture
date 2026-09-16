@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using BitMiracle.LibTiff.Classic;
@@ -1372,13 +1373,38 @@ public partial class ImageProcessor
         // the UI admitting to it. It goes back under the toggle that claims to control curvature.
         if (dewarpEnabled)
         {
+            var sw = Stopwatch.StartNew();
             working = TryApplyDewarp(working, result, dewarpEnabled);
+            var tDewarp = sw.Elapsed; sw.Restart();
             working = TryTrimGutterShadow(working, result);
+            var tGutter = sw.Elapsed; sw.Restart();
             working = TryApplyLineMesh(working, result) ?? working;
+            var tMesh = sw.Elapsed; sw.Restart();
             working = SharpenAfterDewarp(working);
+            var tSharpen = sw.Elapsed;
+            LogStageTiming($"TryApplyDewarp={tDewarp.TotalSeconds:F2}s TryTrimGutterShadow={tGutter.TotalSeconds:F2}s TryApplyLineMesh={tMesh.TotalSeconds:F2}s SharpenAfterDewarp={tSharpen.TotalSeconds:F2}s");
         }
 
-        return FinishPageProcessing(working, result, binarizeEnabled, dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+        var swTail = Stopwatch.StartNew();
+        var finished = FinishPageProcessing(working, result, binarizeEnabled, dpi, measuredDpi, bleedthroughEnabled, hasManualAdjustments, rotationDegrees, flipHorizontal, flipVertical, brightness, contrast, saturation, sharpness, whiteBalance);
+        LogStageTiming($"FinishPageProcessing(QC+resize+binarize+adjustments)={swTail.Elapsed.TotalSeconds:F2}s");
+        return finished;
+    }
+
+    // Temporary stage-timing instrumentation, same log file PythonDewarpRunner.cs already
+    // writes to — used to find where per-capture time goes beyond the dewarp subprocess itself
+    // (confirmed via that log that the subprocess's own optimizer step is no longer the
+    // bottleneck after the L-BFGS-B + analytic-gradient fix, but the operator still reported the
+    // capture feeling slow overall — this narrows down which remaining stage actually costs the
+    // time on their machine before guessing further).
+    private static void LogStageTiming(string message)
+    {
+        try
+        {
+            var path = Path.Combine(Path.GetTempPath(), "microcapture_pagedewarp_debug.log");
+            File.AppendAllText(path, $"[STAGE TIMING {DateTime.UtcNow:O}] {message}\n");
+        }
+        catch { /* non-fatal logging failure */ }
     }
 
     /// <summary>Shared tail of every page-processing path (Method 4 auto-detect AND the manual-

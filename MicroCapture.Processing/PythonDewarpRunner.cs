@@ -71,20 +71,22 @@ internal static class PythonDewarpRunner
                 CreateNoWindow = true,
             };
 
+            var subprocessStart = System.Diagnostics.Stopwatch.StartNew();
             using var proc = Process.Start(startInfo)!;
             var stdout = proc.StandardOutput.ReadToEnd();
             var stderr = proc.StandardError.ReadToEnd();
 
             var exited = proc.WaitForExit(TimeoutMs);
+            subprocessStart.Stop();
             if (!exited)
             {
                 try { proc.Kill(); } catch { /* best effort */ }
-                WriteDebugLog(startInfo, -1, stdout, stderr, timedOut: true);
+                WriteDebugLog(startInfo, -1, stdout, stderr, timedOut: true, subprocessStart.Elapsed);
                 result.Warnings.Add("Book curve correction timed out.");
                 return null;
             }
 
-            WriteDebugLog(startInfo, proc.ExitCode, stdout, stderr, timedOut: false);
+            WriteDebugLog(startInfo, proc.ExitCode, stdout, stderr, timedOut: false, subprocessStart.Elapsed);
 
             var outputPath = Path.Combine(workDir, baseName + "_color.png");
             if (!File.Exists(outputPath))
@@ -116,7 +118,7 @@ internal static class PythonDewarpRunner
         }
     }
 
-    private static void WriteDebugLog(ProcessStartInfo startInfo, int exitCode, string stdout, string stderr, bool timedOut)
+    private static void WriteDebugLog(ProcessStartInfo startInfo, int exitCode, string stdout, string stderr, bool timedOut, TimeSpan subprocessWallTime)
     {
         try
         {
@@ -124,6 +126,13 @@ internal static class PythonDewarpRunner
             dbg.AppendLine($"--- PAGE_DEWARP DEBUG {DateTime.UtcNow:O} ---");
             dbg.AppendLine($"Command: {startInfo.FileName} {startInfo.Arguments}");
             dbg.AppendLine($"WorkingDirectory: {startInfo.WorkingDirectory}");
+            // Full C#-measured subprocess wall time (Process.Start to exit) — includes Python
+            // interpreter startup + numpy/scipy/cv2 import + page_dewarp.py's own work, NOT just
+            // the "optimization took X sec" line further down (which is only the optimizer step
+            // inside that same process). The gap between this number and that one is Python
+            // startup/import/span-detection/remap/write overhead — worth knowing separately when
+            // the operator sees a total time that doesn't match the optimizer time alone.
+            dbg.AppendLine($"SubprocessWallTime: {subprocessWallTime.TotalSeconds:F2} sec");
             dbg.AppendLine(timedOut ? "TIMED OUT" : $"ExitCode: {exitCode}");
             dbg.AppendLine("--- STDOUT ---");
             dbg.AppendLine(stdout);
