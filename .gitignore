@@ -7,6 +7,10 @@
 *.userosscache
 *.sln.docstates
 
+# Per-machine VS Code debug config (e.g. local Python paths for MICROCAPTURE_PYTHON_EXE dev
+# overrides — see PythonDewarpRunner.cs) — machine-specific, never shared.
+.vscode/
+
 # Canon SDK (Do not commit binary SDK packages without permission)
 EDSDK.dll
 EdsImage.dll
@@ -35,3 +39,4 @@ __pycache__/
 
 # Training/eval corpus (1.4GB, not for git)
 /Dataset-Training/
+tools/phaseA-prototype/_batch_results.pkl
