@@ -2920,8 +2920,14 @@ public partial class ImageProcessor
         if (!dewarpEnabled) return src;
         try
         {
-            var flattened = PythonDewarpRunner.RunPythonDewarp(src, result);
-            if (flattened is null) return src; // RunPythonDewarp already added its own warning
+            // PythonDewarpWorker reuses one long-lived page_dewarp.py process across every page
+            // instead of spawning fresh each time — see that class's own header comment for why
+            // (confirmed on a real machine: 6-11s of Python interpreter/import startup PER PAGE
+            // otherwise, dwarfing the now-fast 1-3s optimizer). Falls back to
+            // PythonDewarpRunner's original spawn-per-call behavior on its own if the worker is
+            // ever unavailable or dies, so this call site doesn't need to know which happened.
+            var flattened = PythonDewarpWorker.RunPythonDewarp(src, result);
+            if (flattened is null) return src; // already added its own warning
             result.Warnings.Add("Book curve correction applied.");
             return flattened;
         }

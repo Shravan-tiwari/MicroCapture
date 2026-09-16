@@ -40,6 +40,13 @@ public partial class App : Application
             {
                 DataContext = new MainWindowViewModel(cameraService),
             };
+
+            // The persistent page_dewarp.py worker process (see PythonDewarpWorker.cs) is kept
+            // alive across every page in every batch precisely so it's NOT torn down and
+            // restarted per capture — but that means it must be torn down explicitly here, or a
+            // live Python process is left running (and its temp working directory left on disk)
+            // after the app closes.
+            desktop.Exit += (_, _) => MicroCapture.Processing.PythonDewarpWorker.Shutdown();
         }
 
         base.OnFrameworkInitializationCompleted();

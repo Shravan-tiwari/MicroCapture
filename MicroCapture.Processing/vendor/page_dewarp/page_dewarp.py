@@ -1040,6 +1040,122 @@ def remap_image(name, img, small, page_dims, params):
     return outfile
 
 
+def process_one_image(imgfile):
+    """Runs the full dewarp pipeline on a single image file and writes its
+    output alongside page_dewarp.py's usual naming convention (see
+    remap_image's OUTPUT_COLOR_MODE-based suffix). Returns the output file
+    path, or None if too few text spans were found (page_dewarp.py's own
+    "skip" case — not an error, just no confident curvature). Factored out
+    of main()'s per-image loop body (unchanged logic) so --worker mode (see
+    below) can call it repeatedly inside one long-lived process instead of
+    every image paying Python-interpreter-and-import startup cost again."""
+
+    img = cv2.imread(imgfile)
+    small = resize_to_screen(img)
+    basename = os.path.basename(imgfile)
+    name, _ = os.path.splitext(basename)
+
+    print('loaded', basename, 'with size', imgsize(img), end=' ')
+    print('and resized to', imgsize(small))
+
+    if DEBUG_LEVEL >= 3:
+        debug_show(name, 0.0, 'original', small)
+
+    pagemask, page_outline = get_page_extents(small)
+
+    cinfo_list = get_contours(name, small, pagemask, 'text')
+    spans = assemble_spans(name, small, pagemask, cinfo_list)
+
+    if len(spans) < 3:
+        print('  detecting lines because only', len(spans), 'text spans')
+        cinfo_list = get_contours(name, small, pagemask, 'line')
+        spans2 = assemble_spans(name, small, pagemask, cinfo_list)
+        if len(spans2) > len(spans):
+            spans = spans2
+
+    if len(spans) < 1:
+        print('skipping', name, 'because only', len(spans), 'spans')
+        return None
+
+    tight_pagemask, tight_outline = tighten_page_extents(small, pagemask, spans)
+    if tight_outline is not None:
+        pagemask, page_outline = tight_pagemask, tight_outline
+
+    span_points = sample_spans(small.shape, spans)
+
+    print('  got', len(spans), 'spans', end=' ')
+    print('with', sum([len(pts) for pts in span_points]), 'points.')
+
+    corners, ycoords, xcoords = keypoints_from_samples(name, small,
+                                                       pagemask,
+                                                       page_outline,
+                                                       span_points)
+
+    rough_dims, span_counts, params = get_default_params(corners,
+                                                         ycoords, xcoords)
+
+    dstpoints = np.vstack((corners[0].reshape((1, 1, 2)),) +
+                          tuple(span_points))
+
+    params = optimize_params(name, small,
+                             dstpoints,
+                             span_counts, params)
+
+    page_dims = get_page_dims(corners, rough_dims, params)
+
+    outfile = remap_image(name, img, small, page_dims, params)
+
+    print('  wrote', outfile)
+    print()
+
+    return outfile
+
+
+def run_worker_loop():
+    """--worker mode: after the one-time interpreter/import cost already
+    paid to reach this point, reads one absolute image path per line from
+    stdin, dewarps it with process_one_image, and writes exactly one
+    response line to stdout per request — "OK <outfile>" or "SKIP" (too few
+    spans, page_dewarp's own low-confidence case) or "ERROR <message>" (any
+    exception, with newlines replaced so the response stays one line) —
+    before flushing and waiting for the next line. Exits cleanly on EOF
+    (stdin closed, e.g. the parent process exited) or a line that is
+    exactly "QUIT". See MicroCapture.Processing/PythonDewarpWorker.cs for
+    the C# side of this protocol: it starts this process once and reuses it
+    for every page in a batch instead of spawning fresh each time, which is
+    what actually eliminates the interpreter+import startup cost — the
+    optimizer itself was never the dominant cost once L-BFGS-B with an
+    analytic gradient replaced Powell (see this file's header comment);
+    confirmed on a real Windows machine that ~6-11 seconds of every
+    single-page capture was Python/numpy/scipy/cv2/PIL startup overhead,
+    not the optimizer, no matter how fast the optimizer itself got."""
+    # process_one_image (and everything it calls — span detection, keypoint
+    # sampling, optimize_params, remap_image, etc.) prints its own progress
+    # lines via plain print(), same as CLI mode always has. Those must never
+    # reach real stdout here, since this protocol is exactly one response
+    # line per request — redirect stdout to stderr for the duration of the
+    # actual work (visible in the debug log same as before) and only swap
+    # the real stdout back in to emit the single protocol response line.
+    real_stdout = sys.stdout
+    print('WORKER_READY', file=real_stdout, flush=True)
+    for line in sys.stdin:
+        imgfile = line.strip()
+        if not imgfile or imgfile == 'QUIT':
+            break
+        try:
+            sys.stdout = sys.stderr
+            outfile = process_one_image(imgfile)
+            sys.stdout = real_stdout
+            if outfile is None:
+                print('SKIP', flush=True)
+            else:
+                print('OK', outfile, flush=True)
+        except Exception as ex:  # pylint: disable=broad-except
+            sys.stdout = real_stdout
+            safe_message = str(ex).replace('\n', ' ').replace('\r', ' ')
+            print('ERROR', safe_message, flush=True)
+
+
 def main():
 
     global OUTPUT_COLOR_MODE
@@ -1053,8 +1169,14 @@ def main():
         OUTPUT_COLOR_MODE = 'gray'
         args.remove('--gray')
 
+    if '--worker' in args:
+        args.remove('--worker')
+        run_worker_loop()
+        return
+
     if len(args) < 1:
         print('usage:', sys.argv[0], '[--color|--gray] IMAGE1 [IMAGE2 ...]')
+        print('       ', sys.argv[0], '[--color|--gray] --worker')
         sys.exit(0)
 
     if DEBUG_LEVEL > 0 and DEBUG_OUTPUT != 'file':
@@ -1063,66 +1185,9 @@ def main():
     outfiles = []
 
     for imgfile in args:
-
-        img = cv2.imread(imgfile)
-        small = resize_to_screen(img)
-        basename = os.path.basename(imgfile)
-        name, _ = os.path.splitext(basename)
-
-        print('loaded', basename, 'with size', imgsize(img), end=' ')
-        print('and resized to', imgsize(small))
-
-        if DEBUG_LEVEL >= 3:
-            debug_show(name, 0.0, 'original', small)
-
-        pagemask, page_outline = get_page_extents(small)
-
-        cinfo_list = get_contours(name, small, pagemask, 'text')
-        spans = assemble_spans(name, small, pagemask, cinfo_list)
-
-        if len(spans) < 3:
-            print('  detecting lines because only', len(spans), 'text spans')
-            cinfo_list = get_contours(name, small, pagemask, 'line')
-            spans2 = assemble_spans(name, small, pagemask, cinfo_list)
-            if len(spans2) > len(spans):
-                spans = spans2
-
-        if len(spans) < 1:
-            print('skipping', name, 'because only', len(spans), 'spans')
-            continue
-
-        tight_pagemask, tight_outline = tighten_page_extents(small, pagemask, spans)
-        if tight_outline is not None:
-            pagemask, page_outline = tight_pagemask, tight_outline
-
-        span_points = sample_spans(small.shape, spans)
-
-        print('  got', len(spans), 'spans', end=' ')
-        print('with', sum([len(pts) for pts in span_points]), 'points.')
-
-        corners, ycoords, xcoords = keypoints_from_samples(name, small,
-                                                           pagemask,
-                                                           page_outline,
-                                                           span_points)
-
-        rough_dims, span_counts, params = get_default_params(corners,
-                                                             ycoords, xcoords)
-
-        dstpoints = np.vstack((corners[0].reshape((1, 1, 2)),) +
-                              tuple(span_points))
-
-        params = optimize_params(name, small,
-                                 dstpoints,
-                                 span_counts, params)
-
-        page_dims = get_page_dims(corners, rough_dims, params)
-
-        outfile = remap_image(name, img, small, page_dims, params)
-
-        outfiles.append(outfile)
-
-        print('  wrote', outfile)
-        print()
+        outfile = process_one_image(imgfile)
+        if outfile is not None:
+            outfiles.append(outfile)
 
     print('to convert to PDF (requires ImageMagick):')
     print('  convert -compress Group4 ' + ' '.join(outfiles) + ' output.pdf')

@@ -189,6 +189,12 @@ internal static class PythonDewarpRunner
         return null;
     }
 
+    // Exposes the same resolution logic to PythonDewarpWorker.cs — the persistent-worker path
+    // needs to locate the same interpreter/script this spawn-per-call path does (including the
+    // same dev-override env vars), but starts it once with --worker instead of once per page.
+    internal static string? ResolvePythonExecutableForWorker() => ResolvePythonExecutable();
+    internal static string? ResolveScriptPathForWorker() => ResolveScriptPath();
+
     private static string? ResolveFromPath(string command)
     {
         try
