@@ -21,6 +21,18 @@ public class CaptureJob
     public string? LeftCropBox { get; set; } // Format: "X,Y,Width,Height"
     public string? RightCropBox { get; set; }
 
+    // Dead field, kept only so EF Core keeps supplying a value for it on every INSERT. The
+    // manual dewarp-curve-override feature this backed was removed (Book Curve Correction now
+    // calls the real page_dewarp.py subprocess — see PythonDewarpRunner.cs — which has no
+    // manual-override concept), but the underlying SQLite column is NOT NULL on any database
+    // created before that removal. Once the property left the C# model, EF's generated INSERT
+    // stopped mentioning this column at all — and unlike a plain SQL INSERT, that made SQLite
+    // reject every capture with "NOT NULL constraint failed: CaptureJobs.DewarpManualOverrideApplied"
+    // (confirmed on a real installed database). Restoring the property (never read anywhere) is
+    // the low-risk fix — the alternative, an ALTER-based constraint rebuild, is real migration
+    // work on a live operator database and not worth it for one harmless orphaned column.
+    public bool DewarpManualOverrideApplied { get; set; } = false;
+
     // Manual post-capture adjustments (rotate/flip/tone/color/sharpen) — applied after the
     // rest of the automatic pipeline (crop, dewarp, CLAHE enhancement), immediately before the
     // final TIFF write. See ImageProcessor.ApplyManualAdjustments/AdjustmentGeometry.

@@ -55,13 +55,19 @@ public class CaptureQueueService
         EnsureColumn("Batches", "PreferredExportFormat", "TEXT NOT NULL DEFAULT 'PDF'");
         EnsureColumn("Batches", "Dpi", "INTEGER NOT NULL DEFAULT 150");
         EnsureColumn("Batches", "DewarpEnabled", "INTEGER NOT NULL DEFAULT 0");
-        // CaptureJobs.DewarpManualOverrideApplied/DewarpCurve are no longer read by
-        // ImageProcessor (the manual curve-editing feature they backed was replaced by a real
-        // page_dewarp.py subprocess call — see PythonDewarpRunner.cs — which has no
-        // manual-override concept) — left off this bootstrap on a fresh database, same "harmless
-        // orphaned column, not worth a destructive drop" precedent as UseAltBoundaryPipeline
-        // below. An existing database that already has these columns (added by an older build)
-        // keeps them; nothing reads or writes them anymore.
+        // CaptureJobs.DewarpManualOverrideApplied/DewarpCurve backed a manual curve-editing
+        // feature that was replaced by a real page_dewarp.py subprocess call (see
+        // PythonDewarpRunner.cs), which has no manual-override concept — neither column is read
+        // for anything anymore. DewarpCurve (nullable TEXT) was left off this bootstrap, same
+        // "harmless orphaned column" precedent as UseAltBoundaryPipeline below. But
+        // DewarpManualOverrideApplied is NOT NULL on any database created before the removal —
+        // dropping it from the C# model made EF's generated INSERT stop supplying a value for
+        // it at all, and SQLite rejected every capture on such a database with "NOT NULL
+        // constraint failed" (confirmed on a real installed database). CaptureJob.cs keeps the
+        // property (dead, always false) specifically so EF keeps filling it in; this
+        // EnsureColumn call still needs to stay too, for a genuinely fresh database that has
+        // never had the column at all.
+        EnsureColumn("CaptureJobs", "DewarpManualOverrideApplied", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn("Batches", "BinarizeEnabled", "INTEGER NOT NULL DEFAULT 0");
         // CameraCalibrations is a brand-new table, not just a new column — EnsureCreated()
         // only creates tables for a database that has no schema at all yet, so an existing
