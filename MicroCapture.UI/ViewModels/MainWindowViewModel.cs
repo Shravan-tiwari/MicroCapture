@@ -2377,7 +2377,14 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            StatusText = $"Capture failed: {ex.Message}";
+            // ex.Message alone is useless for a DbUpdateException — EF's own message is just
+            // "An error occurred while saving the entity changes. See the inner exception for
+            // details.", never the actual SQL/constraint error. Walk to the innermost exception
+            // so the real cause (e.g. a SQLite "no such column"/constraint failure) actually
+            // reaches the operator instead of being swallowed behind a dialog they can't act on.
+            var root = ex;
+            while (root.InnerException != null) root = root.InnerException;
+            StatusText = $"Capture failed: {root.Message}";
             // Only safe to rewind the count for a plain append. An insert already committed a
             // page-number shift (and moved DB rows) in ShiftPagesForInsertAsync; a failed
             // capture there leaves a one-shot numbering gap that the next delete/reorder's
