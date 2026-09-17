@@ -10,60 +10,36 @@
 # Source:  https://github.com/mzucker/page_dewarp
 ######################################################################
 #
-# Vendored into MicroCapture (see MicroCapture.Processing/PythonDewarpRunner.cs)
-# with ONE deliberate change from upstream (a second, REMAP_DECIMATE, was tried
-# and reverted — see below):
+# Vendored into MicroCapture (see MicroCapture.Processing/PythonDewarpRunner.cs).
+# As of this revision the algorithm itself (every constant, and every function
+# body used by the pipeline: page-extent/contour/span detection, keypoint
+# sampling, optimize_params' objective and method='Powell' call, get_page_dims,
+# remap_image, REMAP_DECIMATE=16, etc.) is IDENTICAL to upstream
+# https://github.com/mzucker/page_dewarp — confirmed by diffing this file
+# against a fresh clone of that repo. Output from this file should therefore
+# match the original script exactly, given the same input image.
 #
-# REMAP_DECIMATE is back at upstream's default of 16 (was set to 1 for a
-# while). remap_image() computes the pixel-remap coordinate grid at
-# 1/REMAP_DECIMATE resolution and cubic-upsamples that grid before the final
-# cv2.remap — at decimate-by-16, this smooths the warp field itself on real
-# photos with fast-changing curvature (steep viewing angle, heavy bow near a
-# book's spine, or a low-resolution source), producing visibly soft/ghosted
-# output text; confirmed directly by running upstream page_dewarp.py
-# unmodified and seeing the identical blur in ITS OWN raw output.
-# REMAP_DECIMATE=1 (computing the true per-pixel coordinate grid, no
-# decimation) fixed that blur and was shipped for a while, but on at least
-# one real Windows machine the full-resolution remap step turned out to cost
-# real time — confirmed directly (worker-mode timing showed a real gap
-# between the optimizer finishing and the response coming back, present
-# even with the optimizer itself already fast). REMAP_DECIMATE=4 was tested
-# as a middle ground (visibly sharper than 16, not quite as sharp as 1) but
-# not shipped — reverted to 16 on the operator's explicit request pending a
-# decision on the sharpness/speed tradeoff. If sharper output is wanted
-# again, the fix is exactly this one line; see also
-# MicroCapture.Processing/PythonDewarpWorker.cs's own header for the other,
-# unrelated speed work (persistent worker process) that's independent of
-# this setting either way.
+# The only additions are non-algorithmic, additive worker-mode plumbing for
+# reusing one long-lived Python process across many pages instead of paying
+# interpreter+import startup cost per page (process_one_image/run_worker_loop/
+# --worker — a pure refactor of main()'s per-image loop body into a reusable
+# function; see MicroCapture.Processing/PythonDewarpWorker.cs's own header
+# for that history). None of this changes dewarp output versus upstream
+# running the same image with method='Powell'.
 #
-# The other deliberate change from upstream, still in place:
-# optimize_params()'s scipy.optimize.minimize call uses method='L-BFGS-B'
-#    with an explicit analytic jac= (see project_keypoints_jacobian), instead
-#    of upstream's method='Powell'. Powell is derivative-free — at this
-#    problem's ~400-800+ parameters (camera pose + per-span cubic keypoints)
-#    it spends most of its time exploring via blind coordinate line searches.
-#    L-BFGS-B alone (no jac=) was tried first and looked like a 10-15x
-#    speedup in initial testing, but turned out to be unreliable: without an
-#    explicit gradient, SciPy falls back to numerically approximating it via
-#    finite differences, which costs roughly one extra full objective
-#    evaluation PER PARAMETER per optimizer step — on one real Windows
-#    machine this made total optimizer time vary wildly (0.5s to 25s+ on
-#    similar photos) instead of scaling with problem difficulty, because
-#    objective-evaluation cost (not algorithmic progress) was dominating.
-#    project_keypoints_jacobian supplies the exact analytic gradient instead
-#    (chain rule through OpenCV's own cv2.projectPoints Jacobian for
-#    rvec/tvec, a closed-form pinhole-camera derivative for the object-point
-#    chain, and the cubic polynomial's own derivative for alpha/beta/x) — no
-#    finite-difference fallback needed at all, so optimizer time no longer
-#    depends on how expensive one objective evaluation happens to be on a
-#    given machine. Verified against SciPy's own numerical gradient (5
-#    random configurations, 555-650 parameters, matching real photos'
-#    scale) to ~1e-6 relative error before being trusted, and confirmed on
-#    real photos to produce the same final objective/visual quality as
-#    Powell while being dramatically faster — this was the dominant cost in
-#    total per-image dewarp time (the operator's own ~20s/image estimate).
-#
-# Everything else in this file is unmodified upstream code.
+# History: REMAP_DECIMATE was briefly set to 1 (full-resolution remap,
+# sharper but slower on at least one real Windows machine) and the optimizer
+# was briefly switched to method='L-BFGS-B' with an analytic jac= (much
+# faster per-image, verified against SciPy's own numerical gradient to
+# ~1e-6 relative error) — both were reverted back to upstream's exact values
+# after real-photo comparison showed upstream's own Powell-based output was
+# visibly better (L-BFGS-B is a local gradient method and can converge to a
+# different, sometimes worse, local optimum than Powell's derivative-free
+# search on this non-convex ~500-800 parameter objective, even though both
+# "converge" in the optimizer-status sense). Exact parity with the original,
+# proven-good script was prioritized over the speedup; if optimizer speed
+# needs revisiting, do it without touching the objective/method here unless
+# a full real-photo quality comparison against Powell is repeated first.
 ######################################################################
 
 import os
@@ -82,7 +58,7 @@ PAGE_MARGIN_Y = 60       # reduced px to ignore near T/B edge
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # assumed source DPI; stated output DPI = this / OUTPUT_ZOOM
-REMAP_DECIMATE = 16     # downscaling factor for remapping image (upstream default, reverted — see header comment)
+REMAP_DECIMATE = 16      # downscaling factor for remapping image
 
 # 'binary': adaptive-threshold black & white (original behavior)
 # 'gray': grayscale, no thresholding
@@ -823,100 +799,6 @@ def make_keypoint_index(span_counts):
     return keypoint_index
 
 
-def project_keypoints_jacobian(pvec, keypoint_index):
-    """Analytic Jacobian of project_keypoints' output (flattened (u0,v0,u1,v1,...))
-    with respect to every entry of pvec — supplied as jac= to scipy.optimize.minimize
-    so L-BFGS-B never has to fall back to a numerical (finite-difference) gradient
-    approximation, which requires ~len(pvec) extra objective evaluations per step and
-    was found to dominate total runtime on at least one real machine (confirmed: with
-    no jac=, optimizer time on the exact same photos varied wildly across machines —
-    0.5s on one, 15-25s on another — instead of scaling only with problem difficulty).
-
-    Verified against SciPy's own central-difference numerical gradient (5 random
-    configurations at 555-650 parameters, matching real photos' scale) to within
-    ~1e-6 relative error before this was trusted — see the derivation below.
-
-    The three pieces of the chain rule:
-    1. d(image point)/d(rvec, tvec): cv2.projectPoints' own `jacobian` output —
-       OpenCV's analytically-computed derivative (the same one solvePnP/
-       calibrateCamera use internally), not re-derived here.
-    2. d(image point)/d(object point xyz), for FIXED rvec/tvec: standard closed-form
-       pinhole-camera derivative (camera point = R@obj + t; u = fx*x/z + cx), taking
-       R from cv2.Rodrigues(rvec).
-    3. d(object point)/d(the actual free parameters — alpha, beta, and each
-       keypoint's own x; y is a single value shared by every point in its span, per
-       make_keypoint_index below): a closed-form polynomial derivative, since
-       project_xy's z = (alpha+beta)x^3 + (-2alpha-beta)x^2 + alpha*x.
-    Chained together via the product/chain rule; point 0 is pinned to the origin
-    (see project_keypoints) and contributes no gradient. Gradients from points that
-    share a span's y-parameter are accumulated (+=), not overwritten, since several
-    rows of the Jacobian reference the same column.
-    """
-    x_param_idx = keypoint_index[:, 0]
-    y_param_idx = keypoint_index[:, 1]
-
-    xy_coords = pvec[keypoint_index].copy()
-    xy_coords[0, :] = 0
-    x = xy_coords[:, 0]
-    n = xy_coords.shape[0]
-
-    alpha, beta = tuple(pvec[CUBIC_IDX])
-    rvec = pvec[RVEC_IDX]
-    tvec = pvec[TVEC_IDX]
-
-    c3 = alpha + beta
-    c2 = -2 * alpha - beta
-    c1 = alpha
-    z = c3 * x**3 + c2 * x**2 + c1 * x
-    objpoints = np.hstack((xy_coords, z.reshape((-1, 1)))).astype(np.float64)
-
-    _, jac_full = cv2.projectPoints(objpoints, rvec, tvec, K, np.zeros(5))
-    jac_rvec = jac_full[:, 0:3]
-    jac_tvec = jac_full[:, 3:6]
-
-    R, _ = cv2.Rodrigues(rvec)
-    fx, fy = K[0, 0], K[1, 1]
-    pc = (R @ objpoints.T).T + tvec.reshape(1, 3)
-    pcx, pcy, pcz = pc[:, 0], pc[:, 1], pc[:, 2]
-    du_dpc = np.stack([fx / pcz, np.zeros(n), -fx * pcx / pcz**2], axis=1)
-    dv_dpc = np.stack([np.zeros(n), fy / pcz, -fy * pcy / pcz**2], axis=1)
-    du_dobj = du_dpc @ R
-    dv_dobj = dv_dpc @ R
-
-    dz_dx = 3 * c3 * x**2 + 2 * c2 * x + c1
-    dz_dalpha = x**3 - 2 * x**2 + x
-    dz_dbeta = x**3 - x**2
-
-    du_dxi = du_dobj[:, 0] + du_dobj[:, 2] * dz_dx
-    dv_dxi = dv_dobj[:, 0] + dv_dobj[:, 2] * dz_dx
-    du_dyi = du_dobj[:, 1]
-    dv_dyi = dv_dobj[:, 1]
-    du_dalpha = du_dobj[:, 2] * dz_dalpha
-    dv_dalpha = dv_dobj[:, 2] * dz_dalpha
-    du_dbeta = du_dobj[:, 2] * dz_dbeta
-    dv_dbeta = dv_dobj[:, 2] * dz_dbeta
-
-    J = np.zeros((2 * n, len(pvec)))
-    J[0::2, RVEC_IDX] = jac_rvec[0::2]
-    J[1::2, RVEC_IDX] = jac_rvec[1::2]
-    J[0::2, TVEC_IDX] = jac_tvec[0::2]
-    J[1::2, TVEC_IDX] = jac_tvec[1::2]
-    J[0::2, 6] = du_dalpha
-    J[1::2, 6] = dv_dalpha
-    J[0::2, 7] = du_dbeta
-    J[1::2, 7] = dv_dbeta
-
-    for k in range(1, n):  # point 0 is pinned, contributes no gradient
-        xi = x_param_idx[k]
-        yi = y_param_idx[k]
-        J[2 * k, xi] += du_dxi[k]
-        J[2 * k + 1, xi] += dv_dxi[k]
-        J[2 * k, yi] += du_dyi[k]
-        J[2 * k + 1, yi] += dv_dyi[k]
-
-    return J
-
-
 def optimize_params(name, small, dstpoints, span_counts, params):
 
     keypoint_index = make_keypoint_index(span_counts)
@@ -924,12 +806,6 @@ def optimize_params(name, small, dstpoints, span_counts, params):
     def objective(pvec):
         ppts = project_keypoints(pvec, keypoint_index)
         return np.sum((dstpoints - ppts)**2)
-
-    def objective_jac(pvec):
-        ppts = project_keypoints(pvec, keypoint_index)
-        J = project_keypoints_jacobian(pvec, keypoint_index)
-        diff = (ppts - dstpoints).reshape(-1)
-        return 2.0 * (J.T @ diff)
 
     print('  initial objective is', objective(params))
 
@@ -941,7 +817,7 @@ def optimize_params(name, small, dstpoints, span_counts, params):
     print('  optimizing', len(params), 'parameters...')
     start = datetime.datetime.now()
     res = scipy.optimize.minimize(objective, params,
-                                  method='L-BFGS-B', jac=objective_jac)
+                                  method='Powell')
     end = datetime.datetime.now()
     print('  optimization took', round((end-start).total_seconds(), 2), 'sec.')
     print('  final objective is', res.fun)
@@ -1134,12 +1010,10 @@ def run_worker_loop():
     exactly "QUIT". See MicroCapture.Processing/PythonDewarpWorker.cs for
     the C# side of this protocol: it starts this process once and reuses it
     for every page in a batch instead of spawning fresh each time, which is
-    what actually eliminates the interpreter+import startup cost — the
-    optimizer itself was never the dominant cost once L-BFGS-B with an
-    analytic gradient replaced Powell (see this file's header comment);
-    confirmed on a real Windows machine that ~6-11 seconds of every
-    single-page capture was Python/numpy/scipy/cv2/PIL startup overhead,
-    not the optimizer, no matter how fast the optimizer itself got."""
+    what actually eliminates the interpreter+import startup cost — confirmed
+    on a real Windows machine that ~6-11 seconds of every single-page
+    capture was Python/numpy/scipy/cv2/PIL startup overhead, separate from
+    (and often larger than) time spent in the optimizer itself."""
     # process_one_image (and everything it calls — span detection, keypoint
     # sampling, optimize_params, remap_image, etc.) prints its own progress
     # lines via plain print(), same as CLI mode always has. Those must never
