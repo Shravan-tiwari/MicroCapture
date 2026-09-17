@@ -11,22 +11,33 @@
 ######################################################################
 #
 # Vendored into MicroCapture (see MicroCapture.Processing/PythonDewarpRunner.cs)
-# with TWO deliberate changes from upstream:
+# with ONE deliberate change from upstream (a second, REMAP_DECIMATE, was tried
+# and reverted — see below):
 #
-# 1. REMAP_DECIMATE below is 1, not the original 16. remap_image() computes
-#    the pixel-remap coordinate grid at 1/REMAP_DECIMATE resolution and
-#    cubic-upsamples that grid before the final cv2.remap — at the original
-#    decimate-by-16, this smooths the warp field itself on real photos with
-#    fast-changing curvature (steep viewing angle, heavy bow near a book's
-#    spine, or a low-resolution source), producing visibly soft/ghosted
-#    output text. Confirmed directly: running upstream page_dewarp.py
-#    unmodified on several real MicroCapture-captured photos reproduced the
-#    same blur in ITS OWN raw output, and setting REMAP_DECIMATE = 1
-#    (computing the true per-pixel coordinate grid, no decimation) measurably
-#    sharpened the result with negligible extra runtime (~1-1.5s on real
-#    photos) since the optimizer, not the remap, dominates total runtime.
+# REMAP_DECIMATE is back at upstream's default of 16 (was set to 1 for a
+# while). remap_image() computes the pixel-remap coordinate grid at
+# 1/REMAP_DECIMATE resolution and cubic-upsamples that grid before the final
+# cv2.remap — at decimate-by-16, this smooths the warp field itself on real
+# photos with fast-changing curvature (steep viewing angle, heavy bow near a
+# book's spine, or a low-resolution source), producing visibly soft/ghosted
+# output text; confirmed directly by running upstream page_dewarp.py
+# unmodified and seeing the identical blur in ITS OWN raw output.
+# REMAP_DECIMATE=1 (computing the true per-pixel coordinate grid, no
+# decimation) fixed that blur and was shipped for a while, but on at least
+# one real Windows machine the full-resolution remap step turned out to cost
+# real time — confirmed directly (worker-mode timing showed a real gap
+# between the optimizer finishing and the response coming back, present
+# even with the optimizer itself already fast). REMAP_DECIMATE=4 was tested
+# as a middle ground (visibly sharper than 16, not quite as sharp as 1) but
+# not shipped — reverted to 16 on the operator's explicit request pending a
+# decision on the sharpness/speed tradeoff. If sharper output is wanted
+# again, the fix is exactly this one line; see also
+# MicroCapture.Processing/PythonDewarpWorker.cs's own header for the other,
+# unrelated speed work (persistent worker process) that's independent of
+# this setting either way.
 #
-# 2. optimize_params()'s scipy.optimize.minimize call uses method='L-BFGS-B'
+# The other deliberate change from upstream, still in place:
+# optimize_params()'s scipy.optimize.minimize call uses method='L-BFGS-B'
 #    with an explicit analytic jac= (see project_keypoints_jacobian), instead
 #    of upstream's method='Powell'. Powell is derivative-free — at this
 #    problem's ~400-800+ parameters (camera pose + per-span cubic keypoints)
@@ -71,7 +82,7 @@ PAGE_MARGIN_Y = 60       # reduced px to ignore near T/B edge
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # assumed source DPI; stated output DPI = this / OUTPUT_ZOOM
-REMAP_DECIMATE = 1      # downscaling factor for remapping image (upstream default: 16 — see header comment)
+REMAP_DECIMATE = 16     # downscaling factor for remapping image (upstream default, reverted — see header comment)
 
 # 'binary': adaptive-threshold black & white (original behavior)
 # 'gray': grayscale, no thresholding
