@@ -25,9 +25,11 @@
 // `dewarp-model` below reports whether the subprocess produced output and what it warned about
 // — page_dewarp.py's own fitted camera-pose/cubic-surface state lives and dies inside the
 // subprocess, so there's no internal model left in C# to inspect the way the old ports had.
-// `boundary`/`corners`/`rotfield`/`spread`/`points`/`mesh` are the contour/text-line-blob
-// detector's own diagnostics for the line-mesh residual-bow correction that still runs after
-// dewarp — unaffected by this change.
+// `boundary`/`corners`/`rotfield`/`spread`/`points` are the contour/text-line-blob detector's
+// own diagnostics for deskew — unaffected by this change. TryTrimGutterShadow,
+// TryApplyLineMesh, and SharpenAfterDewarp (and this tool's own `mesh` subcommand) were removed
+// entirely — the C# post-dewarp cleanup stages are gone; only page_dewarp.py's own output runs
+// through FinishPageProcessing now.
 //
 // Usage:
 //   dotnet run --project tools/DewarpDiagnostic -- process <input-dir> <output-dir> [--binarize]
@@ -59,8 +61,6 @@ switch (args[0])
         return RunRotField(args);
     case "points":
         return RunPoints(args);
-    case "mesh":
-        return RunMesh(args);
     case "finger":
         return RunFinger(args);
     case "bleed":
@@ -81,7 +81,6 @@ static void PrintUsage()
     Console.WriteLine("  corners <image-or-dir>");
     Console.WriteLine("  rotfield <image-or-dir>");
     Console.WriteLine("  points <image> [pointsPerEdge]");
-    Console.WriteLine("  mesh <image-or-dir>");
     Console.WriteLine("  finger <image-or-dir> [--apply <out-dir>]");
     Console.WriteLine("  bleed <image-or-dir> [--apply <out-dir>]");
 }
@@ -312,34 +311,6 @@ static int RunRotField(string[] args)
         Console.WriteLine($"=== {Path.GetFileName(path)} ===");
         var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
         Console.WriteLine(processor.DebugDeskewRotationField(bytes));
-    }
-    return 0;
-}
-
-static int RunMesh(string[] args)
-{
-    if (args.Length < 2) { PrintUsage(); return 1; }
-    var target = args[1];
-    bool IsImage(string f) => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".tif", StringComparison.OrdinalIgnoreCase)
-        || f.EndsWith(".tiff", StringComparison.OrdinalIgnoreCase);
-    IEnumerable<string> files = Directory.Exists(target)
-        ? Directory.GetFiles(target, "*.*", SearchOption.TopDirectoryOnly).Where(IsImage).OrderBy(f => f)
-        : File.Exists(target) ? new[] { target } : Array.Empty<string>();
-    var fileList = files.ToList();
-
-    if (fileList.Count == 0)
-    {
-        Console.Error.WriteLine($"No image(s) found at {target}");
-        return 1;
-    }
-
-    var processor = new ImageProcessor();
-    foreach (var path in fileList)
-    {
-        Console.WriteLine($"=== {Path.GetFileName(path)} ===");
-        var bytes = ImageDecodeHelper.GetDisplayBytes(path) ?? throw new InvalidOperationException($"Could not decode {path}");
-        Console.WriteLine(processor.DebugLineMesh(bytes));
     }
     return 0;
 }

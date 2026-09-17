@@ -102,8 +102,6 @@ TestCheckLiveRegionsSharpnessIsPerRegion();
 await TestBackgroundWorkerBranchesToFixedFramesWhenBatchFlagSet();
 TestTiffDisplayDecodeRoundTrip();
 TestDewarpStaysSaneOnOffCenterLines();
-TestLineMeshFlattensSharedPageWideBow();
-TestLineMeshDeclinesOnPlainUniformPage();
 TestFingerRemovalCleansEdgeTouchingSkinBlob();
 TestFingerRemovalLeavesInteriorSkinToneAlone();
 TestBleedthroughSuppressesFaintGhostPreservesRealInk();
@@ -413,36 +411,6 @@ string WriteSolidImage(string path, int width, int height)
     using var bitmap = new SKBitmap(width, height);
     using var canvas = new SKCanvas(bitmap);
     canvas.Clear(new SKColor(128, 128, 128));
-    using var image = SKImage.FromBitmap(bitmap);
-    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
-    using var stream = File.Create(path);
-    data.SaveTo(stream);
-    return path;
-}
-
-/// <summary>Several black horizontal bars, each following the *same* smooth curve shape (a
-/// centered parabola bowing upward toward the page's horizontal center) but at different
-/// vertical baselines — stands in for real text lines that share one systematic page-wide bend
-/// (the case <see cref="ImageProcessor.TryApplyLineMesh"/> targets), built from many thin
-/// vertical strokes since SkiaSharp has no direct "draw a bowed rectangle" primitive.</summary>
-string WriteCurvedBarTestImage(string path, int imageWidth, int imageHeight, int[] baselines, int barThickness, double amplitudePx)
-{
-    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-    using var bitmap = new SKBitmap(imageWidth, imageHeight);
-    using var canvas = new SKCanvas(bitmap);
-    canvas.Clear(SKColors.White);
-    using var paint = new SKPaint { Color = SKColors.Black, Style = SKPaintStyle.Fill, IsAntialias = false };
-    var marginX = imageWidth / 20;
-    foreach (var baseline in baselines)
-    {
-        for (var x = marginX; x < imageWidth - marginX; x += 2)
-        {
-            var t = (x - marginX) / (double)(imageWidth - 2 * marginX); // 0..1
-            var bow = amplitudePx * Math.Sin(Math.PI * t); // 0 at both ends, peak at center
-            var y = baseline - bow;
-            canvas.DrawRect(new SKRect(x, (float)y, x + 2, (float)(y + barThickness)), paint);
-        }
-    }
     using var image = SKImage.FromBitmap(bitmap);
     using var data = image.Encode(SKEncodedImageFormat.Png, 100);
     using var stream = File.Create(path);
@@ -3632,80 +3600,6 @@ void TestDewarpStaysSaneOnOffCenterLines()
         Check($"Output is a real, finite-sized image (got {output.Width}x{output.Height})",
             output.Width > 100 && output.Height > 100 && output.Width < width * 10 && output.Height < height * 10);
     }
-}
-
-/// <summary>Mean row of dark pixels across a narrow X window, for measuring where a synthetic
-/// bar actually sits at that column without depending on ImageProcessor's own line detector —
-/// an independent check of the mesh step's real pixel effect, not just its own report of what
-/// it did.</summary>
-double MeasureBarCentroidY(Mat grayOrColor, int x, int windowHalfWidth, int yStart, int yEnd)
-{
-    using var gray = grayOrColor.Channels() == 1 ? grayOrColor.Clone() : new Mat();
-    if (grayOrColor.Channels() != 1) Cv2.CvtColor(grayOrColor, gray, ColorConversionCodes.BGR2GRAY);
-    double sum = 0;
-    var count = 0;
-    for (var xi = Math.Max(0, x - windowHalfWidth); xi < Math.Min(gray.Cols, x + windowHalfWidth); xi++)
-        for (var y = yStart; y < yEnd; y++)
-            if (gray.At<byte>(y, xi) < 140) { sum += y; count++; }
-    return count > 0 ? sum / count : double.NaN;
-}
-
-void TestLineMeshFlattensSharedPageWideBow()
-{
-    Console.WriteLine("\n-- Text-line mesh correction flattens a real, shared page-wide bow (positive case) --");
-    var workDir = TempWorkDir();
-    const int width = 1400, height = 1600;
-    const double amplitude = 50.0;
-    const int barThickness = 16;
-    // 8 bars sharing the exact same bow shape (peaks at page center) at different baselines —
-    // the case TryApplyLineMesh's pooled-fit design targets: one systematic curve shared by
-    // every line, not independent per-line shapes.
-    var baselines = new[] { 150, 320, 490, 660, 830, 1000, 1170, 1340 };
-    var path = WriteCurvedBarTestImage(Path.Combine(workDir, "curved_bars.png"), width, height, baselines, barThickness, amplitude);
-    var bytes = File.ReadAllBytes(path);
-
-    var correctedBytes = new ImageProcessor().ApplyLineMeshFromBytes(bytes);
-    Check("Mesh correction applies (enough shared-shape lines detected)", correctedBytes != null);
-    if (correctedBytes == null) return;
-
-    using var original = Cv2.ImDecode(bytes, ImreadModes.Color);
-    using var corrected = Cv2.ImDecode(correctedBytes, ImreadModes.Color);
-    Check("Corrected output keeps the same dimensions", corrected.Cols == original.Cols && corrected.Rows == original.Rows);
-
-    // Independently re-measure the first bar's own bow (not via ImageProcessor's own detector)
-    // before and after correction — the real, direct assertion that pixels actually moved,
-    // not just that a warning string was emitted.
-    var baseline0 = baselines[0];
-    var yStart = Math.Max(0, baseline0 - (int)amplitude - 20);
-    var yEnd = Math.Min(height, baseline0 + barThickness + 20);
-    var xs = new[] { 100, 300, 500, 700, 900, 1100, 1300 };
-
-    double MaxDeviation(Mat mat)
-    {
-        var ys = xs.Select(x => MeasureBarCentroidY(mat, x, 10, yStart, yEnd)).Where(y => !double.IsNaN(y)).ToList();
-        if (ys.Count < 3) return double.NaN;
-        var median = ys.OrderBy(y => y).ElementAt(ys.Count / 2);
-        return ys.Max(y => Math.Abs(y - median));
-    }
-
-    var beforeDeviation = MaxDeviation(original);
-    var afterDeviation = MaxDeviation(corrected);
-    // Deviation-from-median across 7 sample points on a sine hump reads as roughly half the
-    // injected 50px amplitude (median sits partway up the curve, not at the flat endpoints) —
-    // confirmed empirically at ~24px, not a bug in the correction itself.
-    Check($"Original bar shows the injected bow (before deviation {beforeDeviation:F0}px, expect > 15px)", beforeDeviation > 15);
-    Check($"Mesh correction substantially flattens it (after deviation {afterDeviation:F0}px, expect < half of before)", afterDeviation < beforeDeviation / 2);
-}
-
-void TestLineMeshDeclinesOnPlainUniformPage()
-{
-    Console.WriteLine("\n-- Text-line mesh correction declines (never corrupts) a page with no text lines --");
-    var workDir = TempWorkDir();
-    var path = WriteSolidImage(Path.Combine(workDir, "plain.png"), 800, 600);
-    var bytes = File.ReadAllBytes(path);
-
-    var result = new ImageProcessor().ApplyLineMeshFromBytes(bytes);
-    Check("No lines detected -> declines rather than inventing a correction", result == null);
 }
 
 void TestFingerRemovalCleansEdgeTouchingSkinBlob()
