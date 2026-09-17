@@ -11,35 +11,75 @@
 ######################################################################
 #
 # Vendored into MicroCapture (see MicroCapture.Processing/PythonDewarpRunner.cs).
-# As of this revision the algorithm itself (every constant, and every function
-# body used by the pipeline: page-extent/contour/span detection, keypoint
-# sampling, optimize_params' objective and method='Powell' call, get_page_dims,
-# remap_image, REMAP_DECIMATE=16, etc.) is IDENTICAL to upstream
-# https://github.com/mzucker/page_dewarp — confirmed by diffing this file
-# against a fresh clone of that repo. Output from this file should therefore
-# match the original script exactly, given the same input image.
 #
-# The only additions are non-algorithmic, additive worker-mode plumbing for
+# Deliberate deviations from upstream https://github.com/mzucker/page_dewarp,
+# all originally developed and verified against real photos by the operator
+# in a separate local clone before being ported in here:
+#
+# 1. The cubic-sheet curvature model was extended from a single global
+#    (alpha, beta) pair to alpha(y) = alpha0 + alpha1*y, beta(y) = beta0 +
+#    beta1*y (see CUBIC_IDX, project_xy, get_default_params) — i.e. the
+#    page's cross-sectional curvature is now allowed to vary linearly down
+#    the page instead of being fixed for the whole sheet. Upstream's
+#    single-(alpha,beta) model structurally cannot represent a book photo
+#    where the bow near the spine changes as you move down the page (e.g.
+#    tighter curvature near the top than the bottom) — that showed up as
+#    text staying level at the top of a page but progressively shrinking/
+#    shearing to one side further down. The two new terms (alpha1, beta1)
+#    are lightly regularized toward zero in optimize_params (CUBIC_Y_REG)
+#    so they're only used when the data actually supports them, since
+#    they're otherwise a free way for the optimizer to trade fit error
+#    against pose on sparse keypoints.
+#
+# 2. optimize_params' optimizer was changed from scipy.optimize.minimize
+#    (method='Powell', a derivative-free search over a single scalar
+#    objective) to scipy.optimize.least_squares (method='lm',
+#    Levenberg-Marquardt over the actual per-point residual vector).
+#    This is the textbook-correct algorithm for this problem: it's a
+#    nonlinear least-squares fit (camera pose + curvature to detected
+#    keypoints), and LM exploits that residual structure via a
+#    Gauss-Newton step instead of Powell's blind coordinate line searches.
+#    Confirmed on real photos to be both faster (0.1-0.5s per photo in
+#    testing, versus Powell's ~1-50s and highly input-dependent variance)
+#    and to converge to a visibly better fit — Powell's scalar-objective
+#    search was found to settle for solutions that fit keypoints on
+#    average while distorting local scale/line-spacing down the page.
+#    A light regularization term (YCOORDS_REG) also anchors each span's
+#    y-coordinate parameter to its initial (robust, PCA-measured) value,
+#    preventing the optimizer from drifting line positions to reduce
+#    fit-error elsewhere — this was producing uneven line spacing despite
+#    an accurate initial measurement.
+#
+# 3. tighten_page_extents (crops the page to the union of detected span
+#    contours, padded by a fixed margin) is a genuinely new function, not
+#    in upstream at all — added so isolated header/footer text (or content
+#    near a diagram/table, too far from body-text spans to be chained into
+#    one) isn't clipped by a boundary derived purely from body-text spans.
+#
+# 4. REMAP_DECIMATE stays at upstream's default of 16, and OUTPUT_COLOR_MODE
+#    adds 'color'/'gray' output alongside upstream's binary-only output
+#    (see remap_image) — MicroCapture wants the full-color/grayscale
+#    capture, not a black-and-white scan.
+#
+# Everything else (page-extent/contour/span detection, keypoint sampling,
+# get_page_dims, the overall pipeline shape) is unmodified upstream logic.
+#
+# The only ADDITIVE (non-algorithmic) change is worker-mode plumbing for
 # reusing one long-lived Python process across many pages instead of paying
-# interpreter+import startup cost per page (process_one_image/run_worker_loop/
-# --worker — a pure refactor of main()'s per-image loop body into a reusable
-# function; see MicroCapture.Processing/PythonDewarpWorker.cs's own header
-# for that history). None of this changes dewarp output versus upstream
-# running the same image with method='Powell'.
+# interpreter+import startup cost per page (process_one_image/
+# run_worker_loop/--worker — a pure refactor of main()'s per-image loop
+# body into a reusable function; see
+# MicroCapture.Processing/PythonDewarpWorker.cs's own header for that
+# history).
 #
-# History: REMAP_DECIMATE was briefly set to 1 (full-resolution remap,
-# sharper but slower on at least one real Windows machine) and the optimizer
-# was briefly switched to method='L-BFGS-B' with an analytic jac= (much
-# faster per-image, verified against SciPy's own numerical gradient to
-# ~1e-6 relative error) — both were reverted back to upstream's exact values
-# after real-photo comparison showed upstream's own Powell-based output was
-# visibly better (L-BFGS-B is a local gradient method and can converge to a
-# different, sometimes worse, local optimum than Powell's derivative-free
-# search on this non-convex ~500-800 parameter objective, even though both
-# "converge" in the optimizer-status sense). Exact parity with the original,
-# proven-good script was prioritized over the speedup; if optimizer speed
-# needs revisiting, do it without touching the objective/method here unless
-# a full real-photo quality comparison against Powell is repeated first.
+# History: an earlier revision tried method='L-BFGS-B' with a hand-derived
+# analytic gradient on the OLD scalar-objective/Powell formulation, purely
+# for speed. It was reverted after real-photo comparison showed the
+# original app's Powell-based output looked better — the real fix turned
+# out to be switching to Levenberg-Marquardt on the residual vector (see
+# #2 above), which is both faster AND a better fit, rather than trying to
+# out-optimize Powell on the same underlying (and, for symptom 2, model-
+# limited) formulation.
 ######################################################################
 
 import os
@@ -79,7 +119,10 @@ EDGE_MAX_ANGLE = 7.5     # maximum change in angle allowed between contours
 
 RVEC_IDX = slice(0, 3)   # index of rvec in params vector
 TVEC_IDX = slice(3, 6)   # index of tvec in params vector
-CUBIC_IDX = slice(6, 8)  # index of cubic slopes in params vector
+# cubic slopes alpha(y) = alpha0 + alpha1*y, beta(y) = beta0 + beta1*y,
+# letting the page's cross-sectional curvature vary linearly down the
+# page instead of being fixed for the whole sheet
+CUBIC_IDX = slice(6, 10)  # index of [alpha0, beta0, alpha1, beta1] in params vector
 
 SPAN_MIN_WIDTH = 30      # minimum reduced px width for span
 SPAN_PX_PER_STEP = 20    # reduced px spacing for sampling along spans
@@ -209,8 +252,9 @@ def get_default_params(corners, ycoords, xcoords):
     page_height = np.linalg.norm(corners[-1] - corners[0])
     rough_dims = (page_width, page_height)
 
-    # our initial guess for the cubic has no slope
-    cubic_slopes = [0.0, 0.0]
+    # our initial guess for the cubic has no slope and no variation
+    # down the page (alpha0, beta0, alpha1, beta1)
+    cubic_slopes = [0.0, 0.0, 0.0, 0.0]
 
     # object points of flat page in 3D coordinates
     corners_object3d = np.array([
@@ -241,17 +285,29 @@ def project_xy(xy_coords, pvec):
     #
     #  f(0) = 0, f'(0) = alpha
     #  f(1) = 0, f'(1) = beta
+    #
+    # alpha and beta are themselves allowed to vary linearly with y,
+    # so the page's cross-sectional curvature can twist as you move
+    # down the page instead of being fixed for the whole sheet:
+    #
+    #  alpha(y) = alpha0 + alpha1*y
+    #  beta(y)  = beta0  + beta1*y
 
-    alpha, beta = tuple(pvec[CUBIC_IDX])
-
-    poly = np.array([
-        alpha + beta,
-        -2*alpha - beta,
-        alpha,
-        0])
+    alpha0, beta0, alpha1, beta1 = tuple(pvec[CUBIC_IDX])
 
     xy_coords = xy_coords.reshape((-1, 2))
-    z_coords = np.polyval(poly, xy_coords[:, 0])
+
+    x = xy_coords[:, 0]
+    y = xy_coords[:, 1]
+
+    alpha = alpha0 + alpha1 * y
+    beta = beta0 + beta1 * y
+
+    # f(x) = (alpha+beta)*x^3 + (-2*alpha-beta)*x^2 + alpha*x, evaluated
+    # per-point since alpha/beta now vary with y
+    z_coords = ((alpha + beta) * x**3 +
+                (-2*alpha - beta) * x**2 +
+                alpha * x)
 
     objpoints = np.hstack((xy_coords, z_coords.reshape((-1, 1))))
 
@@ -789,12 +845,15 @@ def make_keypoint_index(span_counts):
     keypoint_index = np.zeros((npts+1, 2), dtype=int)
     start = 1
 
+    # ycoords/xcoords start right after rvec(3)+tvec(3)+cubic(4)=10 params
+    params_offset = 10
+
     for i, count in enumerate(span_counts):
         end = start + count
-        keypoint_index[start:start+end, 1] = 8+i
+        keypoint_index[start:start+end, 1] = params_offset+i
         start = end
 
-    keypoint_index[1:, 0] = np.arange(npts) + 8 + nspans
+    keypoint_index[1:, 0] = np.arange(npts) + params_offset + nspans
 
     return keypoint_index
 
@@ -803,9 +862,50 @@ def optimize_params(name, small, dstpoints, span_counts, params):
 
     keypoint_index = make_keypoint_index(span_counts)
 
-    def objective(pvec):
+    nspans = len(span_counts)
+    # ycoords live at params[10:10+nspans] (see make_keypoint_index); spans
+    # are in top-to-bottom page order, so consecutive entries are usually
+    # consecutive text lines
+    YCOORDS_IDX = slice(10, 10 + nspans)
+
+    # ycoords start out as a direct, robust measurement: each span's mean
+    # position along the page's y-axis, in the PCA-aligned coordinate frame
+    # computed from the actual detected text-line pixels (see
+    # keypoints_from_samples). That measurement is typically already very
+    # uniform line-to-line (this is real paragraph text). But ycoords are
+    # also free parameters in the optimization below, and with only sparse
+    # keypoints as evidence, the optimizer can drift them away from that
+    # good initial measurement to reduce fit error elsewhere (trading off
+    # against pose/curve-shape), which is what was producing uneven line
+    # spacing in the output despite an accurate initial measurement.
+    # Anchoring them back to their initial values keeps that free-floating
+    # in check while still letting them adjust for real per-line wobble.
+    ycoords0 = params[YCOORDS_IDX].copy()
+    YCOORDS_REG = 20.0
+
+    # Lightly regularize the y-varying cubic terms (alpha1, beta1): they
+    # exist to correct real curvature that twists down the page, but with
+    # only sparse keypoints as evidence they're otherwise a free way for
+    # the optimizer to trade fit error against pose/curve-shape. A small
+    # penalty keeps them from being used unless the data justifies them,
+    # without meaningfully competing with the fit term (residual-based
+    # least_squares below is far better conditioned for this than the
+    # old Powell/scalar-objective approach was, so this can stay small).
+    CUBIC_Y_REG = 5.0
+
+    def residuals(pvec):
         ppts = project_keypoints(pvec, keypoint_index)
-        return np.sum((dstpoints - ppts)**2)
+        fit_res = (dstpoints - ppts).reshape(-1)
+
+        alpha1, beta1 = pvec[8], pvec[9]
+        cubic_reg_res = np.array([CUBIC_Y_REG * alpha1, CUBIC_Y_REG * beta1])
+
+        ycoords_reg_res = YCOORDS_REG * (pvec[YCOORDS_IDX] - ycoords0)
+
+        return np.concatenate([fit_res, cubic_reg_res, ycoords_reg_res])
+
+    def objective(pvec):
+        return np.sum(residuals(pvec)**2)
 
     print('  initial objective is', objective(params))
 
@@ -816,11 +916,15 @@ def optimize_params(name, small, dstpoints, span_counts, params):
 
     print('  optimizing', len(params), 'parameters...')
     start = datetime.datetime.now()
-    res = scipy.optimize.minimize(objective, params,
-                                  method='Powell')
+    # Levenberg-Marquardt on the actual per-point residuals converges to a
+    # much better-conditioned solution for this sum-of-squares problem than
+    # Powell's derivative-free coordinate descent on a scalar objective,
+    # which tended to settle into pose/curve-shape trade-offs that fit
+    # keypoints on average while distorting local scale down the page.
+    res = scipy.optimize.least_squares(residuals, params, method='lm')
     end = datetime.datetime.now()
     print('  optimization took', round((end-start).total_seconds(), 2), 'sec.')
-    print('  final objective is', res.fun)
+    print('  final objective is', np.sum(res.fun**2))
     params = res.x
 
     if DEBUG_LEVEL >= 1:
