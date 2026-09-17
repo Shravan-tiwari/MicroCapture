@@ -185,6 +185,34 @@ public static class PythonDewarpWorker
             var proc = Process.Start(startInfo);
             if (proc is null) return false;
 
+            // The worker writes its own progress output (span detection, "optimization took X
+            // sec", etc. — everything process_one_image prints) to stderr for the life of every
+            // request (see run_worker_loop's stdout redirection in the vendored script). Nothing
+            // reading that stream is a real bug, not a cosmetic one: a redirected pipe has a
+            // bounded OS buffer, and once the worker fills it, the next print() call inside
+            // Python BLOCKS until something drains the pipe — confirmed on a real Windows
+            // machine as the actual cause of requests getting progressively slower over a
+            // session and eventually timing out entirely, not any remaining algorithm cost.
+            // OutputDataReceived + BeginErrorReadLine drains it continuously and asynchronously
+            // for the process's whole lifetime, independent of the request/response loop below.
+            // Draining the pipe (via BeginErrorReadLine) is what matters, not necessarily
+            // logging every line — a File.AppendAllText per line would itself become a new
+            // bottleneck at dozens of lines per request. Keep the ones actually useful for
+            // diagnosing timing ("optimization took", "got N spans", "output will be") and drop
+            // the rest, same information the old SubprocessWallTime-per-call log already showed.
+            proc.ErrorDataReceived += (_, args) =>
+            {
+                if (args.Data is null) return;
+                if (args.Data.Contains("optimization took", StringComparison.Ordinal)
+                    || args.Data.Contains("got", StringComparison.Ordinal)
+                    || args.Data.Contains("output will be", StringComparison.Ordinal)
+                    || args.Data.Contains("skipping", StringComparison.Ordinal))
+                {
+                    WriteStageLog($"[worker stderr] {args.Data}");
+                }
+            };
+            proc.BeginErrorReadLine();
+
             var readyTask = proc.StandardOutput.ReadLineAsync();
             if (!readyTask.Wait(StartupTimeoutMs) || readyTask.Result != "WORKER_READY")
             {
