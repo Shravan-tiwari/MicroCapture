@@ -11,8 +11,31 @@
 ######################################################################
 #
 # Vendored into MicroCapture (see MicroCapture.Processing/PythonDewarpRunner.cs)
-# with ONE deliberate change from upstream (a second, REMAP_DECIMATE, was tried
-# and reverted — see below):
+# with TWO deliberate changes from upstream (a third, REMAP_DECIMATE, was
+# tried and reverted — see below):
+#
+# tighten_page_extents()'s padding default is 50, not upstream's 20 (reduced
+# px, i.e. relative to the shrunk detection-resolution image, not the
+# original). This function builds the FINAL crop boundary purely from the
+# bounding boxes of contours that made it into a real span — content that
+# never became part of a span (an isolated header/footer line sitting too
+# far from the body text to get chained on by assemble_spans, or a
+# diagram/table, which doesn't produce text-like contours at all) is
+# invisible to this function and contributes nothing to the boundary, so it
+# only survives if the fixed padding margin happens to reach far enough to
+# still cover it. Confirmed on a real photo (2026-09-15_14-46-28.jpg) that
+# the upstream default clipped a real page header ("Chapter Five" -> "TER
+# FIVE") and multiple lines of body text along both margins. padding=50
+# recovers the header and most margin text with no visible regression on
+# several other real photos that were already clean at padding=20 (a small
+# amount of extra background can appear in a page's own corner when the
+# photo itself has background visible there, but no real content is lost
+# and no excessive blank canvas appears). This does NOT fix every margin
+# case: confirmed separately that content near the page's true right edge
+# can still fall outside the fitted cubic-sheet model's own computed
+# bounds during remap even when it was safely inside this crop mask — that
+# is a limitation of the curve model itself (see project_xy's z=f(x) with
+# no y-dependence), not something this padding value can reach.
 #
 # REMAP_DECIMATE is back at upstream's default of 16 (was set to 1 for a
 # while). remap_image() computes the pixel-remap coordinate grid at
@@ -36,7 +59,7 @@
 # unrelated speed work (persistent worker process) that's independent of
 # this setting either way.
 #
-# The other deliberate change from upstream, still in place:
+# The other deliberate change from upstream, also still in place:
 # optimize_params()'s scipy.optimize.minimize call uses method='L-BFGS-B'
 #    with an explicit analytic jac= (see project_keypoints_jacobian), instead
 #    of upstream's method='Powell'. Powell is derivative-free — at this
@@ -340,7 +363,7 @@ def get_page_extents(small):
     return page, outline
 
 
-def tighten_page_extents(small, pagemask, spans, padding=20):
+def tighten_page_extents(small, pagemask, spans, padding=50):
 
     height, width = small.shape[:2]
 
