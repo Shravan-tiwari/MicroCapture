@@ -95,6 +95,7 @@ public class BatchSyncService
         batch.Dpi = settings.Dpi;
         batch.PreferredExportFormat = settings.PreferredExportFormat;
         batch.DewarpEnabled = settings.DewarpEnabled;
+        batch.DeskewEnabled = settings.DeskewEnabled;
         batch.SplitBookPages = settings.SplitBookPages;
         batch.BinarizeEnabled = settings.BinarizeEnabled;
         batch.BleedthroughEnabled = settings.BleedthroughEnabled;
@@ -190,6 +191,7 @@ public class BatchSyncService
             CaptureFormat = manifest.Settings.CaptureFormat,
             PreferredExportFormat = batch.PreferredExportFormat,
             DewarpEnabled = batch.DewarpEnabled,
+            DeskewEnabled = batch.DeskewEnabled,
             SplitBookPages = batch.SplitBookPages,
             BinarizeEnabled = batch.BinarizeEnabled,
             BleedthroughEnabled = batch.BleedthroughEnabled,

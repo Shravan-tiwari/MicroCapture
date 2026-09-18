@@ -90,6 +90,8 @@
                     <StackPanel Spacing="8" Margin="0,4,0,0">
                         <TextBlock Text="PROCESSING" Classes="sectionLabel"/>
                         <CheckBox IsChecked="{Binding DewarpEnabled}" Content="Book curve correction"/>
+                        <CheckBox IsChecked="{Binding DeskewEnabled}" Content="Deskew (straighten rotated pages)"
+                                  ToolTip.Tip="Corrects overall page rotation/shear. Skipped automatically when Book curve correction is on, since that already levels the page as part of its own correction."/>
                         <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource InkTertiaryBrush}"
                                    Text="These are being built and can't be switched on yet. They're listed here so you can see what's coming."/>
                         <!-- Shown but not operable. Listing them communicates the roadmap; leaving

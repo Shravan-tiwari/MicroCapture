@@ -28,6 +28,7 @@ public partial class NewBatchViewModel : ObservableObject
     [ObservableProperty] private string _selectedExportFormat = "PDF";
 
     [ObservableProperty] private bool _dewarpEnabled;
+    [ObservableProperty] private bool _deskewEnabled;
     [ObservableProperty] private bool _splitBookPages;
     [ObservableProperty] private bool _binarizeEnabled;
     [ObservableProperty] private bool _bleedthroughEnabled;
@@ -229,6 +230,7 @@ public partial class NewBatchViewModel : ObservableObject
             CaptureFormat = SelectedCaptureFormat,
             PreferredExportFormat = SelectedExportFormat,
             DewarpEnabled = DewarpEnabled,
+            DeskewEnabled = DeskewEnabled,
             SplitBookPages = SplitBookPages,
             BinarizeEnabled = BinarizeEnabled,
             BleedthroughEnabled = BleedthroughEnabled

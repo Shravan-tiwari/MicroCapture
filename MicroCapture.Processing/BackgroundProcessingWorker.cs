@@ -89,6 +89,7 @@ public class BackgroundProcessingWorker
                     // fixed-frame capture already carried its own crop box and never reached
                     // it).
                     bool dewarpEnabled = job.Batch?.DewarpEnabled ?? false;
+                    bool deskewEnabled = job.Batch?.DeskewEnabled ?? false;
                     bool binarizeEnabled = job.Batch?.BinarizeEnabled ?? false;
                     // job.Dpi (not job.Batch?.Dpi) — DPI is stamped onto each capture at the
                     // moment it's taken (see MainWindowViewModel.CaptureAsync), so a batch-wide
@@ -135,7 +136,7 @@ public class BackgroundProcessingWorker
                     var outputNameOverride = job.ManualOverrideApplied && !splitPages
                         ? $"{Path.GetFileNameWithoutExtension(job.OriginalFilePath)}_p{job.PageNumber:D6}"
                         : null;
-                    var result = _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat, outputFileNameOverride: outputNameOverride);
+                    var result = _processor.Process(job.OriginalFilePath, outputDir, splitPages, job.LeftCropBox, job.RightCropBox, metadata, dewarpEnabled, binarizeEnabled, lensCalibration, bleedthroughEnabled, job.HasManualAdjustments, job.RotationDegrees, job.FlipHorizontal, job.FlipVertical, job.Brightness, job.Contrast, job.Saturation, job.Sharpness, job.WhiteBalance, measuredDpi: measuredDpi, captureFormat: job.CaptureFormat, outputFileNameOverride: outputNameOverride, deskewEnabled: deskewEnabled);
                     // Stamped so JobCompleted's UI handler can match the one thumbnail this
                     // result is for — several sibling jobs (one per fixed frame) can share the
                     // same OriginalFilePath, so that alone is no longer a unique key.

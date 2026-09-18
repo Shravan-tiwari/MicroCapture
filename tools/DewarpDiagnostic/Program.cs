@@ -73,7 +73,7 @@ switch (args[0])
 static void PrintUsage()
 {
     Console.WriteLine("Usage:");
-    Console.WriteLine("  process <input-dir> <output-dir> [--binarize] [--no-dewarp]");
+    Console.WriteLine("  process <input-dir> <output-dir> [--binarize] [--no-dewarp] [--deskew]");
     Console.WriteLine("  calibrate <calibration-images-dir>");
     Console.WriteLine("  dewarp-model <cropped-page-image>");
     Console.WriteLine("  spread <image-or-dir>");
@@ -95,6 +95,10 @@ static int RunProcess(string[] args)
     // PythonDewarpRunner.cs's page_dewarp.py subprocess call) — --no-dewarp turns it off,
     // matching the "Book Curve Correction" checkbox off in the real app.
     var noDewarp = args.Contains("--no-dewarp");
+    // deskewEnabled matches the separate "Deskew" checkbox — only actually runs when dewarp is
+    // off (see ProcessSinglePage/Batch.DeskewEnabled for why they don't stack), so pair this
+    // with --no-dewarp to exercise it here.
+    var deskew = args.Contains("--deskew");
 
     if (!Directory.Exists(inputDir))
     {
@@ -123,7 +127,7 @@ static int RunProcess(string[] args)
         var name = Path.GetFileNameWithoutExtension(imagePath);
         Console.WriteLine($"=== {name} ===");
 
-        var result = processor.Process(imagePath, outputDir, binarizeEnabled: binarize, dewarpEnabled: !noDewarp);
+        var result = processor.Process(imagePath, outputDir, binarizeEnabled: binarize, dewarpEnabled: !noDewarp, deskewEnabled: deskew);
 
         Console.WriteLine($"  Success: {result.Success}");
         Console.WriteLine($"  CropConfidence: {result.CropConfidence:P1}");

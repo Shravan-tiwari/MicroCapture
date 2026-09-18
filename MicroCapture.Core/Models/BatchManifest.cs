@@ -58,6 +58,7 @@ public class BatchManifestSettings
     public string PreferredExportFormat { get; set; } = "PDF";
 
     public bool DewarpEnabled { get; set; }
+    public bool DeskewEnabled { get; set; }
     public bool SplitBookPages { get; set; }
     public bool BinarizeEnabled { get; set; }
     public bool BleedthroughEnabled { get; set; }

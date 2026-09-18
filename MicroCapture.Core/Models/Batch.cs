@@ -62,6 +62,15 @@ public class Batch
     // MicroCapture.Processing/PythonDewarpRunner.cs (RunPythonDewarp).
     public bool DewarpEnabled { get; set; } = false;
 
+    // Corrects global page rotation/shear via text-line evidence (falling back to whole-image
+    // Hough line detection) — independent of, and skipped when, DewarpEnabled: page_dewarp.py's
+    // own optimizer already solves camera pose (including in-plane rotation) jointly with the
+    // curve fit, and running this beforehand was found to feed it a worse, pre-rotated input on
+    // badly-angled photos (its text-line/Hough angle estimators are unreliable past ~10° of
+    // rotation) — see ImageProcessor.TryDeskew's own doc comment and ProcessSinglePage. This
+    // toggle exists for batches that want rotation correction WITHOUT book curve correction.
+    public bool DeskewEnabled { get; set; } = false;
+
     // Converts every processed page to pure black-and-white via adaptive mean thresholding
     // (matching page_dewarp.py's own binary output mode), written out as a genuine
     // 1-bit/CCITT-Group-4 TIFF (not just an 8-bit image that happens to look bitonal) — smaller

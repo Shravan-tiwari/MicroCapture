@@ -165,6 +165,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var options = new List<string> { $"{batch.Dpi} DPI", SelectedCaptureFormat };
         if (batch.DewarpEnabled) options.Add("book curve");
+        if (batch.DeskewEnabled) options.Add("deskew");
         if (batch.SplitBookPages) options.Add("split pages");
         if (batch.BinarizeEnabled) options.Add("B&W");
         if (batch.BleedthroughEnabled) options.Add("bleedthrough");
@@ -729,6 +730,11 @@ public partial class MainWindowViewModel : ViewModelBase
     // responsiveness. See MicroCapture.Processing/PythonDewarpRunner.cs.
     [ObservableProperty] private bool _dewarpEnabled = false;
 
+    // Global rotation/shear correction, independent of (and skipped when) DewarpEnabled — see
+    // Batch.DeskewEnabled's own doc comment for why the two don't stack. See
+    // ImageProcessor.TryDeskew.
+    [ObservableProperty] private bool _deskewEnabled = false;
+
     // Converts processed pages to pure black-and-white (adaptive mean threshold, written as a
     // genuine 1-bit/CCITT-G4 TIFF) — smaller files and crisper OCR input, at the cost of any
     // color/grayscale content. See ImageProcessor.ApplyAdaptiveMeanBinarization/WriteBitonalTiff.
@@ -765,6 +771,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     partial void OnSelectedDpiChanged(int value) => PersistBatchSettingAsync(b => b.Dpi = value);
     partial void OnDewarpEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.DewarpEnabled = value);
+    partial void OnDeskewEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.DeskewEnabled = value);
     partial void OnBinarizeEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BinarizeEnabled = value);
     partial void OnBleedthroughEnabledChanged(bool value) => PersistBatchSettingAsync(b => b.BleedthroughEnabled = value);
 
@@ -1722,6 +1729,7 @@ public partial class MainWindowViewModel : ViewModelBase
             HydrateFramesFromBatch(batch);
             SelectedDpi = batch.Dpi;
             DewarpEnabled = batch.DewarpEnabled;
+            DeskewEnabled = batch.DeskewEnabled;
             BinarizeEnabled = batch.BinarizeEnabled;
             BleedthroughEnabled = batch.BleedthroughEnabled;
         }
@@ -1948,6 +1956,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 Dpi = settings.SelectedDpi,
                 PreferredExportFormat = settings.SelectedExportFormat,
                 DewarpEnabled = settings.DewarpEnabled,
+                DeskewEnabled = settings.DeskewEnabled,
                 BinarizeEnabled = settings.BinarizeEnabled,
                 BleedthroughEnabled = settings.BleedthroughEnabled,
                 CameraCalibrationId = activeCalibrationId,
@@ -2132,6 +2141,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     SplitBookPages = SplitBookPages && stagedFrameCount == 0,
                     Dpi = SelectedDpi,
                     DewarpEnabled = DewarpEnabled,
+                    DeskewEnabled = DeskewEnabled,
                     BinarizeEnabled = BinarizeEnabled,
                     BleedthroughEnabled = BleedthroughEnabled,
                     CameraCalibrationId = activeCalibrationId,
