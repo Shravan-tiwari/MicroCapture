@@ -3852,9 +3852,9 @@ public partial class ImageProcessor
         if (!binarizeEnabled) return src;
         try
         {
-            var binarized = ApplyNickBinarization(src, dpi, measuredDpi);
+            var binarized = ApplyAdaptiveMeanBinarization(src, dpi, measuredDpi);
             result.WasBinarized = true;
-            result.Warnings.Add("Binarized to black-and-white (NICK local threshold).");
+            result.Warnings.Add("Binarized to black-and-white (adaptive-mean threshold).");
             return binarized;
         }
         catch (Exception ex)
@@ -3864,108 +3864,47 @@ public partial class ImageProcessor
         }
     }
 
-    /// <summary>NICK local thresholding (Khurshid, Siddiqi, Faure, Vincent — "Comparison of
-    /// Niblack inspired Binarization methods for ancient documents", 2009): a Niblack-family
-    /// local window threshold, T(x,y) = mean(x,y) + k * sqrt(variance(x,y) + mean(x,y)^2), with
-    /// k negative (here -0.15) so the threshold sits below the local mean, biasing toward
-    /// classifying borderline/low-contrast pixels as ink rather than background. Formula
-    /// verified against the Doxa Binarization Framework's reference implementation
-    /// (github.com/brandonmpetty/Doxa, Doxa/Nick.hpp) before being trusted.
+    /// <summary>Plain adaptive-mean thresholding (OpenCV's cv2.adaptiveThreshold,
+    /// ADAPTIVE_THRESH_MEAN_C, window 55, C=25) — the same binarization
+    /// MicroCapture.Processing/vendor/page_dewarp/page_dewarp.py itself uses for its own
+    /// 'binary' output mode, and, like NICK, has no GLOBAL image statistic dependency (each
+    /// pixel's threshold comes only from its own local window mean), so it isn't vulnerable to
+    /// the failure mode that ruled out the Wolf-Jolion-based approach this pipeline used
+    /// briefly — see git history: a real photographed page almost always has some dark
+    /// surrounding (copy-stand background, page edge/binding shadow, book cover) visible in
+    /// frame, and Wolf's own darkest-pixel/max-local-stddev GLOBAL contrast normalization let
+    /// that surrounding corrupt the threshold for the entire page, destroying most of the real
+    /// text on a real capture.
     ///
-    /// Replaces the former Wolf-Jolion-based approach (and, before that,
-    /// ApplyMixedContentBinarization's Sobel-classifier + dithering, which is what this
-    /// replaced in production — see git history) after both were found to depend on a GLOBAL
-    /// image statistic (Wolf: the image's own darkest pixel and its own max local stddev,
-    /// used to normalize contrast) that real captures routinely break: a real photographed page
-    /// almost always has some dark surrounding — the copy-stand background, a page edge or
-    /// binding shadow, a book cover — visible in frame, unlike a pre-cropped benchmark image.
-    /// That dark surrounding becomes the image's global minimum, which corrupts Wolf's contrast
-    /// normalization for the ENTIRE page and can silently destroy most of the real text.
-    /// Confirmed directly: a real captured page's body text (normal-size, high-contrast black
-    /// ink) survived at under 10% of its characters under the Wolf-based approach because of a
-    /// dark background strip elsewhere in the same photo, and was fully recovered switching to
-    /// NICK — NICK's threshold formula uses only the LOCAL window's own mean/variance, no
-    /// global image statistic at all, so it cannot be poisoned by content elsewhere in frame.
-    ///
-    /// Tested across 13 real captures (see tools/SmokeTest/Fixtures/real-photos): NICK
-    /// recovered full, legible text (including light-gray/low-contrast headings) on the large
-    /// majority where the Wolf-based approach produced near-total text loss. One real
-    /// regression found: on a photo with heavy background paper/wall texture but no dark
-    /// border, NICK's higher recall produced more false-positive speckle than Wolf's
-    /// contrast-normalized threshold — despeckling (DespeckleBinary) mitigates but doesn't fully
-    /// eliminate this. Real-photo robustness was judged more important than this one weaker
-    /// case, and more important than a few points of F-measure on the (pre-cropped,
-    /// non-representative-of-real-capture-conditions) DIBCO academic benchmark, where this
-    /// scored lower than the Wolf-based approach it replaced (0.83 vs 0.86 F-measure) for
-    /// exactly the reason above: DIBCO's tight crops never exercise the dark-background-in-frame
-    /// failure mode real captures hit routinely.
-    ///
-    /// A second real gap found via full-coverage visual audit (13 real photos, checking every
-    /// one rather than a sample): pure NICK has NO global-consistency safeguard at all — every
-    /// local window is judged purely on its own local mean/variance, with no check on whether
-    /// that variance is large enough in absolute terms to represent a genuine ink/paper edge.
-    /// On a photo with a dark, near-uniform background surface (a copy-stand top, a desk) that
-    /// has fine scratches/dust/specular sheen, that texture's tiny local variance was still
-    /// enough for NICK's formula to misclassify scattered pixels as ink, producing dense
-    /// false-positive speckle outside the page — and on the same photo, page-edge shadow
-    /// interacting with that texture corrupted real body text nearby into fragments. Confirmed
-    /// on a real capture: local window stddev averaged ~2.5 (max ~25 in scattered spots) across
-    /// that background texture, versus ~20 (max ~73) across genuine text strokes on the same
-    /// photo — a real, exploitable gap. <paramref name="minLocalStdDev"/> requires a pixel's
-    /// local window to clear this floor before it can be classified ink at all, filtering out
-    /// texture-scale noise while sitting comfortably below real text's own contrast. Verified
-    /// this doesn't clip genuine low-contrast content: a real captured page with a light-gray
-    /// decorative heading (the case that motivated switching to NICK in the first place, see
-    /// above) still binarizes that heading fully and cleanly with this floor in place. Checked
-    /// against DIBCO too: negligible aggregate impact (F 0.828 -> 0.822), confirming the floor
-    /// is calibrated well below where it would cost real recall.</summary>
-    private static Mat ApplyNickBinarization(Mat src, int dpi, double measuredDpi)
+    /// This method replaced two more elaborate approaches, both tried and found to add
+    /// complexity without a proven advantage over this one on real captures:
+    /// 1. ApplyMixedContentBinarization (Sobel-classifier + Floyd-Steinberg dithering blend,
+    ///    the original production approach) — replaced after the classifier misfired on
+    ///    manuscript/bleedthrough content, producing checkerboard dithering artifacts.
+    /// 2. NICK (Khurshid et al. 2009, a Niblack-family local threshold formula verified against
+    ///    the Doxa Binarization Framework's reference implementation) — initially adopted
+    ///    because it fixed the Wolf-Jolion failure (NICK also has no global-statistic
+    ///    dependency), then found via full-coverage visual audit to have its OWN gap: with no
+    ///    consistency check on whether local variance is large enough in absolute terms, a dark
+    ///    near-uniform background surface's fine scratches/sheen (measured local stddev ~2.5)
+    ///    was still enough to misclassify scattered pixels as ink, producing speckle. A local-
+    ///    contrast-floor fix was built and shipped for this. But a direct side-by-side
+    ///    comparison against plain adaptive-mean (this method) on the SAME 13 real photos plus
+    ///    the DIBCO academic benchmark found the two statistically tied (DIBCO: 11 photos
+    ///    favoring gated-NICK vs. 9 favoring adaptive-mean; real photos: visually equivalent,
+    ///    including on the hardest case) — meaning NICK's real, load-bearing advantage was
+    ///    never being immune to Wolf's bug specifically (which this method already has, for
+    ///    free, being simpler), not some inherent superiority. Reverted to this simpler,
+    ///    already-proven (it's literally what page_dewarp.py itself ships) method rather than
+    ///    carry NICK's own extra tunable (the contrast floor) for no measured benefit.</summary>
+    private static Mat ApplyAdaptiveMeanBinarization(Mat src, int dpi, double measuredDpi)
     {
         using var gray = new Mat();
         if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
         else src.CopyTo(gray);
 
-        const int window = 75;
-        const double k = -0.15;
-        const double minLocalStdDev = 6.0;
-
-        using var gray32 = new Mat();
-        gray.ConvertTo(gray32, MatType.CV_64F);
-        using var graySq = gray32.Mul(gray32);
-
-        using var mean = new Mat();
-        using var sqMean = new Mat();
-        Cv2.BoxFilter(gray32, mean, MatType.CV_64F, new Size(window, window), borderType: BorderTypes.Replicate);
-        Cv2.BoxFilter(graySq, sqMean, MatType.CV_64F, new Size(window, window), borderType: BorderTypes.Replicate);
-
-        using var meanSq = mean.Mul(mean);
-        using var variance = new Mat();
-        Cv2.Subtract(sqMean, meanSq, variance);
-        Cv2.Max(variance, 0, variance);
-
-        using var localStdDev = new Mat();
-        Cv2.Sqrt(variance, localStdDev);
-
-        using var radicand = new Mat();
-        Cv2.Add(variance, meanSq, radicand);
-        using var stdTerm = new Mat();
-        Cv2.Sqrt(radicand, stdTerm);
-
-        using var threshold = new Mat();
-        Cv2.ScaleAdd(stdTerm, k, mean, threshold); // threshold = k*stdTerm + mean
-
-        using var belowThreshold = new Mat();
-        Cv2.Compare(gray32, threshold, belowThreshold, CmpType.LE); // 255 where gray <= threshold (candidate ink)
-
-        using var contrastOk = new Mat();
-        Cv2.Compare(localStdDev, minLocalStdDev, contrastOk, CmpType.GE); // 255 where local contrast clears the noise floor
-
-        using var isInk = new Mat();
-        Cv2.BitwiseAnd(belowThreshold, contrastOk, isInk);
-
-        using var binarized = new Mat();
-        Cv2.BitwiseNot(isInk, binarized); // 0 = ink, 255 = background, matching this file's convention
-        binarized.ConvertTo(binarized, MatType.CV_8UC1);
+        var binarized = new Mat();
+        Cv2.AdaptiveThreshold(gray, binarized, 255, AdaptiveThresholdTypes.MeanC, ThresholdTypes.Binary, 55, 25);
 
         return DespeckleBinary(binarized, dpi, measuredDpi);
     }
