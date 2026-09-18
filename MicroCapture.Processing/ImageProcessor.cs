@@ -3842,7 +3842,7 @@ public partial class ImageProcessor
 
     // ───────────── BINARIZATION ─────────────
 
-    /// <summary>Applies Sauvola binarization if enabled, and reports what happened via
+    /// <summary>Applies binarization if enabled, and reports what happened via
     /// <paramref name="result"/> — same never-throws, degrade-to-unchanged shape as
     /// <see cref="TryApplyDewarp"/>. Runs last in the pipeline (after QC, see
     /// <see cref="ProcessSinglePage"/>) since blur/exposure scores are meaningless once
@@ -3852,9 +3852,9 @@ public partial class ImageProcessor
         if (!binarizeEnabled) return src;
         try
         {
-            var binarized = ApplyMixedContentBinarization(src, dpi, measuredDpi);
+            var binarized = ApplyNickBinarization(src, dpi, measuredDpi);
             result.WasBinarized = true;
-            result.Warnings.Add("Binarized to black-and-white (adaptive threshold with photo-region dithering).");
+            result.Warnings.Add("Binarized to black-and-white (NICK local threshold).");
             return binarized;
         }
         catch (Exception ex)
@@ -3864,298 +3864,79 @@ public partial class ImageProcessor
         }
     }
 
-    /// <summary>Plain adaptive mean thresholding (OpenCV's own cv2.adaptiveThreshold,
-    /// ADAPTIVE_THRESH_MEAN_C) — the same binarization page_dewarp.py itself uses for its
-    /// 'binary' output mode (ADAPTIVE_WINSZ=55, C=25). This is the known-good byte-parity
-    /// reference for text pages (see <see cref="ApplyMixedContentBinarization"/>, which now
-    /// composites this with dithering rather than calling it directly on the whole page) and
-    /// remains a fine choice on its own for text-only content.</summary>
-    private static Mat ApplyAdaptiveMeanBinarization(Mat src)
+    /// <summary>NICK local thresholding (Khurshid, Siddiqi, Faure, Vincent — "Comparison of
+    /// Niblack inspired Binarization methods for ancient documents", 2009): a Niblack-family
+    /// local window threshold, T(x,y) = mean(x,y) + k * sqrt(variance(x,y) + mean(x,y)^2), with
+    /// k negative (here -0.15) so the threshold sits below the local mean, biasing toward
+    /// classifying borderline/low-contrast pixels as ink rather than background. Formula
+    /// verified against the Doxa Binarization Framework's reference implementation
+    /// (github.com/brandonmpetty/Doxa, Doxa/Nick.hpp) before being trusted.
+    ///
+    /// Replaces the former Wolf-Jolion-based approach (and, before that,
+    /// ApplyMixedContentBinarization's Sobel-classifier + dithering, which is what this
+    /// replaced in production — see git history) after both were found to depend on a GLOBAL
+    /// image statistic (Wolf: the image's own darkest pixel and its own max local stddev,
+    /// used to normalize contrast) that real captures routinely break: a real photographed page
+    /// almost always has some dark surrounding — the copy-stand background, a page edge or
+    /// binding shadow, a book cover — visible in frame, unlike a pre-cropped benchmark image.
+    /// That dark surrounding becomes the image's global minimum, which corrupts Wolf's contrast
+    /// normalization for the ENTIRE page and can silently destroy most of the real text.
+    /// Confirmed directly: a real captured page's body text (normal-size, high-contrast black
+    /// ink) survived at under 10% of its characters under the Wolf-based approach because of a
+    /// dark background strip elsewhere in the same photo, and was fully recovered switching to
+    /// NICK — NICK's threshold formula uses only the LOCAL window's own mean/variance, no
+    /// global image statistic at all, so it cannot be poisoned by content elsewhere in frame.
+    ///
+    /// Tested across 13 real captures (see tools/SmokeTest/Fixtures/real-photos): NICK
+    /// recovered full, legible text (including light-gray/low-contrast headings) on the large
+    /// majority where the Wolf-based approach produced near-total text loss. One real
+    /// regression found: on a photo with heavy background paper/wall texture but no dark
+    /// border, NICK's higher recall produced more false-positive speckle than Wolf's
+    /// contrast-normalized threshold — despeckling (DespeckleBinary) mitigates but doesn't fully
+    /// eliminate this. Real-photo robustness was judged more important than this one weaker
+    /// case, and more important than a few points of F-measure on the (pre-cropped,
+    /// non-representative-of-real-capture-conditions) DIBCO academic benchmark, where this
+    /// scored lower than the Wolf-based approach it replaced (0.83 vs 0.86 F-measure) for
+    /// exactly the reason above: DIBCO's tight crops never exercise the dark-background-in-frame
+    /// failure mode real captures hit routinely.</summary>
+    private static Mat ApplyNickBinarization(Mat src, int dpi, double measuredDpi)
     {
         using var gray = new Mat();
         if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
         else src.CopyTo(gray);
 
-        var binarized = new Mat();
-        Cv2.AdaptiveThreshold(gray, binarized, 255, AdaptiveThresholdTypes.MeanC, ThresholdTypes.Binary, 55, 25);
-        return binarized;
-    }
+        const int window = 75;
+        const double k = -0.15;
 
-    /// <summary>Bilevel (1-bit CCITT-G4, see <see cref="WriteBitonalTiff"/>) binarization for
-    /// mixed text/photo pages. A plain adaptive threshold — including Sauvola — reads a
-    /// continuous-tone photo region as one giant low-contrast "stroke" area and collapses it to
-    /// black speckle noise (confirmed on a real fixture: a magazine page with an embedded photo,
-    /// tools/SmokeTest/Fixtures/real-photos/new-test-photos/2026-09-15_14-48-58.jpg — the photo
-    /// and its halftone dot pattern both turned to solid black mush under
-    /// <see cref="ApplyAdaptiveMeanBinarization"/>). Text and photo content need opposite
-    /// treatment even though both must end up strictly 0/255:
-    /// - Text/line-art (sharp local edges, bimodal ink-vs-paper contrast): adaptive-mean
-    ///   threshold, unchanged from the byte-parity reference — clean crisp strokes.
-    /// - Photo/continuous-tone (smooth gradients, no sharp bimodal edge structure): Floyd–
-    ///   Steinberg error-diffusion dithering instead of a hard cutoff. A hard threshold on a
-    ///   photo has nothing to snap to and produces noise; error diffusion instead spreads each
-    ///   pixel's quantization error onto its neighbours, so the *pattern* of black/white dots
-    ///   approximates the original tone (this is the standard fix documented for exactly this
-    ///   failure mode in halftone/mixed-content bitonal scanning).
-    /// Classification is by local gradient magnitude (Sobel), block-averaged: text strokes have
-    /// strong, spatially concentrated edges; photos have weak or diffusely-spread gradient
-    /// energy. The per-block decision is blended into a soft (blurred) 0..1 mask rather than a
-    /// hard region boundary, so the two treatments cross-fade instead of leaving a visible seam
-    /// at a photo's edge.</summary>
-    private static Mat ApplyMixedContentBinarization(Mat src, int dpi, double measuredDpi)
-    {
-        using var gray = new Mat();
-        if (src.Channels() > 1) Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-        else src.CopyTo(gray);
+        using var gray32 = new Mat();
+        gray.ConvertTo(gray32, MatType.CV_64F);
+        using var graySq = gray32.Mul(gray32);
 
-        using var textThreshold = new Mat();
-        Cv2.AdaptiveThreshold(gray, textThreshold, 255, AdaptiveThresholdTypes.MeanC, ThresholdTypes.Binary, 55, 25);
-        using var textThresholdDespeckled = DespeckleBinary(textThreshold, dpi, measuredDpi);
+        using var mean = new Mat();
+        using var sqMean = new Mat();
+        Cv2.BoxFilter(gray32, mean, MatType.CV_64F, new Size(window, window), borderType: BorderTypes.Replicate);
+        Cv2.BoxFilter(graySq, sqMean, MatType.CV_64F, new Size(window, window), borderType: BorderTypes.Replicate);
 
-        using var dithered = ApplyFloydSteinbergDither(gray);
+        using var meanSq = mean.Mul(mean);
+        using var variance = new Mat();
+        Cv2.Subtract(sqMean, meanSq, variance);
+        Cv2.Max(variance, 0, variance);
 
-        // The raw (pre-despeckle) threshold, not textThresholdDespeckled: despeckling removes
-        // small isolated blobs, which would artificially lower a text block's own transition
-        // density right before this measures it.
-        using var photoWeight = ComputePhotoRegionWeight(gray, textThreshold);
+        using var radicand = new Mat();
+        Cv2.Add(variance, meanSq, radicand);
+        using var stdTerm = new Mat();
+        Cv2.Sqrt(radicand, stdTerm);
 
-        var rows = gray.Rows;
-        var cols = gray.Cols;
-        textThresholdDespeckled.GetArray(out byte[] textPixels);
-        dithered.GetArray(out byte[] ditherPixels);
-        photoWeight.GetArray(out byte[] weightPixels); // 0 = pure text treatment, 255 = pure photo treatment.
+        using var threshold = new Mat();
+        Cv2.ScaleAdd(stdTerm, k, mean, threshold); // threshold = k*stdTerm + mean
 
-        var output = new byte[rows * cols];
-        for (var i = 0; i < output.Length; i++)
-        {
-            // Blend by picking one source per pixel with probability proportional to the photo
-            // weight (ordered by a fixed pattern via the dither's own error-diffused value)
-            // rather than averaging two bilevel values, which would produce grey — meaningless
-            // in a 1-bit image. Using the photo weight itself as the mix threshold means a block
-            // confidently classified as text (weight near 0) is untouched, one confidently
-            // photo (weight near 255) is fully dithered, and the blur already applied to the
-            // weight map (see ComputePhotoRegionWeight) makes the transition band gradual
-            // instead of a hard per-pixel coin flip.
-            output[i] = weightPixels[i] < 128 ? textPixels[i] : ditherPixels[i];
-        }
+        using var binarized64 = new Mat();
+        Cv2.Compare(gray32, threshold, binarized64, CmpType.GT); // 255 where gray > threshold (background), 0 where ink
 
-        var result = new Mat(rows, cols, MatType.CV_8UC1);
-        result.SetArray(output);
-        return result;
-    }
+        using var binarized = new Mat();
+        binarized64.ConvertTo(binarized, MatType.CV_8UC1);
 
-    /// <summary>0..255 per-pixel "this looks like a photo, not text" weight, block-classified
-    /// then blurred into a soft mask. Two signals combine per block, both measured where
-    /// <paramref name="textThreshold"/> (the plain adaptive-mean threshold already computed for
-    /// the text path) actually flips between 0 and 255:
-    /// (1) transition density — the fraction of adjacent-pixel pairs that flip. Real text/line-art
-    /// strokes make the threshold flip rapidly and densely (~0.08-0.22 across real text blocks);
-    /// most photo regions flip rarely (~0.00-0.05).
-    /// (2) edge sharpness AT those transitions — the original grayscale gradient magnitude right
-    /// where the threshold flips. A genuine ink/paper edge is a steep step (measured 24-54 across
-    /// real text blocks, including sparse ones); the rare flips a threshold produces inside a
-    /// smooth photo region are shallow, gradual crossings (measured 0-2.6 across real photo/face
-    /// blocks) rather than true edges.
-    ///
-    /// Density alone under-classifies genuine text: a single sparse header line, a title in a
-    /// mostly-empty block, or a solid dark photo-vignette border all have low transition density
-    /// despite being correctly non-photo content — confirmed on a real fixture (a book's running
-    /// header, "PHOTO-2026-09-17-15-46-30 3.jpg") where density alone wiped the header text into
-    /// white speckle voids. Requiring EITHER no transitions at all (nothing for either treatment
-    /// to disagree about — stays on the text path, which correctly renders it as flat
-    /// black/white) OR sharp transitions when they do exist is what actually distinguishes real
-    /// text/line-art from photo content, regardless of how sparse the strokes are.
-    ///
-    /// This is the third iteration of this discriminator; two earlier, weaker versions were
-    /// disproven on real captures: gradient peak/mean shape and Otsu histogram separability both
-    /// misread a smooth intensity ramp (shaded skin) as bimodal/edge-like enough to count as
-    /// text, wiping real photo content to white. Transition density alone (the second iteration)
-    /// fixed that but then over-fired on sparse text/line-art, which this edge-sharpness gate
-    /// fixes without reintroducing either earlier failure.</summary>
-    private static Mat ComputePhotoRegionWeight(Mat gray, Mat textThreshold)
-    {
-        var rows = textThreshold.Rows;
-        var cols = textThreshold.Cols;
-        // Large enough that a text block reliably contains several stroke transitions (a single
-        // character stroke can be only a few pixels wide at typical archival DPI, so too small a
-        // block would see mostly-uniform interior-of-stroke or interior-of-gap patches and
-        // under-read its own density); small enough to still localize a photo/text boundary
-        // reasonably once the soft blur pass below runs.
-        var blockSize = Math.Clamp(Math.Max(rows, cols) / 100, 32, 96);
-
-        // Blurred once up front (not per-block) so the zero-transition branch below can compare
-        // each block's blurred-vs-raw variance cheaply — see the "noise floor" comment there.
-        using var blurredGray = new Mat();
-        Cv2.GaussianBlur(gray, blurredGray, new Size(0, 0), 3.0);
-
-        gray.GetArray(out byte[] grayData);
-        blurredGray.GetArray(out byte[] blurredData);
-        textThreshold.GetArray(out byte[] binary);
-        var weight = new byte[rows * cols];
-
-        for (var by = 0; by < rows; by += blockSize)
-        {
-            var y1 = Math.Min(rows, by + blockSize);
-            for (var bx = 0; bx < cols; bx += blockSize)
-            {
-                var x1 = Math.Min(cols, bx + blockSize);
-
-                var transitions = 0;
-                var pairs = 0;
-                double edgeGradSum = 0;
-                double brightnessSum = 0;
-                double brightnessSqSum = 0;
-                double blurredSum = 0;
-                double blurredSqSum = 0;
-                var pixelCount = 0;
-                for (var y = by; y < y1; y++)
-                {
-                    var rowOffset = y * cols;
-                    for (var x = bx; x < x1; x++)
-                    {
-                        var v = binary[rowOffset + x];
-                        var g = grayData[rowOffset + x];
-                        var bl = blurredData[rowOffset + x];
-                        brightnessSum += g;
-                        brightnessSqSum += (double)g * g;
-                        blurredSum += bl;
-                        blurredSqSum += (double)bl * bl;
-                        pixelCount++;
-                        if (x + 1 < x1)
-                        {
-                            if (v != binary[rowOffset + x + 1])
-                            {
-                                transitions++;
-                                edgeGradSum += Math.Abs(g - grayData[rowOffset + x + 1]);
-                            }
-                            pairs++;
-                        }
-                        if (y + 1 < y1)
-                        {
-                            if (v != binary[rowOffset + cols + x])
-                            {
-                                transitions++;
-                                edgeGradSum += Math.Abs(g - grayData[rowOffset + cols + x]);
-                            }
-                            pairs++;
-                        }
-                    }
-                }
-
-                var density = pairs > 0 ? (double)transitions / pairs : 0;
-                var edgeSharpness = transitions > 0 ? edgeGradSum / transitions : 0;
-                var brightnessMean = pixelCount > 0 ? brightnessSum / pixelCount : 0;
-                var brightnessVariance = pixelCount > 0 ? Math.Max(0, brightnessSqSum / pixelCount - brightnessMean * brightnessMean) : 0;
-                var brightnessStdDev = Math.Sqrt(brightnessVariance);
-                var blurredMean = pixelCount > 0 ? blurredSum / pixelCount : 0;
-                var blurredVariance = pixelCount > 0 ? Math.Max(0, blurredSqSum / pixelCount - blurredMean * blurredMean) : 0;
-                var blurredStdDev = Math.Sqrt(blurredVariance);
-                // How much of the block's own variance survives a Gaussian blur. A genuine
-                // photographic gradient (shading across skin, a lit background) is spatially
-                // coherent and mostly survives blurring; JPEG/sensor noise or fine paper texture
-                // on an otherwise flat surface is high-frequency and collapses under the same
-                // blur. Confirmed on real captures: a busy magazine page's flat-paper blocks with
-                // stray std > 5 (noise, not content) measured blur-survival ~0.9 and below, while
-                // a real out-of-focus face's shaded-skin blocks measured ~0.93 and above.
-                var blurSurvival = brightnessStdDev > 1e-6 ? blurredStdDev / brightnessStdDev : 0;
-
-                bool isPhoto;
-                if (transitions == 0)
-                {
-                    // The threshold produced one solid colour for the whole block — either
-                    // genuine flat page background (std ~0.4-1.7 in testing: paper margins, a
-                    // photo-vignette border), page/paper noise masquerading as texture (std up to
-                    // ~23 seen on a real magazine page, but that variance is high-frequency and
-                    // mostly vanishes under blur), or a smooth photo region entirely swallowed
-                    // into one class (std up to ~50 in testing: out-of-focus skin/background,
-                    // whose variance is a real spatial gradient and mostly survives blur).
-                    // Requiring both a stddev floor AND that the variance survive blurring catches
-                    // genuine continuous-tone photo content without either reclassifying blank
-                    // space or being fooled by noise on flat paper — confirmed against both a real
-                    // out-of-focus face photo (63% zero-transition blocks, needed this branch to
-                    // be recognised as photo at all) and a real busy magazine page (whose flat
-                    // background previously misfired as photo under a stddev-only floor).
-                    isPhoto = brightnessStdDev > 5.0 && blurSurvival > 0.92;
-                }
-                else
-                {
-                    // No standout edge relative to the surrounding gradient (photos/halftone
-                    // lack the "sparse strong stroke" signature text has), and — the decisive
-                    // check — the few transitions the threshold DID produce are shallow/gradual
-                    // rather than a genuine ink/paper step edge.
-                    isPhoto = density < 0.06 && edgeSharpness < 15.0;
-                }
-                var blockWeight = (byte)(isPhoto ? 255 : 0);
-
-                for (var y = by; y < y1; y++)
-                {
-                    var rowOffset = y * cols;
-                    for (var x = bx; x < x1; x++)
-                        weight[rowOffset + x] = blockWeight;
-                }
-            }
-        }
-
-        using var weightMat = new Mat(rows, cols, MatType.CV_8UC1);
-        weightMat.SetArray(weight);
-
-        // Soften only the block-grid seam itself (a small fraction of one block width) rather
-        // than blending whole neighbouring blocks together. An earlier version used sigma =
-        // blockSize/2, whose ~3-sigma blur radius reached well over a block width in every
-        // direction — enough to drag a "photo" classification from a blank page margin block
-        // across the entire adjacent text paragraph, switching real ink strokes over to
-        // Floyd–Steinberg dithering and corrupting them into white speckle voids (confirmed on a
-        // real text-only page: the classifier's own raw per-block decisions were correct, margin
-        // blank vs. paragraph text, but the wide blur silently overrode much of the paragraph).
-        // A margin block is usually many blocks wide, so a narrow blur still keeps most of it
-        // fully "photo" while confining the cross-fade to genuine boundaries.
-        var softened = new Mat();
-        Cv2.GaussianBlur(weightMat, softened, new Size(0, 0), blockSize / 8.0);
-        return softened;
-    }
-
-    /// <summary>Standard Floyd–Steinberg error-diffusion dithering to bilevel (0/255): each
-    /// pixel is thresholded at 128, and the resulting quantization error is spread onto
-    /// not-yet-visited neighbours (7/16 right, 3/16 below-left, 5/16 below, 1/16 below-right).
-    /// Unlike a hard per-pixel threshold, the diffused error makes the local *density* of black
-    /// dots track the original tone, so a mid-grey photo region renders as a checkerboard-like
-    /// texture that reads as grey at normal viewing distance instead of collapsing to solid
-    /// black or vanishing to solid white. Run at full resolution (not pre-downscaled) so the
-    /// dot pattern is fine enough to stay below the eye's resolving power at archival DPI.</summary>
-    private static Mat ApplyFloydSteinbergDither(Mat gray)
-    {
-        var rows = gray.Rows;
-        var cols = gray.Cols;
-        gray.GetArray(out byte[] src);
-
-        var work = new float[rows * cols];
-        for (var i = 0; i < src.Length; i++) work[i] = src[i];
-
-        var output = new byte[rows * cols];
-        for (var y = 0; y < rows; y++)
-        {
-            var rowOffset = y * cols;
-            for (var x = 0; x < cols; x++)
-            {
-                var idx = rowOffset + x;
-                var oldVal = Math.Clamp(work[idx], 0f, 255f);
-                var newVal = oldVal < 128f ? 0f : 255f;
-                output[idx] = (byte)newVal;
-                var error = oldVal - newVal;
-
-                if (x + 1 < cols) work[idx + 1] += error * 7f / 16f;
-                if (y + 1 < rows)
-                {
-                    if (x - 1 >= 0) work[idx + cols - 1] += error * 3f / 16f;
-                    work[idx + cols] += error * 5f / 16f;
-                    if (x + 1 < cols) work[idx + cols + 1] += error * 1f / 16f;
-                }
-            }
-        }
-
-        var result = new Mat(rows, cols, MatType.CV_8UC1);
-        result.SetArray(output);
-        return result;
+        return DespeckleBinary(binarized, dpi, measuredDpi);
     }
 
     /// <summary>Sauvola local-adaptive thresholding — the same algorithm Tesseract/Leptonica
