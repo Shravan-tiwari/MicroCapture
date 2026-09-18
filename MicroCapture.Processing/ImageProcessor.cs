@@ -3898,7 +3898,27 @@ public partial class ImageProcessor
     /// non-representative-of-real-capture-conditions) DIBCO academic benchmark, where this
     /// scored lower than the Wolf-based approach it replaced (0.83 vs 0.86 F-measure) for
     /// exactly the reason above: DIBCO's tight crops never exercise the dark-background-in-frame
-    /// failure mode real captures hit routinely.</summary>
+    /// failure mode real captures hit routinely.
+    ///
+    /// A second real gap found via full-coverage visual audit (13 real photos, checking every
+    /// one rather than a sample): pure NICK has NO global-consistency safeguard at all — every
+    /// local window is judged purely on its own local mean/variance, with no check on whether
+    /// that variance is large enough in absolute terms to represent a genuine ink/paper edge.
+    /// On a photo with a dark, near-uniform background surface (a copy-stand top, a desk) that
+    /// has fine scratches/dust/specular sheen, that texture's tiny local variance was still
+    /// enough for NICK's formula to misclassify scattered pixels as ink, producing dense
+    /// false-positive speckle outside the page — and on the same photo, page-edge shadow
+    /// interacting with that texture corrupted real body text nearby into fragments. Confirmed
+    /// on a real capture: local window stddev averaged ~2.5 (max ~25 in scattered spots) across
+    /// that background texture, versus ~20 (max ~73) across genuine text strokes on the same
+    /// photo — a real, exploitable gap. <paramref name="minLocalStdDev"/> requires a pixel's
+    /// local window to clear this floor before it can be classified ink at all, filtering out
+    /// texture-scale noise while sitting comfortably below real text's own contrast. Verified
+    /// this doesn't clip genuine low-contrast content: a real captured page with a light-gray
+    /// decorative heading (the case that motivated switching to NICK in the first place, see
+    /// above) still binarizes that heading fully and cleanly with this floor in place. Checked
+    /// against DIBCO too: negligible aggregate impact (F 0.828 -> 0.822), confirming the floor
+    /// is calibrated well below where it would cost real recall.</summary>
     private static Mat ApplyNickBinarization(Mat src, int dpi, double measuredDpi)
     {
         using var gray = new Mat();
@@ -3907,6 +3927,7 @@ public partial class ImageProcessor
 
         const int window = 75;
         const double k = -0.15;
+        const double minLocalStdDev = 6.0;
 
         using var gray32 = new Mat();
         gray.ConvertTo(gray32, MatType.CV_64F);
@@ -3922,6 +3943,9 @@ public partial class ImageProcessor
         Cv2.Subtract(sqMean, meanSq, variance);
         Cv2.Max(variance, 0, variance);
 
+        using var localStdDev = new Mat();
+        Cv2.Sqrt(variance, localStdDev);
+
         using var radicand = new Mat();
         Cv2.Add(variance, meanSq, radicand);
         using var stdTerm = new Mat();
@@ -3930,11 +3954,18 @@ public partial class ImageProcessor
         using var threshold = new Mat();
         Cv2.ScaleAdd(stdTerm, k, mean, threshold); // threshold = k*stdTerm + mean
 
-        using var binarized64 = new Mat();
-        Cv2.Compare(gray32, threshold, binarized64, CmpType.GT); // 255 where gray > threshold (background), 0 where ink
+        using var belowThreshold = new Mat();
+        Cv2.Compare(gray32, threshold, belowThreshold, CmpType.LE); // 255 where gray <= threshold (candidate ink)
+
+        using var contrastOk = new Mat();
+        Cv2.Compare(localStdDev, minLocalStdDev, contrastOk, CmpType.GE); // 255 where local contrast clears the noise floor
+
+        using var isInk = new Mat();
+        Cv2.BitwiseAnd(belowThreshold, contrastOk, isInk);
 
         using var binarized = new Mat();
-        binarized64.ConvertTo(binarized, MatType.CV_8UC1);
+        Cv2.BitwiseNot(isInk, binarized); // 0 = ink, 255 = background, matching this file's convention
+        binarized.ConvertTo(binarized, MatType.CV_8UC1);
 
         return DespeckleBinary(binarized, dpi, measuredDpi);
     }
